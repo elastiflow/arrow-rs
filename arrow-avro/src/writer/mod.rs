@@ -15,29 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Convert data to / from the [Apache Arrow] memory format and [Apache Avro]
-//!
-//! [Apache Arrow]: https://arrow.apache.org
-//! [Apache Avro]: https://avro.apache.org/
-
-#![warn(missing_docs)]
-#![allow(unused)] // Temporary
-
-pub mod reader;
 mod schema;
-
-mod compression;
-
-mod codec;
-
-mod writer;
+mod vlq;
 
 #[cfg(test)]
-mod test_util {
-    pub fn arrow_test_data(path: &str) -> String {
-        match std::env::var("ARROW_TEST_DATA") {
-            Ok(dir) => format!("{dir}/{path}"),
-            Err(_) => format!("../testing/data/{path}"),
-        }
+mod test {
+    use arrow_array::RecordBatch;
+    use std::fs::File;
+    use std::io::BufWriter;
+
+    fn write_file(file: &str, batch: &RecordBatch) {
+        let file = File::open(file).unwrap();
+        let mut writer = BufWriter::new(file);
     }
 }
