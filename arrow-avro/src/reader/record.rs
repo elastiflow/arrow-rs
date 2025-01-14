@@ -159,6 +159,11 @@ impl Decoder {
                 OffsetBufferBuilder::new(DEFAULT_CAPACITY),
                 Vec::with_capacity(DEFAULT_CAPACITY),
             ),
+            Codec::Decimal(precision, scale, size) => {
+                let builder = DecimalBuilder::new(*precision, *scale, *size)?;
+                Self::Decimal(*precision, *scale, *size, builder)
+            }
+            Codec::Uuid => Self::Fixed(16, Vec::with_capacity(DEFAULT_CAPACITY)),
             Codec::Date32 => Self::Date32(Vec::with_capacity(DEFAULT_CAPACITY)),
             Codec::TimeMillis => Self::TimeMillis(Vec::with_capacity(DEFAULT_CAPACITY)),
             Codec::TimeMicros => Self::TimeMicros(Vec::with_capacity(DEFAULT_CAPACITY)),
@@ -169,7 +174,7 @@ impl Decoder {
                 Self::TimestampMicros(*is_utc, Vec::with_capacity(DEFAULT_CAPACITY))
             }
             Codec::Fixed(n) => Self::Fixed(*n, Vec::with_capacity(DEFAULT_CAPACITY)),
-            Codec::Interval => Self::Interval(Vec::with_capacity(DEFAULT_CAPACITY)),
+            Codec::Duration => Self::Interval(Vec::with_capacity(DEFAULT_CAPACITY)),
             Codec::List(item) => {
                 let item_decoder = Box::new(Self::try_new(item)?);
                 Self::List(
@@ -208,10 +213,6 @@ impl Decoder {
                     Box::new(Self::try_new(value_type)?),
                     0,
                 )
-            }
-            Codec::Decimal(precision, scale, size) => {
-                let builder = DecimalBuilder::new(*precision, *scale, *size)?;
-                Self::Decimal(*precision, *scale, *size, builder)
             }
         };
 
@@ -866,7 +867,7 @@ mod tests {
     fn test_interval_decoding() {
         // Avro interval => 12 bytes => [ months i32, days i32, ms i32 ]
         // decode 2 rows => row1 => months=1, days=2, ms=100 => row2 => months=-1, days=10, ms=9999
-        let dt = AvroDataType::from_codec(Codec::Interval);
+        let dt = AvroDataType::from_codec(Codec::Duration);
         let mut dec = Decoder::try_new(&dt).unwrap();
         // row1 => months=1 => 01,00,00,00, days=2 => 02,00,00,00, ms=100 => 64,00,00,00
         // row2 => months=-1 => 0xFF,0xFF,0xFF,0xFF, days=10 => 0x0A,0x00,0x00,0x00, ms=9999 => 0x0F,0x27,0x00,0x00
@@ -903,7 +904,7 @@ mod tests {
     #[test]
     fn test_interval_decoding_with_nulls() {
         // Avro union => [ interval, null]
-        let dt = AvroDataType::from_codec(Codec::Interval);
+        let dt = AvroDataType::from_codec(Codec::Duration);
         let child = Decoder::try_new(&dt).unwrap();
         let mut dec = Decoder::Nullable(
             Nullability::NullFirst,
