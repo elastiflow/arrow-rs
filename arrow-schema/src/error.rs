@@ -54,6 +54,8 @@ pub enum ArrowError {
     InvalidArgumentError(String),
     /// Error during Parquet operations.
     ParquetError(String),
+    /// Error during Avro operations.
+    AvroError(String),
     /// Error during import or export to/from the C Data Interface
     CDataInterface(String),
     /// Error when a dictionary key is bigger than the key type
@@ -116,6 +118,9 @@ impl Display for ArrowError {
             }
             ArrowError::ParquetError(desc) => {
                 write!(f, "Parquet argument error: {desc}")
+            }
+            ArrowError::AvroError(desc) => {
+                write!(f, "Avro argument error: {desc}")
             }
             ArrowError::CDataInterface(desc) => {
                 write!(f, "C Data interface error: {desc}")

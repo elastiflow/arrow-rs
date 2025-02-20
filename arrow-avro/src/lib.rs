@@ -28,8 +28,11 @@ mod schema;
 mod compression;
 
 mod codec;
+pub mod writer;
 
 pub use self::reader::{Decoder, Reader, ReaderBuilder};
+pub use self::compression::{CompressionCodec};
+
 
 #[cfg(test)]
 mod test_util {
