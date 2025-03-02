@@ -73,7 +73,6 @@ impl AvroHeader {
         write_zigzag_long(0, sink)?;
         sink.write_all(&self.sync_marker)
             .map_err(|e| to_arrow_io_err(e, "Writing sync marker"))?;
-
         Ok(())
     }
 }

@@ -673,10 +673,22 @@ fn copy_metadata_to_attributes(
     source: &HashMap<String, String>,
     target: &mut Attributes,
 ) {
-    for (k, v) in source.iter() {
-        target
-            .additional
-            .insert(Box::leak(k.clone().into_boxed_str()), serde_json::Value::String(v.clone()));
+    for (k, v) in source {
+        if k == "type"
+            || k == "name"
+            || k == "fields"
+            || k == "aliases"
+            || k == "namespace"
+            || k == "doc"
+            || k == "logicalType"        // <-- prevents duplication of e.g. "decimal"
+            || k.starts_with("avro.")
+        {
+            continue;
+        }
+        target.additional.insert(
+            Box::leak(k.clone().into_boxed_str()),
+            serde_json::Value::String(v.clone()),
+        );
     }
 }
 
@@ -802,7 +814,6 @@ pub fn field_to_schema(data_type: &AvroDataType) -> Result<Schema<'static>, Arro
             let mut attrs = Attributes {
                 logical_type: Some("decimal"),
                 additional: HashMap::from([
-                    ("logicalType", serde_json::Value::String("decimal".into())),
                     ("precision", serde_json::Value::Number(p.into())),
                     ("scale", serde_json::Value::Number(s.into())),
                 ]),
