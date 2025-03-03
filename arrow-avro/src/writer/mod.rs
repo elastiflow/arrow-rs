@@ -261,15 +261,83 @@ impl<W: Write> BatchWriter for Writer<W> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs::File;
     use super::*;
     use arrow_array::{Array, Decimal128Array, Decimal256Array, DictionaryArray, FixedSizeBinaryArray, Int32Array, Int8Array, ListArray, MapArray, PrimitiveArray, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Fields, IntervalUnit, Schema};
-    use crate::reader::{ReaderBuilder};
-    use std::io::Cursor;
+    use crate::reader::{Reader, ReaderBuilder};
+    use std::io::{BufReader, Cursor};
     use arrow_array::builder::{Decimal128Builder, Decimal256Builder, FixedSizeBinaryBuilder, Int32Builder, MapBuilder, StringBuilder};
     use arrow_array::types::IntervalMonthDayNanoType;
     use arrow_buffer::{i256, Buffer, IntervalMonthDayNano};
     use arrow_data::ArrayData;
+    use crate::test_util::arrow_test_data;
+
+    fn read_file(path: &str, _schema: Option<Schema>) -> Reader<BufReader<File>> {
+        let file = File::open(path).unwrap();
+        let reader = BufReader::new(file);
+        let builder = ReaderBuilder::new().with_batch_size(64);
+        builder.build(reader).unwrap()
+    }
+
+    #[test]
+    fn test_round_trip_files() -> Result<(), ArrowError> {
+        let files = [
+            "avro/alltypes_plain.avro",
+            "avro/alltypes_plain.snappy.avro",
+            "avro/alltypes_plain.zstandard.avro",
+            "avro/alltypes_plain.bzip2.avro",
+            "avro/alltypes_plain.xz.avro",
+            "avro/alltypes_dictionary.avro",
+            "avro/alltypes_nulls_plain.avro",
+            "avro/binary.avro",
+        ];
+        for file in files {
+            let file = arrow_test_data(file);
+            let mut original_reader = read_file(&file, None);
+            let mut original_batches = Vec::new();
+            while let Some(batch) = original_reader.next() {
+                original_batches.push(batch?);
+            }
+            let mut buffer = Vec::new();
+            if !original_batches.is_empty() {
+                let schema = original_batches[0].schema();
+                let mut writer = WriterBuilder::new(&mut buffer, schema.clone()).build()?;
+                for batch in &original_batches {
+                    writer.write(batch)?;
+                }
+                writer.finish()?;
+            }
+            let mut roundtrip_reader = ReaderBuilder::new().build(Cursor::new(&buffer))?;
+            let mut roundtrip_batches = Vec::new();
+            while let Some(batch) = roundtrip_reader.next() {
+                roundtrip_batches.push(batch?);
+            }
+            assert_eq!(original_batches.len(), roundtrip_batches.len(),
+                       "Mismatch in number of batches for file '{}'", file);
+            for (i, (original, roundtrip)) in
+                original_batches.iter().zip(roundtrip_batches.iter()).enumerate()
+            {
+                assert_eq!(
+                    original.num_rows(), roundtrip.num_rows(),
+                    "Row count mismatch in file '{}' batch {}",
+                    file, i
+                );
+                assert_eq!(
+                    original.num_columns(), roundtrip.num_columns(),
+                    "Column count mismatch in file '{}' batch {}",
+                    file, i
+                );
+                assert_eq!(
+                    original, roundtrip,
+                    "Mismatch in file '{}' batch {} after round-trip",
+                    file, i
+                );
+            }
+        }
+        Ok(())
+    }
+
 
     fn round_trip(
         batches: &[RecordBatch],
