@@ -3,9 +3,8 @@
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
 // to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file
-// except in compliance with the License.  You may obtain a
-// copy of the License at
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
 //
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
@@ -16,15 +15,81 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Row-based encoder logic
+//! Row-based encoder logic for Avro container files.
 
-use arrow_array::*;
+use arrow_array::{
+    Array, BinaryArray, BooleanArray, Decimal128Array, Decimal256Array,
+    DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array,
+    Float64Array, Int32Array, Int64Array, LargeListArray, ListArray, MapArray,
+    PrimitiveArray, StringArray, StructArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray,
+};
 use arrow_array::builder::{Decimal128Builder, Decimal256Builder};
-use arrow_array::types::{Int16Type, Int32Type, Int64Type, Int8Type, Time32MillisecondType, Time64MicrosecondType};
+use arrow_array::types::{
+    Int16Type, Int32Type, Int64Type, Int8Type, IntervalMonthDayNanoType,
+    Time32MillisecondType, Time64MicrosecondType,
+};
 use arrow_buffer::i256;
-use arrow_schema::{ArrowError, DataType, Field, Schema as ArrowSchema, TimeUnit};
+use arrow_buffer::IntervalMonthDayNano;
+use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, TimeUnit};
+
 use crate::writer::zigzag::write_zigzag_long;
 
+/// A `FieldEncoder` is responsible for writing a single Arrow column's
+/// **one row** to Avro bytes. The top-level `RecordEncoder` calls
+/// `encode_one` in row-major order.
+#[derive(Debug)]
+enum FieldEncoder {
+    /// Avro null
+    Null,
+    /// Avro bool
+    Boolean,
+    /// Avro int32
+    Int32,
+    /// Avro int64
+    Int64,
+    /// Avro float32
+    Float32,
+    /// Avro float64
+    Float64,
+    /// Avro bytes
+    Binary,
+    /// Avro string
+    Utf8,
+    /// Avro record
+    Record(Vec<FieldEncoder>),
+    /// Avro enum (dictionary)
+    Enum(DictKeyEnc),
+    /// Avro array
+    Array(Box<FieldEncoder>),
+    /// Avro map
+    Map(Box<FieldEncoder>),
+    /// Avro fixed
+    Fixed(usize),
+    /// Avro decimal128
+    Decimal128(usize, usize, Option<usize>),
+    /// Avro decimal256
+    Decimal256(usize, usize, Option<usize>),
+    /// Avro date32
+    Date32,
+    /// Avro time-millis
+    TimeMillis,
+    /// Avro time-micros
+    TimeMicros,
+    /// Avro timestamp-millis
+    TimestampMillis(bool),
+    /// Avro timestamp-micros
+    TimestampMicros(bool),
+    /// Avro 16-byte UUID
+    Uuid,
+    /// Avro 12-byte duration (months, days, ms)
+    Duration,
+
+    /// For `[ "null", T ]` union encoding in Avro
+    Nullable(Box<FieldEncoder>),
+}
+
+/// The integral type used for dictionary keys in an Avro enum.
 #[derive(Debug, Clone, Copy)]
 enum DictKeyEnc {
     Int8,
@@ -33,16 +98,16 @@ enum DictKeyEnc {
     Int64,
 }
 
-/// An encoder that converts [`RecordBatch`] data into an Avro.
+/// A `RecordEncoder` converts entire Arrow rows into Avro bytes by
+/// calling `encode_one` on each column row.
 #[derive(Debug)]
 pub struct RecordEncoder {
     fields: Vec<FieldEncoder>,
 }
 
 impl RecordEncoder {
-    /// Create a new [`crate::writer::encoder::RecordEncoder`] from an [`ArrowSchema`].
-    ///
-    pub fn try_new(schema: &ArrowSchema) -> Result<Self, ArrowError> {
+    /// Create a new `RecordEncoder` from an Arrow schema.
+    pub fn try_new(schema: &arrow_schema::Schema) -> Result<Self, ArrowError> {
         let mut fields = Vec::with_capacity(schema.fields().len());
         for f in schema.fields() {
             fields.push(FieldEncoder::try_new(f)?);
@@ -50,12 +115,11 @@ impl RecordEncoder {
         Ok(Self { fields })
     }
 
-    /// encode_row encodes an Arrow Row
-    ///
+    /// Encode one row from a `RecordBatch` into `out`.
     pub fn encode_row(
         &mut self,
-        _schema: &ArrowSchema,
-        batch: &RecordBatch,
+        _schema: &arrow_schema::Schema,
+        batch: &arrow_array::RecordBatch,
         row_idx: usize,
         out: &mut Vec<u8>,
     ) -> Result<(), ArrowError> {
@@ -66,12 +130,11 @@ impl RecordEncoder {
         Ok(())
     }
 
-    /// encode_row_to_vec encodes an Arrow Row
-    ///
+    /// Convenience to encode a single row into a new `Vec<u8>`.
     pub fn encode_row_to_vec(
         &mut self,
-        schema: &ArrowSchema,
-        batch: &RecordBatch,
+        schema: &arrow_schema::Schema,
+        batch: &arrow_array::RecordBatch,
         row_idx: usize,
     ) -> Result<Vec<u8>, ArrowError> {
         let mut buf = Vec::new();
@@ -80,43 +143,12 @@ impl RecordEncoder {
     }
 }
 
-/// A `FieldEncoder` handles writing a single Arrow column value into Avro bytes,
-/// for a single row index.
-#[derive(Debug)]
-enum FieldEncoder {
-    /// Primitive
-    Null,
-    Boolean,
-    Int32,
-    Int64,
-    Float32,
-    Float64,
-    Binary,
-    Utf8,
-    /// Complex
-    Record(Vec<FieldEncoder>),
-    Enum(DictKeyEnc),
-    Array(Box<FieldEncoder>),
-    Map(Box<FieldEncoder>),
-    Fixed(usize),
-    /// Logical
-    Decimal128(usize, usize, Option<usize>),
-    Decimal256(usize, usize, Option<usize>),
-    Date32,
-    TimeMillis,
-    TimeMicros,
-    TimestampMillis(bool),
-    TimestampMicros(bool),
-    Uuid,
-    Duration,
-    /// For `[ "null", T ]` union encoding in Avro
-    Nullable(Box<FieldEncoder>),
-}
-
 impl FieldEncoder {
+    /// Determine how to encode a single Arrow `Field`.
     pub fn try_new(field: &Field) -> Result<Self, ArrowError> {
         let dt = field.data_type();
         let enc = match dt {
+            DataType::Null => Self::Null,
             DataType::Boolean => Self::Boolean,
             DataType::Int8 | DataType::Int16 | DataType::Int32 => Self::Int32,
             DataType::Int64 => Self::Int64,
@@ -127,19 +159,35 @@ impl FieldEncoder {
             DataType::Struct(fields) => {
                 let mut child_encoders = Vec::with_capacity(fields.len());
                 for child_field in fields {
-                    child_encoders.push(FieldEncoder::try_new(child_field)?);
+                    child_encoders.push(Self::try_new(child_field)?);
                 }
                 Self::Record(child_encoders)
             }
-            DataType::Dictionary(key_dt, value_dt) => match (key_dt.as_ref(), value_dt.as_ref()) {
-                (DataType::Int8, DataType::Utf8 | DataType::LargeUtf8) => Self::Enum(DictKeyEnc::Int8),
-                (DataType::Int16, DataType::Utf8 | DataType::LargeUtf8) => Self::Enum(DictKeyEnc::Int16),
-                (DataType::Int32, DataType::Utf8 | DataType::LargeUtf8) => Self::Enum(DictKeyEnc::Int32),
-                (DataType::Int64, DataType::Utf8 | DataType::LargeUtf8) => Self::Enum(DictKeyEnc::Int64),
-                _ => {
-                    Self::Null
+            DataType::Dictionary(key_dt, value_dt) => {
+                let valid_key = matches!(
+                    key_dt.as_ref(),
+                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                );
+                let valid_val = matches!(
+                    value_dt.as_ref(),
+                    DataType::Utf8 | DataType::LargeUtf8
+                );
+                match (valid_key && valid_val, field.metadata().get("avro.enum.symbols")) {
+                    (false, _) => Self::Utf8,
+                    (true, None) => Self::Utf8,
+                    (true, Some(_sym_json_str)) => {
+                        // Determine the dictionary key type
+                        let key_enc = match key_dt.as_ref() {
+                            DataType::Int8 => DictKeyEnc::Int8,
+                            DataType::Int16 => DictKeyEnc::Int16,
+                            DataType::Int32 => DictKeyEnc::Int32,
+                            DataType::Int64 => DictKeyEnc::Int64,
+                            _ => DictKeyEnc::Int32, // fallback
+                        };
+                        Self::Enum(key_enc)
+                    }
                 }
-            },
+            }
             DataType::List(child_field) | DataType::LargeList(child_field) => {
                 let child_enc = Self::try_new(child_field.as_ref())?;
                 Self::Array(Box::new(child_enc))
@@ -148,29 +196,25 @@ impl FieldEncoder {
                 let child_enc = Self::try_new(child_field.as_ref())?;
                 Self::Array(Box::new(child_enc))
             }
-            DataType::Map(entry_field, _keys_sorted) => {
-                match entry_field.data_type() {
-                    DataType::Struct(fs) if fs.len() == 2 => {
-                        let val_field = &fs[1];
-                        let val_enc = FieldEncoder::try_new(val_field)?;
-                        Self::Map(Box::new(val_enc))
-                    }
-                    other => {
-                        eprintln!("WARN: arrow MAP child type {other:?} not recognized => Null");
-                        Self::Map(Box::new(FieldEncoder::Null))
-                    }
+            DataType::Map(entry_field, _keys_sorted) => match entry_field.data_type() {
+                DataType::Struct(fs) if fs.len() == 2 => {
+                    let val_field = &fs[1];
+                    let val_enc = Self::try_new(val_field)?;
+                    Self::Map(Box::new(val_enc))
                 }
-            }
+                other => {
+                    eprintln!("WARN: arrow MAP child type {other:?} not recognized => Null");
+                    Self::Map(Box::new(Self::Null))
+                }
+            },
             DataType::FixedSizeBinary(n) => {
-                let n_usize = *n as usize;
                 let md = field.metadata();
                 match md.get("logicalType").map(|s| s.as_str()) {
-                    Some("uuid") if n_usize == 16 => Self::Uuid,
-                    Some("duration") if n_usize == 12 => Self::Duration,
-                    _ => Self::Fixed(n_usize),
+                    Some("uuid") if *n == 16 => Self::Uuid,
+                    Some("duration") if *n == 12 => Self::Duration,
+                    _ => Self::Fixed(*n as usize),
                 }
             }
-            // Logical
             DataType::Decimal128(p, s) => {
                 Self::Decimal128(*p as usize, *s as usize, Some(16))
             }
@@ -188,20 +232,22 @@ impl FieldEncoder {
                 let is_utc = tz_opt.as_deref() == Some("+00:00");
                 Self::TimestampMicros(is_utc)
             }
+            DataType::Interval(IntervalUnit::MonthDayNano) => {
+                Self::Duration
+            }
             other => {
                 eprintln!("WARN: unhandled Arrow type {other:?}, encoding as Null");
                 Self::Null
             }
         };
-        if field.is_nullable() && !matches!(enc, FieldEncoder::Null) {
+        if field.is_nullable() && !matches!(enc, Self::Null) {
             Ok(Self::Nullable(Box::new(enc)))
         } else {
             Ok(enc)
         }
     }
 
-    /// A `encode_one` handles writing a single Arrow column value into Avro bytes,
-    /// for a single row index.
+    /// Encode exactly one row from an Arrow array into Avro bytes.
     pub fn encode_one(
         &self,
         array: &dyn Array,
@@ -309,12 +355,12 @@ impl FieldEncoder {
                             .as_any()
                             .downcast_ref::<DictionaryArray<Int8Type>>()
                             .ok_or_else(|| {
-                                ArrowError::ParseError("Not a DictionaryArray<Int8> array".to_string())
+                                ArrowError::ParseError("Not a Dictionary<Int8> array".to_string())
                             })?;
                         let key_usize = dict_arr.key(row_idx).unwrap_or(0);
                         if key_usize > i32::MAX as usize {
                             return Err(ArrowError::InvalidArgumentError(format!(
-                                "Enum index {key_usize} out of i32 range for Avro enum"
+                                "Enum index {key_usize} out of i32 range"
                             )));
                         }
                         write_zigzag_long(key_usize as i64, out)?;
@@ -324,12 +370,12 @@ impl FieldEncoder {
                             .as_any()
                             .downcast_ref::<DictionaryArray<Int16Type>>()
                             .ok_or_else(|| {
-                                ArrowError::ParseError("Not a DictionaryArray<Int16> array".to_string())
+                                ArrowError::ParseError("Not a Dictionary<Int16> array".to_string())
                             })?;
                         let key_usize = dict_arr.key(row_idx).unwrap_or(0);
                         if key_usize > i32::MAX as usize {
                             return Err(ArrowError::InvalidArgumentError(format!(
-                                "Enum index {key_usize} out of i32 range for Avro enum"
+                                "Enum index {key_usize} out of i32 range"
                             )));
                         }
                         write_zigzag_long(key_usize as i64, out)?;
@@ -339,12 +385,12 @@ impl FieldEncoder {
                             .as_any()
                             .downcast_ref::<DictionaryArray<Int32Type>>()
                             .ok_or_else(|| {
-                                ArrowError::ParseError("Not a DictionaryArray<Int32> array".to_string())
+                                ArrowError::ParseError("Not a Dictionary<Int32> array".to_string())
                             })?;
                         let key_usize = dict_arr.key(row_idx).unwrap_or(0);
                         if key_usize > i32::MAX as usize {
                             return Err(ArrowError::InvalidArgumentError(format!(
-                                "Enum index {key_usize} out of i32 range for Avro enum"
+                                "Enum index {key_usize} out of i32 range"
                             )));
                         }
                         write_zigzag_long(key_usize as i64, out)?;
@@ -354,12 +400,12 @@ impl FieldEncoder {
                             .as_any()
                             .downcast_ref::<DictionaryArray<Int64Type>>()
                             .ok_or_else(|| {
-                                ArrowError::ParseError("Not a DictionaryArray<Int64> array".to_string())
+                                ArrowError::ParseError("Not a Dictionary<Int64> array".to_string())
                             })?;
                         let key_usize = dict_arr.key(row_idx).unwrap_or(0);
                         if key_usize > i32::MAX as usize {
                             return Err(ArrowError::InvalidArgumentError(format!(
-                                "Enum index {key_usize} out of i32 range for Avro enum"
+                                "Enum index {key_usize} out of i32 range"
                             )));
                         }
                         write_zigzag_long(key_usize as i64, out)?;
@@ -457,18 +503,23 @@ impl FieldEncoder {
                 Ok(())
             }
             FieldEncoder::Fixed(n) => {
-                let fsb_arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>()
-                    .ok_or_else(|| ArrowError::ParseError("Not a FixedSizeBinary array".to_string()))?;
+                let fsb_arr = array
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .ok_or_else(|| {
+                        ArrowError::ParseError("Not a FixedSizeBinary array".to_string())
+                    })?;
                 let val = fsb_arr.value(row_idx);
                 if val.len() != *n {
-                    return Err(ArrowError::InvalidArgumentError(
-                        format!("FixedSizeBinary length mismatch: expected {n}, got {}", val.len())
-                    ));
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "FixedSizeBinary length mismatch: expected {n}, got {}",
+                        val.len()
+                    )));
                 }
                 out.extend_from_slice(val);
                 Ok(())
             }
-            FieldEncoder::Decimal128(_precision, _scale, size_opt) => {
+            FieldEncoder::Decimal128(_p, _s, size_opt) => {
                 let dec_arr = array
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
@@ -476,9 +527,9 @@ impl FieldEncoder {
                         ArrowError::ParseError("Not a Decimal128 array".to_string())
                     })?;
                 let value = dec_arr.value(row_idx);
-                let be_bytes = value.to_be_bytes().to_vec();
+                let be_bytes = value.to_be_bytes();
                 let sign_byte = if value >= 0 { 0x00 } else { 0xFF };
-                let mut first_non_extend = 0;
+                let mut first_non_extend = 0usize;
                 while first_non_extend + 1 < be_bytes.len()
                     && be_bytes[first_non_extend] == sign_byte
                     && (be_bytes[first_non_extend + 1] & 0x80) == (sign_byte & 0x80)
@@ -486,14 +537,14 @@ impl FieldEncoder {
                     first_non_extend += 1;
                 }
                 let trimmed = &be_bytes[first_non_extend..];
-                if let Some(fix_size) = size_opt {
-                    if trimmed.len() > *fix_size {
+                if let Some(sz) = size_opt {
+                    if trimmed.len() > *sz {
                         return Err(ArrowError::InvalidArgumentError(
                             "Decimal128 value doesn't fit fixed size".to_string(),
                         ));
                     }
-                    let mut buf = vec![sign_byte; *fix_size];
-                    let start = fix_size - trimmed.len();
+                    let mut buf = vec![sign_byte; *sz];
+                    let start = sz - trimmed.len();
                     buf[start..].copy_from_slice(trimmed);
                     out.extend_from_slice(&buf);
                 } else {
@@ -502,7 +553,7 @@ impl FieldEncoder {
                 }
                 Ok(())
             }
-            FieldEncoder::Decimal256(_precision, _scale, size_opt) => {
+            FieldEncoder::Decimal256(_p, _s, size_opt) => {
                 let dec_arr = array
                     .as_any()
                     .downcast_ref::<Decimal256Array>()
@@ -510,25 +561,25 @@ impl FieldEncoder {
                         ArrowError::ParseError("Not a Decimal256 array".to_string())
                     })?;
                 let val_i256 = dec_arr.value(row_idx);
-                let mut le_bytes = val_i256.to_le_bytes();
-                le_bytes.reverse();
+                let mut be_bytes = val_i256.to_le_bytes();
+                be_bytes.reverse();
                 let sign_byte = if val_i256.is_negative() { 0xFF } else { 0x00 };
-                let mut idx = 0;
-                while idx + 1 < le_bytes.len()
-                    && le_bytes[idx] == sign_byte
-                    && (le_bytes[idx + 1] & 0x80) == (sign_byte & 0x80)
+                let mut first_non_extend = 0usize;
+                while first_non_extend + 1 < be_bytes.len()
+                    && be_bytes[first_non_extend] == sign_byte
+                    && (be_bytes[first_non_extend + 1] & 0x80) == (sign_byte & 0x80)
                 {
-                    idx += 1;
+                    first_non_extend += 1;
                 }
-                let trimmed = &le_bytes[idx..];
-                if let Some(fix_size) = size_opt {
-                    if trimmed.len() > *fix_size {
+                let trimmed = &be_bytes[first_non_extend..];
+                if let Some(sz) = size_opt {
+                    if trimmed.len() > *sz {
                         return Err(ArrowError::InvalidArgumentError(
                             "Decimal256 value doesn't fit fixed size".to_string(),
                         ));
                     }
-                    let mut buf = vec![sign_byte; *fix_size];
-                    let start = fix_size - trimmed.len();
+                    let mut buf = vec![sign_byte; *sz];
+                    let start = sz - trimmed.len();
                     buf[start..].copy_from_slice(trimmed);
                     out.extend_from_slice(&buf);
                 } else {
@@ -538,62 +589,91 @@ impl FieldEncoder {
                 Ok(())
             }
             FieldEncoder::Date32 => {
-                let arr = array.as_any().downcast_ref::<Date32Array>()
-                    .ok_or_else(|| ArrowError::ParseError("Not a Date32 array".to_string()))?;
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Date32Array>()
+                    .ok_or_else(|| {
+                        ArrowError::ParseError("Not a Date32 array".to_string())
+                    })?;
                 let val = arr.value(row_idx);
                 write_zigzag_long(val as i64, out)?;
                 Ok(())
             }
             FieldEncoder::TimeMillis => {
-                let arr = array.as_any().downcast_ref::<PrimitiveArray<Time32MillisecondType>>()
-                    .ok_or_else(|| ArrowError::ParseError("Not a Time32(Millisecond) array".to_string()))?;
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<PrimitiveArray<Time32MillisecondType>>()
+                    .ok_or_else(|| {
+                        ArrowError::ParseError("Not a Time32(Millis) array".to_string())
+                    })?;
                 let val = arr.value(row_idx);
                 write_zigzag_long(val as i64, out)?;
                 Ok(())
             }
             FieldEncoder::TimeMicros => {
-                let arr = array.as_any().downcast_ref::<PrimitiveArray<Time64MicrosecondType>>()
-                    .ok_or_else(|| ArrowError::ParseError("Not a Time64(Microsecond) array".to_string()))?;
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<PrimitiveArray<Time64MicrosecondType>>()
+                    .ok_or_else(|| {
+                        ArrowError::ParseError("Not a Time64(Micros) array".to_string())
+                    })?;
                 let val = arr.value(row_idx);
                 write_zigzag_long(val, out)?;
                 Ok(())
             }
             FieldEncoder::TimestampMillis(_is_utc) => {
-                let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>()
-                    .ok_or_else(|| ArrowError::ParseError("Not a Timestamp(Millisecond) array".to_string()))?;
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .ok_or_else(|| {
+                        ArrowError::ParseError("Not a Timestamp(Millis) array".to_string())
+                    })?;
                 let val = arr.value(row_idx);
                 write_zigzag_long(val, out)?;
                 Ok(())
             }
             FieldEncoder::TimestampMicros(_is_utc) => {
-                let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>()
-                    .ok_or_else(|| ArrowError::ParseError("Not a Timestamp(Microsecond) array".to_string()))?;
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .ok_or_else(|| {
+                        ArrowError::ParseError("Not a Timestamp(Micros) array".to_string())
+                    })?;
                 let val = arr.value(row_idx);
                 write_zigzag_long(val, out)?;
                 Ok(())
             }
             FieldEncoder::Uuid => {
-                let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>()
-                    .ok_or_else(|| ArrowError::ParseError("Not a FixedSizeBinary(16) array for Uuid".to_string()))?;
-                let val = arr.value(row_idx);
+                let fsb_arr = array
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .ok_or_else(|| {
+                        ArrowError::ParseError("Not a FixedSizeBinary(16) array".to_string())
+                    })?;
+                let val = fsb_arr.value(row_idx);
                 if val.len() != 16 {
-                    return Err(ArrowError::InvalidArgumentError(
-                        format!("Uuid field must be 16 bytes, got {}", val.len())
-                    ));
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "UUID field must be 16 bytes, got {}",
+                        val.len()
+                    )));
                 }
                 out.extend_from_slice(val);
                 Ok(())
             }
             FieldEncoder::Duration => {
-                let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>()
-                    .ok_or_else(|| ArrowError::ParseError("Not a FixedSizeBinary(12) array for duration".to_string()))?;
-                let val = arr.value(row_idx);
-                if val.len() != 12 {
-                    return Err(ArrowError::InvalidArgumentError(
-                        format!("Duration field must be 12 bytes, got {}", val.len())
-                    ));
-                }
-                out.extend_from_slice(val);
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<PrimitiveArray<IntervalMonthDayNanoType>>()
+                    .ok_or_else(|| {
+                        ArrowError::ParseError("Not IntervalMonthDayNano array".to_string())
+                    })?;
+                let val: IntervalMonthDayNano = arr.value(row_idx);
+                let months = val.months;
+                let days = val.days;
+                let ms = (val.nanoseconds / 1_000_000) as i32;
+                out.extend_from_slice(&months.to_le_bytes());
+                out.extend_from_slice(&days.to_le_bytes());
+                out.extend_from_slice(&ms.to_le_bytes());
                 Ok(())
             }
             FieldEncoder::Nullable(inner) => {
@@ -612,10 +692,7 @@ impl FieldEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{
-        BinaryArray, BooleanArray, FixedSizeBinaryArray, Float32Array,
-        Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    };
+    use arrow_array::{BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, Time32MillisecondArray, Time64MicrosecondArray};
     use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema as ArrowSchema};
     use std::sync::Arc;
     use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
@@ -866,32 +943,43 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_duration() -> Result<(), ArrowError> {
-        let val0 = b"hello1234567";
-        let val1 = b"abcXYZ456789";
-        let arr = FixedSizeBinaryArray::from(vec![Some(&val0[..]), Some(&val1[..])]);
-        let mut md = std::collections::HashMap::new();
-        md.insert("logicalType".to_string(), "duration".to_string());
-        let field = Field::new("dur_col", DataType::FixedSizeBinary(12), false)
-            .with_metadata(md);
+    fn test_encode_duration_interval() {
+        let data = vec![Some(IntervalMonthDayNano::new(2, 3, 1_000_000))];
+        let arr = PrimitiveArray::<IntervalMonthDayNanoType>::from(data);
+        let field = Field::new(
+            "duration_test",
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            false,
+        );
         let schema = ArrowSchema::new(vec![field.clone()]);
-        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])
+            .unwrap();
+        let mut encoder = RecordEncoder::try_new(&schema).unwrap();
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
-        assert_eq!(out.len(), 24, "2 rows * 12 bytes each");
-        assert_eq!(&out[0..12], b"hello1234567");
-        assert_eq!(&out[12..24], b"abcXYZ456789");
-        Ok(())
+        encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
+        assert_eq!(
+            &out,
+            &[
+                0x02, 0x00, 0x00, 0x00,
+                0x03, 0x00, 0x00, 0x00,
+                0x01, 0x00, 0x00, 0x00
+            ]
+        );
     }
 
     #[test]
     fn test_encode_enum_dictionary_int8_nullable() -> Result<(), ArrowError> {
+        use std::collections::HashMap;
         let keys = Int8Array::from(vec![Some(1i8), Some(0), None, Some(2), Some(2)]);
         let values = StringArray::from(vec!["GREEN", "RED", "BLUE"]);
         let dict_array = DictionaryArray::try_new(keys, Arc::new(values))?;
-        let field = Field::new("enum_col", dict_array.data_type().clone(), true);
+        let mut md = HashMap::new();
+        md.insert(
+            "avro.enum.symbols".to_string(),
+            "[\"GREEN\",\"RED\",\"BLUE\"]".to_string()
+        );
+        let field = Field::new("enum_col", dict_array.data_type().clone(), true)
+            .with_metadata(md);
         let schema = ArrowSchema::new(vec![field]);
         let batch = RecordBatch::try_new(
             Arc::new(schema.clone()),
@@ -936,12 +1024,22 @@ mod tests {
 
     #[test]
     fn test_encode_enum_dictionary_int64_in_range() -> Result<(), ArrowError> {
+        use std::collections::HashMap;
         let keys = Int64Array::from(vec![Some(0), Some(2)]);
         let values = StringArray::from(vec!["FISH", "DOG", "CAT"]);
         let dict_array = DictionaryArray::try_new(keys, Arc::new(values))?;
-        let field = Field::new("enum_col", dict_array.data_type().clone(), false);
+        let mut md = HashMap::new();
+        md.insert(
+            "avro.enum.symbols".to_string(),
+            "[\"FISH\",\"DOG\",\"CAT\"]".to_string()
+        );
+        let field = Field::new("enum_col", dict_array.data_type().clone(), false)
+            .with_metadata(md);
         let schema = ArrowSchema::new(vec![field]);
-        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(dict_array)])?;
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(dict_array)],
+        )?;
         let mut encoder = RecordEncoder::try_new(&schema)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;

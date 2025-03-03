@@ -46,9 +46,9 @@ impl AvroHeader {
     pub fn write_header(&self, sink: &mut dyn Write) -> Result<(), ArrowError> {
         sink.write_all(b"Obj\x01")
             .map_err(|e| to_arrow_io_err(e, "Writing Avro magic"))?;
-        let mut meta_entries = self.extra_meta.len() + 1; // for avro.schema
+        let mut meta_entries = self.extra_meta.len() + 1;
         if self.compression.is_some() {
-            meta_entries += 1; // for avro.codec
+            meta_entries += 1;
         }
         write_zigzag_long(meta_entries as i64, sink)?;
         let schema_json = serde_json::to_vec(&self.avro_schema)

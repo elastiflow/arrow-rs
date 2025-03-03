@@ -638,6 +638,7 @@ pub fn arrow_field_to_avro_datatype(field: &Field) -> Result<AvroDataType, Arrow
                 _ => Codec::Fixed(*n),
             }
         }
+        DataType::Interval(IntervalUnit::MonthDayNano) => Codec::Duration,
         DataType::Decimal128(p, s) => {
             Codec::Decimal(*p as usize, Some(*s as usize), Some(16))
         }
@@ -680,14 +681,22 @@ fn copy_metadata_to_attributes(
             || k == "aliases"
             || k == "namespace"
             || k == "doc"
-            || k == "logicalType"        // <-- prevents duplication of e.g. "decimal"
             || k.starts_with("avro.")
         {
             continue;
         }
+        // Here is the key change: for "precision" or "scale", try parsing as an integer.
+        let maybe_parsed_value = if k == "precision" || k == "scale" {
+            match v.parse::<i64>() {
+                Ok(parsed_int) => serde_json::Value::Number(parsed_int.into()),
+                Err(_) => serde_json::Value::String(v.clone()),
+            }
+        } else {
+            serde_json::Value::String(v.clone())
+        };
         target.additional.insert(
             Box::leak(k.clone().into_boxed_str()),
-            serde_json::Value::String(v.clone()),
+            maybe_parsed_value,
         );
     }
 }

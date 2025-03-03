@@ -263,11 +263,11 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::File;
     use super::*;
-    use arrow_array::{Array, Decimal128Array, Decimal256Array, DictionaryArray, FixedSizeBinaryArray, Int32Array, Int8Array, ListArray, MapArray, PrimitiveArray, StringArray, StructArray};
+    use arrow_array::{Array, Decimal128Array, Decimal256Array, DictionaryArray, Int32Array, Int8Array, ListArray, MapArray, PrimitiveArray, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Fields, IntervalUnit, Schema};
     use crate::reader::{Reader, ReaderBuilder};
     use std::io::{BufReader, Cursor};
-    use arrow_array::builder::{Decimal128Builder, Decimal256Builder, FixedSizeBinaryBuilder, Int32Builder, MapBuilder, StringBuilder};
+    use arrow_array::builder::{Decimal128Builder, Decimal256Builder, Int32Builder, MapBuilder, StringBuilder};
     use arrow_array::types::IntervalMonthDayNanoType;
     use arrow_buffer::{i256, Buffer, IntervalMonthDayNano};
     use arrow_data::ArrayData;
@@ -291,6 +291,15 @@ mod tests {
             "avro/alltypes_dictionary.avro",
             "avro/alltypes_nulls_plain.avro",
             "avro/binary.avro",
+            "avro/fixed_length_decimal.avro",
+            "avro/fixed_length_decimal_legacy.avro",
+            "avro/int32_decimal.avro",
+            "avro/int64_decimal.avro",
+            "avro/datapage_v2.snappy.avro",
+            "avro/dict-page-offset-zero.avro",
+            "avro/list_columns.avro",
+            "avro/nested_lists.snappy.avro",
+            "avro/nested_records.avro",
         ];
         for file in files {
             let file = arrow_test_data(file);
@@ -338,7 +347,6 @@ mod tests {
         Ok(())
     }
 
-
     fn round_trip(
         batches: &[RecordBatch],
         compression: Option<CompressionCodec>,
@@ -372,18 +380,17 @@ mod tests {
 
     #[test]
     fn test_round_trip_duration() -> Result<(), ArrowError> {
-        let row0 = [0u8; 12];
-        let row1 = [0, 0, 0, 0,   1, 0, 0, 0,   0xF4, 0x01, 0, 0];
-        let mut builder = FixedSizeBinaryBuilder::new(12);
-        builder.append_value(&row0)?;
-        builder.append_value(&row1)?;
-        let duration_array: FixedSizeBinaryArray = builder.finish();
-        let mut md = HashMap::new();
-        md.insert("logicalType".to_string(), "duration".to_string());
-        let field = Field::new("duration_col", DataType::FixedSizeBinary(12), true)
-            .with_metadata(md);
+        let row0 = IntervalMonthDayNano::new(0, 0, 0);
+        let row1 = IntervalMonthDayNano::new(0, 1, 500_000_000);
+        let data = vec![Some(row0), Some(row1)];
+        let interval_arr = PrimitiveArray::<IntervalMonthDayNanoType>::from(data);
+        let field = Field::new(
+            "duration_col",
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            true,
+        );
         let schema = Arc::new(Schema::new(vec![field]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(duration_array) as ArrayRef])?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(interval_arr) as ArrayRef])?;
         let out_batches = round_trip(&[batch], None)?;
         assert_eq!(out_batches.len(), 1);
         let out_batch = &out_batches[0];
