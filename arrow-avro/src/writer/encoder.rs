@@ -18,26 +18,24 @@
 //! Row-based encoder logic for Avro container files.
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Decimal128Array, Decimal256Array,
-    DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array,
-    Float64Array, Int32Array, Int64Array, LargeListArray, ListArray, MapArray,
-    PrimitiveArray, StringArray, StructArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray,
+    Array, BinaryArray, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
+    FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array,
+    Int64Array, LargeListArray, ListArray, MapArray, PrimitiveArray, StringArray,
+    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
 };
 use arrow_array::builder::{Decimal128Builder, Decimal256Builder};
 use arrow_array::types::{
     Int16Type, Int32Type, Int64Type, Int8Type, IntervalMonthDayNanoType,
     Time32MillisecondType, Time64MicrosecondType,
 };
-use arrow_buffer::i256;
-use arrow_buffer::IntervalMonthDayNano;
+use arrow_buffer::{i256, IntervalMonthDayNano};
 use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, TimeUnit};
 
+use crate::codec::Nullability;
 use crate::writer::zigzag::write_zigzag_long;
 
 /// A `FieldEncoder` is responsible for writing a single Arrow column's
-/// **one row** to Avro bytes. The top-level `RecordEncoder` calls
-/// `encode_one` in row-major order.
+/// **one row** to Avro bytes.
 #[derive(Debug)]
 enum FieldEncoder {
     /// Avro null
@@ -76,17 +74,19 @@ enum FieldEncoder {
     TimeMillis,
     /// Avro time-micros
     TimeMicros,
-    /// Avro timestamp-millis
+    /// Avro timestamp-millis (bool indicates whether to store as UTC)
     TimestampMillis(bool),
-    /// Avro timestamp-micros
+    /// Avro timestamp-micros (bool indicates whether to store as UTC)
     TimestampMicros(bool),
     /// Avro 16-byte UUID
     Uuid,
     /// Avro 12-byte duration (months, days, ms)
     Duration,
-
-    /// For `[ "null", T ]` union encoding in Avro
-    Nullable(Box<FieldEncoder>),
+    /// For union-encoded columns. The second param is the union ordering.
+    ///
+    /// - `NullFirst` => `[ "null", T ]` => branch=0 => null, branch=1 => T
+    /// - `NullSecond` => `[ T, "null" ]` => branch=0 => T, branch=1 => null
+    Nullable(Box<FieldEncoder>, Nullability),
 }
 
 /// The integral type used for dictionary keys in an Avro enum.
@@ -106,11 +106,16 @@ pub struct RecordEncoder {
 }
 
 impl RecordEncoder {
-    /// Create a new `RecordEncoder` from an Arrow schema.
-    pub fn try_new(schema: &arrow_schema::Schema) -> Result<Self, ArrowError> {
+    /// Create a new `RecordEncoder` from an Arrow schema,
+    /// specifying `impala_mode=true` if we want `[ T, "null" ]` ordering
+    /// for nullable fields.
+    pub fn try_new(
+        schema: &arrow_schema::Schema,
+        impala_mode: bool,
+    ) -> Result<Self, ArrowError> {
         let mut fields = Vec::with_capacity(schema.fields().len());
         for f in schema.fields() {
-            fields.push(FieldEncoder::try_new(f)?);
+            fields.push(FieldEncoder::try_new(f, impala_mode)?);
         }
         Ok(Self { fields })
     }
@@ -144,8 +149,11 @@ impl RecordEncoder {
 }
 
 impl FieldEncoder {
-    /// Determine how to encode a single Arrow `Field`.
-    pub fn try_new(field: &Field) -> Result<Self, ArrowError> {
+    /// Build a `FieldEncoder` for the given Arrow `Field`.
+    ///
+    /// If `impala` is true, and the field is nullable, we produce a union
+    /// that uses `[ T, "null" ]` ordering (`Nullability::NullSecond`).
+    pub fn try_new(field: &Field, impala: bool) -> Result<Self, ArrowError> {
         let dt = field.data_type();
         let enc = match dt {
             DataType::Null => Self::Null,
@@ -159,53 +167,58 @@ impl FieldEncoder {
             DataType::Struct(fields) => {
                 let mut child_encoders = Vec::with_capacity(fields.len());
                 for child_field in fields {
-                    child_encoders.push(Self::try_new(child_field)?);
+                    child_encoders.push(Self::try_new(child_field.as_ref(), impala)?);
                 }
                 Self::Record(child_encoders)
             }
-            DataType::Dictionary(key_dt, value_dt) => {
+            DataType::Dictionary(key_dt, _value_dt) => {
                 let valid_key = matches!(
                     key_dt.as_ref(),
                     DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
                 );
-                let valid_val = matches!(
-                    value_dt.as_ref(),
-                    DataType::Utf8 | DataType::LargeUtf8
-                );
-                match (valid_key && valid_val, field.metadata().get("avro.enum.symbols")) {
-                    (false, _) => Self::Utf8,
-                    (true, None) => Self::Utf8,
-                    (true, Some(_sym_json_str)) => {
-                        // Determine the dictionary key type
+                // If not recognized as enum => encode as string by default
+                if !valid_key {
+                    Self::Utf8
+                } else if let Some(sym_json_str) = field.metadata().get("avro.enum.symbols") {
+                    // parse:
+                    let parsed: serde_json::Value = serde_json::from_str(sym_json_str)
+                        .map_err(|e| {
+                            ArrowError::ParseError(format!(
+                                "Invalid JSON in avro.enum.symbols: {e}"
+                            ))
+                        })?;
+                    if !parsed.is_array() {
+                        // fallback
+                        Self::Utf8
+                    } else {
                         let key_enc = match key_dt.as_ref() {
                             DataType::Int8 => DictKeyEnc::Int8,
                             DataType::Int16 => DictKeyEnc::Int16,
                             DataType::Int32 => DictKeyEnc::Int32,
                             DataType::Int64 => DictKeyEnc::Int64,
-                            _ => DictKeyEnc::Int32, // fallback
+                            _ => DictKeyEnc::Int32,
                         };
                         Self::Enum(key_enc)
                     }
+                } else {
+                    Self::Utf8
                 }
             }
             DataType::List(child_field) | DataType::LargeList(child_field) => {
-                let child_enc = Self::try_new(child_field.as_ref())?;
+                let child_enc = Self::try_new(child_field.as_ref(), impala)?;
                 Self::Array(Box::new(child_enc))
             }
-            DataType::FixedSizeList(child_field, _) => {
-                let child_enc = Self::try_new(child_field.as_ref())?;
+            DataType::FixedSizeList(child_field, _sz) => {
+                let child_enc = Self::try_new(child_field.as_ref(), impala)?;
                 Self::Array(Box::new(child_enc))
             }
             DataType::Map(entry_field, _keys_sorted) => match entry_field.data_type() {
                 DataType::Struct(fs) if fs.len() == 2 => {
                     let val_field = &fs[1];
-                    let val_enc = Self::try_new(val_field)?;
+                    let val_enc = Self::try_new(val_field, impala)?;
                     Self::Map(Box::new(val_enc))
                 }
-                other => {
-                    eprintln!("WARN: arrow MAP child type {other:?} not recognized => Null");
-                    Self::Map(Box::new(Self::Null))
-                }
+                _ => Self::Null,
             },
             DataType::FixedSizeBinary(n) => {
                 let md = field.metadata();
@@ -232,16 +245,19 @@ impl FieldEncoder {
                 let is_utc = tz_opt.as_deref() == Some("+00:00");
                 Self::TimestampMicros(is_utc)
             }
-            DataType::Interval(IntervalUnit::MonthDayNano) => {
-                Self::Duration
-            }
+            DataType::Interval(IntervalUnit::MonthDayNano) => Self::Duration,
             other => {
                 eprintln!("WARN: unhandled Arrow type {other:?}, encoding as Null");
                 Self::Null
             }
         };
         if field.is_nullable() && !matches!(enc, Self::Null) {
-            Ok(Self::Nullable(Box::new(enc)))
+            let nullability = if impala {
+                Nullability::NullSecond
+            } else {
+                Nullability::NullFirst
+            };
+            Ok(Self::Nullable(Box::new(enc), nullability))
         } else {
             Ok(enc)
         }
@@ -355,14 +371,11 @@ impl FieldEncoder {
                             .as_any()
                             .downcast_ref::<DictionaryArray<Int8Type>>()
                             .ok_or_else(|| {
-                                ArrowError::ParseError("Not a Dictionary<Int8> array".to_string())
+                                ArrowError::ParseError(
+                                    "Not a Dictionary<Int8> array".to_string(),
+                                )
                             })?;
                         let key_usize = dict_arr.key(row_idx).unwrap_or(0);
-                        if key_usize > i32::MAX as usize {
-                            return Err(ArrowError::InvalidArgumentError(format!(
-                                "Enum index {key_usize} out of i32 range"
-                            )));
-                        }
                         write_zigzag_long(key_usize as i64, out)?;
                     }
                     DictKeyEnc::Int16 => {
@@ -370,14 +383,11 @@ impl FieldEncoder {
                             .as_any()
                             .downcast_ref::<DictionaryArray<Int16Type>>()
                             .ok_or_else(|| {
-                                ArrowError::ParseError("Not a Dictionary<Int16> array".to_string())
+                                ArrowError::ParseError(
+                                    "Not a Dictionary<Int16> array".to_string(),
+                                )
                             })?;
                         let key_usize = dict_arr.key(row_idx).unwrap_or(0);
-                        if key_usize > i32::MAX as usize {
-                            return Err(ArrowError::InvalidArgumentError(format!(
-                                "Enum index {key_usize} out of i32 range"
-                            )));
-                        }
                         write_zigzag_long(key_usize as i64, out)?;
                     }
                     DictKeyEnc::Int32 => {
@@ -385,14 +395,11 @@ impl FieldEncoder {
                             .as_any()
                             .downcast_ref::<DictionaryArray<Int32Type>>()
                             .ok_or_else(|| {
-                                ArrowError::ParseError("Not a Dictionary<Int32> array".to_string())
+                                ArrowError::ParseError(
+                                    "Not a Dictionary<Int32> array".to_string(),
+                                )
                             })?;
                         let key_usize = dict_arr.key(row_idx).unwrap_or(0);
-                        if key_usize > i32::MAX as usize {
-                            return Err(ArrowError::InvalidArgumentError(format!(
-                                "Enum index {key_usize} out of i32 range"
-                            )));
-                        }
                         write_zigzag_long(key_usize as i64, out)?;
                     }
                     DictKeyEnc::Int64 => {
@@ -400,14 +407,11 @@ impl FieldEncoder {
                             .as_any()
                             .downcast_ref::<DictionaryArray<Int64Type>>()
                             .ok_or_else(|| {
-                                ArrowError::ParseError("Not a Dictionary<Int64> array".to_string())
+                                ArrowError::ParseError(
+                                    "Not a Dictionary<Int64> array".to_string(),
+                                )
                             })?;
                         let key_usize = dict_arr.key(row_idx).unwrap_or(0);
-                        if key_usize > i32::MAX as usize {
-                            return Err(ArrowError::InvalidArgumentError(format!(
-                                "Enum index {key_usize} out of i32 range"
-                            )));
-                        }
                         write_zigzag_long(key_usize as i64, out)?;
                     }
                 }
@@ -422,6 +426,7 @@ impl FieldEncoder {
                             .ok_or_else(|| {
                                 ArrowError::ParseError("Not a List array".to_string())
                             })?;
+
                         let offset = list_arr.value_offsets()[row_idx] as usize;
                         let offset_next = list_arr.value_offsets()[row_idx + 1] as usize;
                         let length = offset_next - offset;
@@ -430,7 +435,9 @@ impl FieldEncoder {
                         for i in offset..offset_next {
                             child_enc.encode_one(values.as_ref(), i, out)?;
                         }
-                        write_zigzag_long(0, out)?;
+                        if length > 0 {
+                            write_zigzag_long(0, out)?;
+                        }
                     }
                     DataType::LargeList(_) => {
                         let ll_arr = array
@@ -447,15 +454,20 @@ impl FieldEncoder {
                         for i in offset..offset_next {
                             child_enc.encode_one(values.as_ref(), i, out)?;
                         }
-                        write_zigzag_long(0, out)?;
+                        if length > 0 {
+                            write_zigzag_long(0, out)?;
+                        }
                     }
                     DataType::FixedSizeList(_, size) => {
                         let fsl_arr = array
                             .as_any()
                             .downcast_ref::<FixedSizeListArray>()
                             .ok_or_else(|| {
-                                ArrowError::ParseError("Not a FixedSizeList array".to_string())
+                                ArrowError::ParseError(
+                                    "Not a FixedSizeList array".to_string(),
+                                )
                             })?;
+                        let length = *size;
                         let start = row_idx * *size as usize;
                         let end = start + *size as usize;
                         write_zigzag_long(*size as i64, out)?;
@@ -463,7 +475,10 @@ impl FieldEncoder {
                         for i in start..end {
                             child_enc.encode_one(values.as_ref(), i, out)?;
                         }
-                        write_zigzag_long(0, out)?;
+                        // Avro array termination
+                        if length > 0 {
+                            write_zigzag_long(0, out)?;
+                        }
                     }
                     dt => {
                         return Err(ArrowError::NotYetImplemented(format!(
@@ -480,10 +495,13 @@ impl FieldEncoder {
                     .ok_or_else(|| {
                         ArrowError::ParseError("Not a Map array".to_string())
                     })?;
+
                 let offset = map_array.value_offsets()[row_idx] as usize;
                 let offset_next = map_array.value_offsets()[row_idx + 1] as usize;
                 let length = offset_next - offset;
+
                 write_zigzag_long(length as i64, out)?;
+
                 let entries_struct = map_array.entries();
                 let key_arr = entries_struct
                     .column(0)
@@ -493,21 +511,29 @@ impl FieldEncoder {
                         ArrowError::ParseError("Map keys not a String array".to_string())
                     })?;
                 let val_arr = entries_struct.column(1);
+
                 for i in offset..offset_next {
                     let key_val = key_arr.value(i);
                     write_zigzag_long(key_val.len() as i64, out)?;
                     out.extend_from_slice(key_val.as_bytes());
                     val_enc.encode_one(val_arr.as_ref(), i, out)?;
                 }
-                write_zigzag_long(0, out)?;
+
+                // Only write the '0' terminator if we had a non-empty block
+                if length > 0 {
+                    write_zigzag_long(0, out)?;
+                }
                 Ok(())
             }
+
             FieldEncoder::Fixed(n) => {
                 let fsb_arr = array
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
                     .ok_or_else(|| {
-                        ArrowError::ParseError("Not a FixedSizeBinary array".to_string())
+                        ArrowError::ParseError(
+                            "Not a FixedSizeBinary array".to_string(),
+                        )
                     })?;
                 let val = fsb_arr.value(row_idx);
                 if val.len() != *n {
@@ -524,11 +550,14 @@ impl FieldEncoder {
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
                     .ok_or_else(|| {
-                        ArrowError::ParseError("Not a Decimal128 array".to_string())
+                        ArrowError::ParseError(
+                            "Not a Decimal128 array".to_string(),
+                        )
                     })?;
                 let value = dec_arr.value(row_idx);
                 let be_bytes = value.to_be_bytes();
                 let sign_byte = if value >= 0 { 0x00 } else { 0xFF };
+                // Trim sign extension
                 let mut first_non_extend = 0usize;
                 while first_non_extend + 1 < be_bytes.len()
                     && be_bytes[first_non_extend] == sign_byte
@@ -538,6 +567,7 @@ impl FieldEncoder {
                 }
                 let trimmed = &be_bytes[first_non_extend..];
                 if let Some(sz) = size_opt {
+                    // fixed-size decimal
                     if trimmed.len() > *sz {
                         return Err(ArrowError::InvalidArgumentError(
                             "Decimal128 value doesn't fit fixed size".to_string(),
@@ -548,6 +578,7 @@ impl FieldEncoder {
                     buf[start..].copy_from_slice(trimmed);
                     out.extend_from_slice(&buf);
                 } else {
+                    // variable-size decimal => length-prefix
                     write_zigzag_long(trimmed.len() as i64, out)?;
                     out.extend_from_slice(trimmed);
                 }
@@ -558,21 +589,27 @@ impl FieldEncoder {
                     .as_any()
                     .downcast_ref::<Decimal256Array>()
                     .ok_or_else(|| {
-                        ArrowError::ParseError("Not a Decimal256 array".to_string())
+                        ArrowError::ParseError(
+                            "Not a Decimal256 array".to_string(),
+                        )
                     })?;
                 let val_i256 = dec_arr.value(row_idx);
+                // Convert to big-endian
                 let mut be_bytes = val_i256.to_le_bytes();
                 be_bytes.reverse();
                 let sign_byte = if val_i256.is_negative() { 0xFF } else { 0x00 };
+                // Trim sign extension
                 let mut first_non_extend = 0usize;
                 while first_non_extend + 1 < be_bytes.len()
                     && be_bytes[first_non_extend] == sign_byte
-                    && (be_bytes[first_non_extend + 1] & 0x80) == (sign_byte & 0x80)
+                    && (be_bytes[first_non_extend + 1] & 0x80)
+                    == (sign_byte & 0x80)
                 {
                     first_non_extend += 1;
                 }
                 let trimmed = &be_bytes[first_non_extend..];
                 if let Some(sz) = size_opt {
+                    // fixed-size
                     if trimmed.len() > *sz {
                         return Err(ArrowError::InvalidArgumentError(
                             "Decimal256 value doesn't fit fixed size".to_string(),
@@ -583,6 +620,7 @@ impl FieldEncoder {
                     buf[start..].copy_from_slice(trimmed);
                     out.extend_from_slice(&buf);
                 } else {
+                    // variable-size => length + data
                     write_zigzag_long(trimmed.len() as i64, out)?;
                     out.extend_from_slice(trimmed);
                 }
@@ -604,7 +642,9 @@ impl FieldEncoder {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Time32MillisecondType>>()
                     .ok_or_else(|| {
-                        ArrowError::ParseError("Not a Time32(Millis) array".to_string())
+                        ArrowError::ParseError(
+                            "Not a Time32(Millis) array".to_string(),
+                        )
                     })?;
                 let val = arr.value(row_idx);
                 write_zigzag_long(val as i64, out)?;
@@ -615,7 +655,9 @@ impl FieldEncoder {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Time64MicrosecondType>>()
                     .ok_or_else(|| {
-                        ArrowError::ParseError("Not a Time64(Micros) array".to_string())
+                        ArrowError::ParseError(
+                            "Not a Time64(Micros) array".to_string(),
+                        )
                     })?;
                 let val = arr.value(row_idx);
                 write_zigzag_long(val, out)?;
@@ -626,7 +668,9 @@ impl FieldEncoder {
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
                     .ok_or_else(|| {
-                        ArrowError::ParseError("Not a Timestamp(Millis) array".to_string())
+                        ArrowError::ParseError(
+                            "Not a Timestamp(Millis) array".to_string(),
+                        )
                     })?;
                 let val = arr.value(row_idx);
                 write_zigzag_long(val, out)?;
@@ -637,7 +681,9 @@ impl FieldEncoder {
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .ok_or_else(|| {
-                        ArrowError::ParseError("Not a Timestamp(Micros) array".to_string())
+                        ArrowError::ParseError(
+                            "Not a Timestamp(Micros) array".to_string(),
+                        )
                     })?;
                 let val = arr.value(row_idx);
                 write_zigzag_long(val, out)?;
@@ -648,7 +694,9 @@ impl FieldEncoder {
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
                     .ok_or_else(|| {
-                        ArrowError::ParseError("Not a FixedSizeBinary(16) array".to_string())
+                        ArrowError::ParseError(
+                            "Not a FixedSizeBinary(16) array".to_string(),
+                        )
                     })?;
                 let val = fsb_arr.value(row_idx);
                 if val.len() != 16 {
@@ -665,23 +713,44 @@ impl FieldEncoder {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<IntervalMonthDayNanoType>>()
                     .ok_or_else(|| {
-                        ArrowError::ParseError("Not IntervalMonthDayNano array".to_string())
+                        ArrowError::ParseError(
+                            "Not IntervalMonthDayNano array".to_string(),
+                        )
                     })?;
                 let val: IntervalMonthDayNano = arr.value(row_idx);
                 let months = val.months;
                 let days = val.days;
+                // Convert total nanoseconds to milliseconds
                 let ms = (val.nanoseconds / 1_000_000) as i32;
                 out.extend_from_slice(&months.to_le_bytes());
                 out.extend_from_slice(&days.to_le_bytes());
                 out.extend_from_slice(&ms.to_le_bytes());
                 Ok(())
             }
-            FieldEncoder::Nullable(inner) => {
-                if array.is_null(row_idx) {
-                    write_zigzag_long(0, out)?;
-                } else {
-                    write_zigzag_long(1, out)?;
-                    inner.encode_one(array, row_idx, out)?;
+            FieldEncoder::Nullable(inner, nb) => {
+                match nb {
+                    // Standard Avro => [ "null", T ] => branch=0 => null, branch=1 => T
+                    Nullability::NullFirst => {
+                        if array.is_null(row_idx) {
+                            // pick union-variant #0 => null
+                            write_zigzag_long(0, out)?;
+                        } else {
+                            // pick union-variant #1 => T
+                            write_zigzag_long(1, out)?;
+                            inner.encode_one(array, row_idx, out)?;
+                        }
+                    }
+                    // Impala => [ T, "null" ] => branch=0 => T, branch=1 => null
+                    Nullability::NullSecond => {
+                        if array.is_null(row_idx) {
+                            // => branch=1 => null
+                            write_zigzag_long(1, out)?;
+                        } else {
+                            // => branch=0 => T
+                            write_zigzag_long(0, out)?;
+                            inner.encode_one(array, row_idx, out)?;
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -758,7 +827,7 @@ mod tests {
         let field = Field::new("date_col", DataType::Date32, false);
         let schema = ArrowSchema::new(vec![field.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(date_arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -779,7 +848,7 @@ mod tests {
         let field = Field::new("time_ms", DataType::Time32(TimeUnit::Millisecond), false);
         let schema = ArrowSchema::new(vec![field.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -800,7 +869,7 @@ mod tests {
         let field = Field::new("time_us", DataType::Time64(TimeUnit::Microsecond), false);
         let schema = ArrowSchema::new(vec![field.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -828,7 +897,7 @@ mod tests {
         let field = Field::new("ts_ms_utc", data_type, false);
         let schema = ArrowSchema::new(vec![field.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -853,7 +922,7 @@ mod tests {
         );
         let schema = ArrowSchema::new(vec![field.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -881,7 +950,7 @@ mod tests {
         let field = Field::new("ts_us_utc", data_type, false);
         let schema = ArrowSchema::new(vec![field]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -906,7 +975,7 @@ mod tests {
         );
         let schema = ArrowSchema::new(vec![field.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -932,7 +1001,7 @@ mod tests {
             ]));
         let schema = ArrowSchema::new(vec![field.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -954,7 +1023,7 @@ mod tests {
         let schema = ArrowSchema::new(vec![field.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])
             .unwrap();
-        let mut encoder = RecordEncoder::try_new(&schema).unwrap();
+        let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
         assert_eq!(
@@ -985,7 +1054,7 @@ mod tests {
             Arc::new(schema.clone()),
             vec![Arc::new(dict_array)],
         )?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         for row_idx in 0..5 {
             encoder.encode_row(&schema, &batch, row_idx, &mut out)?;
@@ -1040,7 +1109,7 @@ mod tests {
             Arc::new(schema.clone()),
             vec![Arc::new(dict_array)],
         )?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -1071,7 +1140,7 @@ mod tests {
         let map_array = map_builder.finish();
         assert_eq!(map_array.len(), 2);
         let field = Field::new("my_map", map_array.data_type().clone(), true);
-        let map_encoder = FieldEncoder::try_new(&field).expect("Failed to build FieldEncoder");
+        let map_encoder = FieldEncoder::try_new(&field, false).expect("Failed to build FieldEncoder");
         let mut encoded = Vec::new();
         map_encoder.encode_one(&map_array, 0, &mut encoded).unwrap();
         map_encoder.encode_one(&map_array, 1, &mut encoded).unwrap();
@@ -1088,7 +1157,7 @@ mod tests {
         assert_eq!(map_array.len(), 1, "Expected 1 row");
         assert!(map_array.is_null(0), "Row 0 should be null");
         let field = Field::new("nullable_map", map_array.data_type().clone(), true);
-        let enc = FieldEncoder::try_new(&field).unwrap();
+        let enc = FieldEncoder::try_new(&field, false).unwrap();
         let mut buf = Vec::new();
         enc.encode_one(&map_array, 0, &mut buf).unwrap();
         assert_eq!(buf, vec![0x00], "Expected union=0 => null for a null map");
@@ -1108,7 +1177,7 @@ mod tests {
         );
         let schema = ArrowSchema::new(vec![Field::new("ll_col", ll_type, false)]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(ll_arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -1152,7 +1221,7 @@ mod tests {
         );
         let schema = ArrowSchema::new(vec![Field::new("list_col", list_type, false)]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(list_arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -1201,7 +1270,7 @@ mod tests {
         let schema = ArrowSchema::new(vec![top_level_field]);
         let batch =
             RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(fsl_arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -1249,7 +1318,7 @@ mod tests {
         );
         let schema = ArrowSchema::new(vec![Field::new("nested_rec", struct_type, false)]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(struct_array)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         encoder.encode_row(&schema, &batch, 1, &mut out)?;
@@ -1282,7 +1351,7 @@ mod tests {
         let field = Field::new("dec128", DataType::Decimal128(10, 2), false);
         let schema = ArrowSchema::new(vec![field]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(decimal_arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         assert_eq!(out.len(), 16);
@@ -1298,7 +1367,7 @@ mod tests {
         let field = Field::new("dec256", DataType::Decimal256(12, 2), false);
         let schema = ArrowSchema::new(vec![field]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(decimal_arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out)?;
         assert_eq!(out.len(), 32);
@@ -1314,7 +1383,7 @@ mod tests {
         let field = Field::new("dec_col", DataType::Decimal128(10, 2), false);
         let schema = ArrowSchema::new(vec![field]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(decimal_arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         if let FieldEncoder::Decimal128(_, _, ref mut size_opt) = encoder.fields[0] {
             *size_opt = None;
         }
@@ -1332,7 +1401,7 @@ mod tests {
         let schema = ArrowSchema::new(vec![Field::new("bool_col", DataType::Boolean, false)]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(bool_arr)])
             .unwrap();
-        let mut encoder = RecordEncoder::try_new(&schema).unwrap();
+        let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
         let got = decode_avro_boolean(&out);
@@ -1345,7 +1414,7 @@ mod tests {
         let schema = ArrowSchema::new(vec![Field::new("int_col", DataType::Int32, false)]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(int_arr)])
             .unwrap();
-        let mut encoder = RecordEncoder::try_new(&schema).unwrap();
+        let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
         let (decoded, consumed) = decode_zigzag_long(&out);
@@ -1359,7 +1428,7 @@ mod tests {
         let schema = ArrowSchema::new(vec![Field::new("long_col", DataType::Int64, false)]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(long_arr)])
             .unwrap();
-        let mut encoder = RecordEncoder::try_new(&schema).unwrap();
+        let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
         let (decoded, consumed) = decode_zigzag_long(&out);
@@ -1373,7 +1442,7 @@ mod tests {
         let schema = ArrowSchema::new(vec![Field::new("float_col", DataType::Float32, false)]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(float_arr)])
             .unwrap();
-        let mut encoder = RecordEncoder::try_new(&schema).unwrap();
+        let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
         let got = decode_avro_f32(&out);
@@ -1386,7 +1455,7 @@ mod tests {
         let schema = ArrowSchema::new(vec![Field::new("double_col", DataType::Float64, false)]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(double_arr)])
             .unwrap();
-        let mut encoder = RecordEncoder::try_new(&schema).unwrap();
+        let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
         let got = decode_avro_f64(&out);
@@ -1399,7 +1468,7 @@ mod tests {
         let schema = ArrowSchema::new(vec![Field::new("bin_col", DataType::Binary, false)]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(bin_arr)])
             .unwrap();
-        let mut encoder = RecordEncoder::try_new(&schema).unwrap();
+        let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
         let got = decode_avro_bytes(&out);
@@ -1412,7 +1481,7 @@ mod tests {
         let schema = ArrowSchema::new(vec![Field::new("str_col", DataType::Utf8, false)]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(str_arr)])
             .unwrap();
-        let mut encoder = RecordEncoder::try_new(&schema).unwrap();
+        let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
         let got = decode_avro_string(&out);
@@ -1433,7 +1502,7 @@ mod tests {
             Arc::new(schema.clone()),
             vec![Arc::new(arr)],
         ).unwrap();
-        let mut encoder = RecordEncoder::try_new(&schema).unwrap();
+        let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
         assert_eq!(out.len(), 5);
@@ -1446,7 +1515,7 @@ mod tests {
         let field = Field::new("maybe_str", DataType::Utf8, true);
         let schema = ArrowSchema::new(vec![field]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(str_arr)])?;
-        let mut encoder = RecordEncoder::try_new(&schema)?;
+        let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out0 = Vec::new();
         encoder.encode_row(&schema, &batch, 0, &mut out0)?;
         let (branch, consumed) = decode_zigzag_long(&out0);

@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 //! This module provides writing capabilities for Avro container files,
 
 mod block;
@@ -41,7 +40,7 @@ use header::AvroHeader;
 /// A builder for creating an Avro [`Writer`] for Arrow data.
 ///
 /// Use this builder to configure options like compression, max block size,
-/// custom Avro schema, etc., before creating the writer.
+/// custom Avro schema, out-of-spec Impala union ordering, etc., before creating the writer.
 pub struct WriterBuilder<W: Write> {
     /// The underlying output [`Write`] to which Avro data is written.
     writer: W,
@@ -63,6 +62,10 @@ pub struct WriterBuilder<W: Write> {
 
     /// If provided, the 16-byte sync marker used in the file; otherwise generated.
     sync_marker: Option<[u8; 16]>,
+
+    /// If `true`, produce unions with `[ T, "null" ]` ordering (Impala style)
+    /// rather than the standard `[ "null", T ]`.
+    impala: bool,
 }
 
 impl<W: Write> WriterBuilder<W> {
@@ -76,6 +79,7 @@ impl<W: Write> WriterBuilder<W> {
             max_block_size: 16 * 1024 * 1024,
             extra_meta: vec![],
             sync_marker: None,
+            impala: false,
         }
     }
 
@@ -111,6 +115,13 @@ impl<W: Write> WriterBuilder<W> {
         self
     }
 
+    /// **New:** If `impala` is true, produce `[ T, "null" ]` union ordering for nullable fields
+    /// (matching Impala's out-of-spec union ordering), instead of the typical `[ "null", T ]`.
+    pub fn with_impala(mut self, impala: bool) -> Self {
+        self.impala = impala;
+        self
+    }
+
     /// Finalize the configuration and construct the [`Writer`], immediately
     /// writing the Avro file header to the underlying output.
     ///
@@ -121,7 +132,7 @@ impl<W: Write> WriterBuilder<W> {
     pub fn build(mut self) -> Result<Writer<W>, ArrowError> {
         let avro_schema = match self.avro_schema.take() {
             Some(sch) => sch,
-            None => arrow_schema_to_avro_schema(&self.arrow_schema)?,
+            None => arrow_schema_to_avro_schema(&self.arrow_schema, self.impala)?,
         };
         let sync_marker = self.sync_marker.unwrap_or([0xAA; 16]);
         let header = AvroHeader {
@@ -136,7 +147,7 @@ impl<W: Write> WriterBuilder<W> {
             sync_marker,
             self.max_block_size,
         );
-        let record_encoder = RecordEncoder::try_new(self.arrow_schema.as_ref())?;
+        let record_encoder = RecordEncoder::try_new(self.arrow_schema.as_ref(), self.impala)?;
         Ok(Writer {
             sink: self.writer,
             header_written: true,
@@ -265,20 +276,13 @@ mod tests {
     use super::*;
     use arrow_array::{Array, Decimal128Array, Decimal256Array, DictionaryArray, Int32Array, Int8Array, ListArray, MapArray, PrimitiveArray, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Fields, IntervalUnit, Schema};
-    use crate::reader::{Reader, ReaderBuilder};
+    use crate::reader::{ReaderBuilder};
     use std::io::{BufReader, Cursor};
     use arrow_array::builder::{Decimal128Builder, Decimal256Builder, Int32Builder, MapBuilder, StringBuilder};
     use arrow_array::types::IntervalMonthDayNanoType;
     use arrow_buffer::{i256, Buffer, IntervalMonthDayNano};
     use arrow_data::ArrayData;
     use crate::test_util::arrow_test_data;
-
-    fn read_file(path: &str, _schema: Option<Schema>) -> Reader<BufReader<File>> {
-        let file = File::open(path).unwrap();
-        let reader = BufReader::new(file);
-        let builder = ReaderBuilder::new().with_batch_size(64);
-        builder.build(reader).unwrap()
-    }
 
     #[test]
     fn test_round_trip_files() -> Result<(), ArrowError> {
@@ -300,10 +304,19 @@ mod tests {
             "avro/list_columns.avro",
             "avro/nested_lists.snappy.avro",
             "avro/nested_records.avro",
+            "avro/nonnullable.impala.avro",
+            "avro/nullable.impala.avro",
+            "avro/nulls.snappy.avro",
+            "avro/repeated_no_annotation.avro",
+            //"avro/simple_enum.avro"
         ];
         for file in files {
-            let file = arrow_test_data(file);
-            let mut original_reader = read_file(&file, None);
+            let file_path = arrow_test_data(file);
+            let mut original_reader = {
+                let f = File::open(&file_path).unwrap();
+                let bf = BufReader::new(f);
+                ReaderBuilder::new().with_batch_size(64).build(bf)?
+            };
             let mut original_batches = Vec::new();
             while let Some(batch) = original_reader.next() {
                 original_batches.push(batch?);
@@ -311,7 +324,9 @@ mod tests {
             let mut buffer = Vec::new();
             if !original_batches.is_empty() {
                 let schema = original_batches[0].schema();
-                let mut writer = WriterBuilder::new(&mut buffer, schema.clone()).build()?;
+                let mut writer = WriterBuilder::new(&mut buffer, schema.clone())
+                    .with_impala(true)
+                    .build()?;
                 for batch in &original_batches {
                     writer.write(batch)?;
                 }
