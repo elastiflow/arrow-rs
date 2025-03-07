@@ -10,8 +10,8 @@
 //
 // Unless required by applicable law or agreed to in writing,
 // software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS
-// OF ANY KIND, either express or implied.  See the License for the
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
 
@@ -363,9 +363,15 @@ fn make_data_type<'a>(
                 Ok(rec_dt)
             }
             ComplexType::Enum(e) => {
+                // Insert "avro.enum.symbols" into metadata so we can preserve it.
+                let mut md = e.attributes.field_metadata();
+                if let Ok(symbols_json) = serde_json::to_string(&e.symbols) {
+                    md.insert("avro.enum.symbols".to_string(), symbols_json);
+                }
+
                 let en = AvroDataType {
                     nullability: None,
-                    metadata: Arc::new(e.attributes.field_metadata()),
+                    metadata: Arc::new(md),
                     codec: Codec::Enum(
                         Arc::from(
                             e.symbols
@@ -983,7 +989,6 @@ pub fn field_to_schema(data_type: &AvroDataType) -> Result<Schema<'static>, Arro
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1556,8 +1561,8 @@ mod tests {
             default: Some(json!(42)),
         };
         let arrow_field = field.field();
-        let md = arrow_field.metadata();
-        let got = md.get("avro.default").cloned();
+        let metadata = arrow_field.metadata();
+        let got = metadata.get("avro.default").cloned();
         assert_eq!(got, Some("42".to_string()));
     }
 

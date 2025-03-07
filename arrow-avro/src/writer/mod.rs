@@ -65,7 +65,7 @@ pub struct WriterBuilder<W: Write> {
 
     /// If `true`, produce unions with `[ T, "null" ]` ordering (Impala style)
     /// rather than the standard `[ "null", T ]`.
-    impala: bool,
+    impala_mode: bool,
 }
 
 impl<W: Write> WriterBuilder<W> {
@@ -79,7 +79,7 @@ impl<W: Write> WriterBuilder<W> {
             max_block_size: 16 * 1024 * 1024,
             extra_meta: vec![],
             sync_marker: None,
-            impala: false,
+            impala_mode: false,
         }
     }
 
@@ -115,10 +115,10 @@ impl<W: Write> WriterBuilder<W> {
         self
     }
 
-    /// **New:** If `impala` is true, produce `[ T, "null" ]` union ordering for nullable fields
+    /// **New:** If `impala_mode` is true, produce `[ T, "null" ]` union ordering for nullable fields
     /// (matching Impala's out-of-spec union ordering), instead of the typical `[ "null", T ]`.
-    pub fn with_impala(mut self, impala: bool) -> Self {
-        self.impala = impala;
+    pub fn with_impala_mode(mut self, impala: bool) -> Self {
+        self.impala_mode = impala;
         self
     }
 
@@ -132,7 +132,7 @@ impl<W: Write> WriterBuilder<W> {
     pub fn build(mut self) -> Result<Writer<W>, ArrowError> {
         let avro_schema = match self.avro_schema.take() {
             Some(sch) => sch,
-            None => arrow_schema_to_avro_schema(&self.arrow_schema, self.impala)?,
+            None => arrow_schema_to_avro_schema(&self.arrow_schema, self.impala_mode)?,
         };
         let sync_marker = self.sync_marker.unwrap_or([0xAA; 16]);
         let header = AvroHeader {
@@ -147,7 +147,7 @@ impl<W: Write> WriterBuilder<W> {
             sync_marker,
             self.max_block_size,
         );
-        let record_encoder = RecordEncoder::try_new(self.arrow_schema.as_ref(), self.impala)?;
+        let record_encoder = RecordEncoder::try_new(self.arrow_schema.as_ref(), self.impala_mode)?;
         Ok(Writer {
             sink: self.writer,
             header_written: true,
@@ -287,30 +287,32 @@ mod tests {
     #[test]
     fn test_round_trip_files() -> Result<(), ArrowError> {
         let files = [
-            "avro/alltypes_plain.avro",
-            "avro/alltypes_plain.snappy.avro",
-            "avro/alltypes_plain.zstandard.avro",
-            "avro/alltypes_plain.bzip2.avro",
-            "avro/alltypes_plain.xz.avro",
-            "avro/alltypes_dictionary.avro",
-            "avro/alltypes_nulls_plain.avro",
-            "avro/binary.avro",
-            "avro/fixed_length_decimal.avro",
-            "avro/fixed_length_decimal_legacy.avro",
-            "avro/int32_decimal.avro",
-            "avro/int64_decimal.avro",
-            "avro/datapage_v2.snappy.avro",
-            "avro/dict-page-offset-zero.avro",
-            "avro/list_columns.avro",
-            "avro/nested_lists.snappy.avro",
-            "avro/nested_records.avro",
-            "avro/nonnullable.impala.avro",
-            "avro/nullable.impala.avro",
-            "avro/nulls.snappy.avro",
-            "avro/repeated_no_annotation.avro",
-            //"avro/simple_enum.avro"
+            ("avro/alltypes_plain.avro", false),
+            ("avro/alltypes_plain.snappy.avro", false),
+            ("avro/alltypes_plain.zstandard.avro", false),
+            ("avro/alltypes_plain.bzip2.avro", false),
+            ("avro/alltypes_plain.xz.avro", false),
+            ("avro/alltypes_dictionary.avro", false),
+            ("avro/alltypes_nulls_plain.avro", false),
+            ("avro/binary.avro", false),
+            ("avro/fixed_length_decimal.avro", false),
+            ("avro/fixed_length_decimal_legacy.avro", false),
+            ("avro/int32_decimal.avro", false),
+            ("avro/int64_decimal.avro", false),
+            ("avro/datapage_v2.snappy.avro", false),
+            ("avro/dict-page-offset-zero.avro", false),
+            ("avro/list_columns.avro", false),
+            ("avro/nested_lists.snappy.avro", false),
+            ("avro/nested_records.avro", false),
+            ("avro/nonnullable.impala.avro", true),
+            ("avro/nullable.impala.avro", true),
+            ("avro/nulls.snappy.avro", false),
+            ("avro/repeated_no_annotation.avro", false),
+            ("avro/simple_enum.avro", false),
+            ("avro/simple_fixed.avro", false),
+            ("avro/single_nan.avro", false),
         ];
-        for file in files {
+        for (file, mode) in files {
             let file_path = arrow_test_data(file);
             let mut original_reader = {
                 let f = File::open(&file_path).unwrap();
@@ -325,7 +327,7 @@ mod tests {
             if !original_batches.is_empty() {
                 let schema = original_batches[0].schema();
                 let mut writer = WriterBuilder::new(&mut buffer, schema.clone())
-                    .with_impala(true)
+                    .with_impala_mode(mode)
                     .build()?;
                 for batch in &original_batches {
                     writer.write(batch)?;

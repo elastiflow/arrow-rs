@@ -1691,7 +1691,9 @@ mod test {
 
     #[test]
     fn test_simple() {
+
         fn build_expected_enum() -> RecordBatch {
+            // Build the DictionaryArrays for f1, f2, f3
             let keys_f1 = Int32Array::from(vec![0, 1, 2, 3]);
             let vals_f1 = StringArray::from(vec!["a", "b", "c", "d"]);
             let f1_dict =
@@ -1706,10 +1708,28 @@ mod test {
                 DictionaryArray::<Int32Type>::try_new(keys_f3, Arc::new(vals_f3)).unwrap();
             let dict_type =
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+            let mut md_f1 = HashMap::new();
+            md_f1.insert(
+                "avro.enum.symbols".to_string(),
+                r#"["a","b","c","d"]"#.to_string(),
+            );
+            let f1_field = Field::new("f1", dict_type.clone(), false).with_metadata(md_f1);
+            let mut md_f2 = HashMap::new();
+            md_f2.insert(
+                "avro.enum.symbols".to_string(),
+                r#"["e","f","g","h"]"#.to_string(),
+            );
+            let f2_field = Field::new("f2", dict_type.clone(), false).with_metadata(md_f2);
+            let mut md_f3 = HashMap::new();
+            md_f3.insert(
+                "avro.enum.symbols".to_string(),
+                r#"["i","j","k"]"#.to_string(),
+            );
+            let f3_field = Field::new("f3", dict_type.clone(), true).with_metadata(md_f3);
             let expected_schema = Arc::new(Schema::new(vec![
-                Field::new("f1", dict_type.clone(), false),
-                Field::new("f2", dict_type.clone(), false),
-                Field::new("f3", dict_type.clone(), true),
+                f1_field,
+                f2_field,
+                f3_field,
             ]));
             RecordBatch::try_new(
                 expected_schema,
@@ -1719,25 +1739,26 @@ mod test {
                     Arc::new(f3_dict) as Arc<dyn Array>,
                 ],
             )
-            .unwrap()
+                .unwrap()
         }
 
         fn build_expected_fixed() -> RecordBatch {
-            let f1 =
-                FixedSizeBinaryArray::try_from_iter(vec![b"abcde", b"12345"].into_iter()).unwrap();
-            let f2 =
-                FixedSizeBinaryArray::try_from_iter(vec![b"fghijklmno", b"1234567890"].into_iter())
-                    .unwrap();
+            let f1 = FixedSizeBinaryArray::try_from_iter(
+                vec![b"abcde", b"12345"].into_iter()
+            ).unwrap();
+            let f2 = FixedSizeBinaryArray::try_from_iter(
+                vec![b"fghijklmno", b"1234567890"].into_iter()
+            ).unwrap();
             let f3 = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
                 vec![Some(b"ABCDEF" as &[u8]), None].into_iter(),
                 6,
-            )
-            .unwrap();
+            ).unwrap();
             let expected_schema = Arc::new(Schema::new(vec![
                 Field::new("f1", DataType::FixedSizeBinary(5), false),
                 Field::new("f2", DataType::FixedSizeBinary(10), false),
                 Field::new("f3", DataType::FixedSizeBinary(6), true),
             ]));
+
             RecordBatch::try_new(
                 expected_schema,
                 vec![
@@ -1746,14 +1767,13 @@ mod test {
                     Arc::new(f3) as Arc<dyn Array>,
                 ],
             )
-            .unwrap()
+                .unwrap()
         }
-
-        // We list the two test files
         let tests = [
             ("avro/simple_enum.avro", build_expected_enum()),
             ("avro/simple_fixed.avro", build_expected_fixed()),
         ];
+
         for (file_name, expected) in tests {
             let file = arrow_test_data(file_name);
             let mut reader = read_file(&file, None);
@@ -1761,9 +1781,11 @@ mod test {
                 .next()
                 .expect("Should have a batch")
                 .expect("Error reading batch");
+
             assert_eq!(actual, expected, "Mismatch for file {file_name}");
         }
     }
+
 
     #[test]
     fn test_single_nan() {
