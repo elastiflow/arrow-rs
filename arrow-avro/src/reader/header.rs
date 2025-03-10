@@ -208,7 +208,6 @@ impl HeaderDecoder {
                     buf = &buf[to_read..];
                     if self.bytes_remaining == 0 {
                         self.meta_offsets.push(self.meta_buf.len());
-
                         self.tuples_remaining -= 1;
                         match self.tuples_remaining {
                             0 => self.state = HeaderDecoderState::BlockCount,

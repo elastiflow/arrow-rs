@@ -29,7 +29,6 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, SchemaRef};
 
-use crate::codec::arrow_schema_to_avro_schema;
 use crate::compression::CompressionCodec;
 use crate::schema::Schema as AvroSchema;
 
@@ -130,13 +129,10 @@ impl<W: Write> WriterBuilder<W> {
     /// Returns an error if the Arrow schema cannot be converted to Avro
     /// or if writing the header fails.
     pub fn build(mut self) -> Result<Writer<W>, ArrowError> {
-        let avro_schema = match self.avro_schema.take() {
-            Some(sch) => sch,
-            None => arrow_schema_to_avro_schema(&self.arrow_schema, self.impala_mode)?,
-        };
         let sync_marker = self.sync_marker.unwrap_or([0xAA; 16]);
         let header = AvroHeader {
-            avro_schema,
+            arrow_schema: self.arrow_schema.as_ref().clone(),
+            impala_mode: self.impala_mode,
             compression: self.compression,
             extra_meta: self.extra_meta,
             sync_marker,
@@ -207,7 +203,7 @@ impl<W: Write> Writer<W> {
         for row_idx in 0..row_count {
             let encoded_row = self
                 .record_encoder
-                .encode_row_to_vec(self.arrow_schema.as_ref(), batch, row_idx)?;
+                .encode_row_to_vec(batch, row_idx)?;
             self.block_encoder.append_encoded(&encoded_row);
             self.block_encoder.inc_count();
             self.block_encoder.maybe_flush(&mut self.sink)?;

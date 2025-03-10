@@ -42,7 +42,10 @@ impl RecordDecoder {
     ///
     /// - `strict_mode`: if `true`, we will throw an error if we encounter
     ///   a union of the form `[T, "null"]` (i.e. `Nullability::NullSecond`).
-    pub fn try_new(data_type: &AvroDataType, strict_mode: bool) -> Result<Self, ArrowError> {
+    pub fn try_new(
+        data_type: &AvroDataType,
+        strict_mode: bool,
+    ) -> Result<Self, ArrowError> {
         match Decoder::try_new(data_type, strict_mode)? {
             Decoder::Record(fields, decoders) => Ok(Self {
                 schema: Arc::new(ArrowSchema::new(fields)),

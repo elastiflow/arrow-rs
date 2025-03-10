@@ -19,10 +19,9 @@
 
 use std::io::Write;
 
-use arrow_schema::ArrowError;
-
+use arrow_schema::{ArrowError, Schema};
+use crate::codec::make_schema;
 use crate::compression::CompressionCodec;
-use crate::schema::Schema as AvroSchema;
 use crate::writer::utils::{
     to_arrow_io_err, write_bytes, write_string,
 };
@@ -31,8 +30,10 @@ use crate::writer::zigzag::write_zigzag_long;
 /// Holds information needed to write the Avro container-file header.
 #[derive(Debug)]
 pub struct AvroHeader {
+    /// The Arrow schema (JSON-serialized into metadata)
+    pub arrow_schema: Schema,
     /// The Avro schema (JSON-serialized into metadata)
-    pub avro_schema: AvroSchema<'static>,
+    pub impala_mode: bool,
     /// Optional compression codec
     pub compression: Option<CompressionCodec>,
     /// Additional metadata key-value pairs
@@ -51,13 +52,14 @@ impl AvroHeader {
             meta_entries += 1;
         }
         write_zigzag_long(meta_entries as i64, sink)?;
-        let schema_json = serde_json::to_vec(&self.avro_schema)
+        let schema =  make_schema(&self.arrow_schema, &self.impala_mode)?;
+        let schema_json = serde_json::to_vec(&schema)
             .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
         write_string("avro.schema", sink)?;
         write_bytes(&schema_json, sink)?;
         if let Some(codec) = self.compression {
             write_string(crate::compression::CODEC_METADATA_KEY, sink)?;
-            let codec_str: &'static [u8] = match codec {
+            let codec_str: &[u8] = match codec {
                 CompressionCodec::Snappy => b"snappy",
                 CompressionCodec::Deflate => b"deflate",
                 CompressionCodec::ZStandard => b"zstandard",

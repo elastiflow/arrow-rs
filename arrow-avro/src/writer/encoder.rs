@@ -34,75 +34,11 @@ use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, TimeUnit};
 use crate::codec::Nullability;
 use crate::writer::zigzag::write_zigzag_long;
 
-/// A `FieldEncoder` is responsible for writing a single Arrow column's
-/// **one row** to Avro bytes.
-#[derive(Debug)]
-enum FieldEncoder {
-    /// Avro null
-    Null,
-    /// Avro bool
-    Boolean,
-    /// Avro int32
-    Int32,
-    /// Avro int64
-    Int64,
-    /// Avro float32
-    Float32,
-    /// Avro float64
-    Float64,
-    /// Avro bytes
-    Binary,
-    /// Avro string
-    Utf8,
-    /// Avro record
-    Record(Vec<FieldEncoder>),
-    /// Avro enum (dictionary)
-    Enum(DictKeyEnc),
-    /// Avro array
-    Array(Box<FieldEncoder>),
-    /// Avro map
-    Map(Box<FieldEncoder>),
-    /// Avro fixed
-    Fixed(usize),
-    /// Avro decimal128
-    Decimal128(usize, usize, Option<usize>),
-    /// Avro decimal256
-    Decimal256(usize, usize, Option<usize>),
-    /// Avro date32
-    Date32,
-    /// Avro time-millis
-    TimeMillis,
-    /// Avro time-micros
-    TimeMicros,
-    /// Avro timestamp-millis (bool indicates whether to store as UTC)
-    TimestampMillis(bool),
-    /// Avro timestamp-micros (bool indicates whether to store as UTC)
-    TimestampMicros(bool),
-    /// Avro 16-byte UUID
-    Uuid,
-    /// Avro 12-byte duration (months, days, ms)
-    Duration,
-    /// For union-encoded columns. The second param is the union ordering.
-    ///
-    /// - `NullFirst` => `[ "null", T ]` => branch=0 => null, branch=1 => T
-    /// - `NullSecond` => `[ T, "null" ]` => branch=0 => T, branch=1 => null
-    Nullable(Box<FieldEncoder>, Nullability),
-}
-
-/// The integral type used for dictionary keys in an Avro enum.
-#[derive(Debug, Clone, Copy)]
-enum DictKeyEnc {
-    Int8,
-    Int16,
-    Int32,
-    Int64,
-}
-
 /// A `RecordEncoder` converts entire Arrow rows into Avro bytes by
 /// calling `encode_one` on each column row.
 #[derive(Debug)]
 pub struct RecordEncoder {
-    fields: Vec<FieldEncoder>,
+    fields: Vec<Encoder>,
 }
 
 impl RecordEncoder {
@@ -115,7 +51,7 @@ impl RecordEncoder {
     ) -> Result<Self, ArrowError> {
         let mut fields = Vec::with_capacity(schema.fields().len());
         for f in schema.fields() {
-            fields.push(FieldEncoder::try_new(f, impala_mode)?);
+            fields.push(Encoder::try_new(f, impala_mode)?);
         }
         Ok(Self { fields })
     }
@@ -123,7 +59,6 @@ impl RecordEncoder {
     /// Encode one row from a `RecordBatch` into `out`.
     pub fn encode_row(
         &mut self,
-        _schema: &arrow_schema::Schema,
         batch: &arrow_array::RecordBatch,
         row_idx: usize,
         out: &mut Vec<u8>,
@@ -138,18 +73,62 @@ impl RecordEncoder {
     /// Convenience to encode a single row into a new `Vec<u8>`.
     pub fn encode_row_to_vec(
         &mut self,
-        schema: &arrow_schema::Schema,
         batch: &arrow_array::RecordBatch,
         row_idx: usize,
     ) -> Result<Vec<u8>, ArrowError> {
         let mut buf = Vec::new();
-        self.encode_row(schema, batch, row_idx, &mut buf)?;
+        self.encode_row(batch, row_idx, &mut buf)?;
         Ok(buf)
     }
 }
 
-impl FieldEncoder {
-    /// Build a `FieldEncoder` for the given Arrow `Field`.
+/// A `Encoder` is responsible for writing a single Arrow column
+/// to Avro bytes.
+#[derive(Debug)]
+enum Encoder {
+    /// Primitives
+    Null,
+    Boolean,
+    Int32,
+    Int64,
+    Float32,
+    Float64,
+    Binary,
+    Utf8,
+    /// Complex
+    Record(Vec<Encoder>),
+    Enum(DictKeyEnc),
+    Array(Box<Encoder>),
+    Map(Box<Encoder>),
+    Fixed(usize),
+    /// Logical
+    Decimal128(usize, usize, Option<usize>),
+    Decimal256(usize, usize, Option<usize>),
+    Date32,
+    TimeMillis,
+    TimeMicros,
+    TimestampMillis(bool),
+    TimestampMicros(bool),
+    Uuid,
+    Duration,
+    /// For union-encoded columns. The second param is the union ordering.
+    ///
+    /// - `NullFirst` => `[ "null", T ]` => branch=0 => null, branch=1 => T
+    /// - `NullSecond` => `[ T, "null" ]` => branch=0 => T, branch=1 => null
+    Nullable(Box<Encoder>, Nullability),
+}
+
+/// The integral type used for dictionary keys in an Avro enum.
+#[derive(Debug, Clone, Copy)]
+enum DictKeyEnc {
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+}
+
+impl Encoder {
+    /// Build an `Encoder` for the given Arrow `Field`.
     ///
     /// If `impala` is true, and the field is nullable, we produce a union
     /// that uses `[ T, "null" ]` ordering (`Nullability::NullSecond`).
@@ -176,11 +155,9 @@ impl FieldEncoder {
                     key_dt.as_ref(),
                     DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
                 );
-                // If not recognized as enum => encode as string by default
                 if !valid_key {
                     Self::Utf8
                 } else if let Some(sym_json_str) = field.metadata().get("avro.enum.symbols") {
-                    // parse:
                     let parsed: serde_json::Value = serde_json::from_str(sym_json_str)
                         .map_err(|e| {
                             ArrowError::ParseError(format!(
@@ -188,7 +165,6 @@ impl FieldEncoder {
                             ))
                         })?;
                     if !parsed.is_array() {
-                        // fallback
                         Self::Utf8
                     } else {
                         let key_enc = match key_dt.as_ref() {
@@ -263,7 +239,7 @@ impl FieldEncoder {
         }
     }
 
-    /// Encode exactly one row from an Arrow array into Avro bytes.
+    /// Encode a row from an Arrow array into Avro bytes.
     pub fn encode_one(
         &self,
         array: &dyn Array,
@@ -271,8 +247,8 @@ impl FieldEncoder {
         out: &mut Vec<u8>,
     ) -> Result<(), ArrowError> {
         match self {
-            FieldEncoder::Null => Ok(()),
-            FieldEncoder::Boolean => {
+            Self::Null => Ok(()),
+            Self::Boolean => {
                 let bool_arr = array
                     .as_any()
                     .downcast_ref::<BooleanArray>()
@@ -283,7 +259,7 @@ impl FieldEncoder {
                 out.push(val as u8);
                 Ok(())
             }
-            FieldEncoder::Int32 => {
+            Self::Int32 => {
                 let int_arr = array
                     .as_any()
                     .downcast_ref::<Int32Array>()
@@ -294,7 +270,7 @@ impl FieldEncoder {
                 write_zigzag_long(val as i64, out)?;
                 Ok(())
             }
-            FieldEncoder::Int64 => {
+            Self::Int64 => {
                 let int_arr = array
                     .as_any()
                     .downcast_ref::<Int64Array>()
@@ -305,7 +281,7 @@ impl FieldEncoder {
                 write_zigzag_long(val, out)?;
                 Ok(())
             }
-            FieldEncoder::Float32 => {
+            Self::Float32 => {
                 let float_arr = array
                     .as_any()
                     .downcast_ref::<Float32Array>()
@@ -316,7 +292,7 @@ impl FieldEncoder {
                 out.extend_from_slice(&val);
                 Ok(())
             }
-            FieldEncoder::Float64 => {
+            Self::Float64 => {
                 let float_arr = array
                     .as_any()
                     .downcast_ref::<Float64Array>()
@@ -327,7 +303,7 @@ impl FieldEncoder {
                 out.extend_from_slice(&val);
                 Ok(())
             }
-            FieldEncoder::Binary => {
+            Self::Binary => {
                 let bin_arr = array
                     .as_any()
                     .downcast_ref::<BinaryArray>()
@@ -339,7 +315,7 @@ impl FieldEncoder {
                 out.extend_from_slice(val);
                 Ok(())
             }
-            FieldEncoder::Utf8 => {
+            Self::Utf8 => {
                 let str_arr = array
                     .as_any()
                     .downcast_ref::<StringArray>()
@@ -351,7 +327,7 @@ impl FieldEncoder {
                 out.extend_from_slice(val.as_bytes());
                 Ok(())
             }
-            FieldEncoder::Record(child_encoders) => {
+            Self::Record(child_encoders) => {
                 let struct_arr = array
                     .as_any()
                     .downcast_ref::<StructArray>()
@@ -364,7 +340,7 @@ impl FieldEncoder {
                 }
                 Ok(())
             }
-            FieldEncoder::Enum(key_enc) => {
+            Self::Enum(key_enc) => {
                 match key_enc {
                     DictKeyEnc::Int8 => {
                         let dict_arr = array
@@ -417,7 +393,7 @@ impl FieldEncoder {
                 }
                 Ok(())
             }
-            FieldEncoder::Array(child_enc) => {
+            Self::Array(child_enc) => {
                 match array.data_type() {
                     DataType::List(_) => {
                         let list_arr = array
@@ -488,20 +464,17 @@ impl FieldEncoder {
                 }
                 Ok(())
             }
-            FieldEncoder::Map(val_enc) => {
+            Self::Map(val_enc) => {
                 let map_array = array
                     .as_any()
                     .downcast_ref::<MapArray>()
                     .ok_or_else(|| {
                         ArrowError::ParseError("Not a Map array".to_string())
                     })?;
-
                 let offset = map_array.value_offsets()[row_idx] as usize;
                 let offset_next = map_array.value_offsets()[row_idx + 1] as usize;
                 let length = offset_next - offset;
-
                 write_zigzag_long(length as i64, out)?;
-
                 let entries_struct = map_array.entries();
                 let key_arr = entries_struct
                     .column(0)
@@ -511,22 +484,18 @@ impl FieldEncoder {
                         ArrowError::ParseError("Map keys not a String array".to_string())
                     })?;
                 let val_arr = entries_struct.column(1);
-
                 for i in offset..offset_next {
                     let key_val = key_arr.value(i);
                     write_zigzag_long(key_val.len() as i64, out)?;
                     out.extend_from_slice(key_val.as_bytes());
                     val_enc.encode_one(val_arr.as_ref(), i, out)?;
                 }
-
-                // Only write the '0' terminator if we had a non-empty block
                 if length > 0 {
                     write_zigzag_long(0, out)?;
                 }
                 Ok(())
             }
-
-            FieldEncoder::Fixed(n) => {
+            Self::Fixed(n) => {
                 let fsb_arr = array
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
@@ -545,7 +514,7 @@ impl FieldEncoder {
                 out.extend_from_slice(val);
                 Ok(())
             }
-            FieldEncoder::Decimal128(_p, _s, size_opt) => {
+            Self::Decimal128(_p, _s, size_opt) => {
                 let dec_arr = array
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
@@ -584,7 +553,7 @@ impl FieldEncoder {
                 }
                 Ok(())
             }
-            FieldEncoder::Decimal256(_p, _s, size_opt) => {
+            Self::Decimal256(_p, _s, size_opt) => {
                 let dec_arr = array
                     .as_any()
                     .downcast_ref::<Decimal256Array>()
@@ -626,7 +595,7 @@ impl FieldEncoder {
                 }
                 Ok(())
             }
-            FieldEncoder::Date32 => {
+            Self::Date32 => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<arrow_array::Date32Array>()
@@ -637,7 +606,7 @@ impl FieldEncoder {
                 write_zigzag_long(val as i64, out)?;
                 Ok(())
             }
-            FieldEncoder::TimeMillis => {
+            Self::TimeMillis => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Time32MillisecondType>>()
@@ -650,7 +619,7 @@ impl FieldEncoder {
                 write_zigzag_long(val as i64, out)?;
                 Ok(())
             }
-            FieldEncoder::TimeMicros => {
+            Self::TimeMicros => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Time64MicrosecondType>>()
@@ -663,7 +632,7 @@ impl FieldEncoder {
                 write_zigzag_long(val, out)?;
                 Ok(())
             }
-            FieldEncoder::TimestampMillis(_is_utc) => {
+            Self::TimestampMillis(_is_utc) => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
@@ -676,7 +645,7 @@ impl FieldEncoder {
                 write_zigzag_long(val, out)?;
                 Ok(())
             }
-            FieldEncoder::TimestampMicros(_is_utc) => {
+            Self::TimestampMicros(_is_utc) => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
@@ -689,7 +658,7 @@ impl FieldEncoder {
                 write_zigzag_long(val, out)?;
                 Ok(())
             }
-            FieldEncoder::Uuid => {
+            Self::Uuid => {
                 let fsb_arr = array
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
@@ -708,7 +677,7 @@ impl FieldEncoder {
                 out.extend_from_slice(val);
                 Ok(())
             }
-            FieldEncoder::Duration => {
+            Self::Duration => {
                 let arr = array
                     .as_any()
                     .downcast_ref::<PrimitiveArray<IntervalMonthDayNanoType>>()
@@ -727,26 +696,20 @@ impl FieldEncoder {
                 out.extend_from_slice(&ms.to_le_bytes());
                 Ok(())
             }
-            FieldEncoder::Nullable(inner, nb) => {
+            Self::Nullable(inner, nb) => {
                 match nb {
-                    // Standard Avro => [ "null", T ] => branch=0 => null, branch=1 => T
                     Nullability::NullFirst => {
                         if array.is_null(row_idx) {
-                            // pick union-variant #0 => null
                             write_zigzag_long(0, out)?;
                         } else {
-                            // pick union-variant #1 => T
                             write_zigzag_long(1, out)?;
                             inner.encode_one(array, row_idx, out)?;
                         }
                     }
-                    // Impala => [ T, "null" ] => branch=0 => T, branch=1 => null
                     Nullability::NullSecond => {
                         if array.is_null(row_idx) {
-                            // => branch=1 => null
                             write_zigzag_long(1, out)?;
                         } else {
-                            // => branch=0 => T
                             write_zigzag_long(0, out)?;
                             inner.encode_one(array, row_idx, out)?;
                         }
@@ -829,8 +792,8 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(date_arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         let mut offset = 0;
         let (val0, used0) = decode_zigzag_long(&out[offset..]);
         offset += used0;
@@ -850,8 +813,8 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         let mut offset = 0;
         let (row0_val, used0) = decode_zigzag_long(&out[offset..]);
         offset += used0;
@@ -871,8 +834,8 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         let mut offset = 0;
         let (row0_val, used0) = decode_zigzag_long(&out[offset..]);
         offset += used0;
@@ -899,8 +862,8 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         let mut offset = 0;
         let (row0_val, used0) = decode_zigzag_long(&out[offset..]);
         offset += used0;
@@ -924,8 +887,8 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         let mut offset = 0;
         let (row0_val, used0) = decode_zigzag_long(&out[offset..]);
         offset += used0;
@@ -952,8 +915,8 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         let mut offset = 0;
         let (row0_val, used0) = decode_zigzag_long(&out[offset..]);
         offset += used0;
@@ -977,8 +940,8 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         let mut offset = 0;
         let (row0_val, used0) = decode_zigzag_long(&out[offset..]);
         offset += used0;
@@ -1003,8 +966,8 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         assert_eq!(out.len(), 32, "2 rows * 16 bytes each = 32 total");
         assert_eq!(&out[0..16], b"1234567890ABCDEF");
         assert_eq!(&out[16..32], b"abcdefghijklmnop");
@@ -1025,7 +988,7 @@ mod tests {
             .unwrap();
         let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
+        encoder.encode_row(&batch, 0, &mut out).unwrap();
         assert_eq!(
             &out,
             &[
@@ -1057,7 +1020,7 @@ mod tests {
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
         for row_idx in 0..5 {
-            encoder.encode_row(&schema, &batch, row_idx, &mut out)?;
+            encoder.encode_row(&batch, row_idx, &mut out)?;
         }
         let mut offset = 0;
         let (branch0, used0) = decode_zigzag_long(&out[offset..]);
@@ -1111,8 +1074,8 @@ mod tests {
         )?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         let mut offset = 0;
         let (row0_val, used0) = decode_zigzag_long(&out[offset..]);
         offset += used0;
@@ -1140,7 +1103,7 @@ mod tests {
         let map_array = map_builder.finish();
         assert_eq!(map_array.len(), 2);
         let field = Field::new("my_map", map_array.data_type().clone(), true);
-        let map_encoder = FieldEncoder::try_new(&field, false).expect("Failed to build FieldEncoder");
+        let map_encoder = Encoder::try_new(&field, false).expect("Failed to build FieldEncoder");
         let mut encoded = Vec::new();
         map_encoder.encode_one(&map_array, 0, &mut encoded).unwrap();
         map_encoder.encode_one(&map_array, 1, &mut encoded).unwrap();
@@ -1157,7 +1120,7 @@ mod tests {
         assert_eq!(map_array.len(), 1, "Expected 1 row");
         assert!(map_array.is_null(0), "Row 0 should be null");
         let field = Field::new("nullable_map", map_array.data_type().clone(), true);
-        let enc = FieldEncoder::try_new(&field, false).unwrap();
+        let enc = Encoder::try_new(&field, false).unwrap();
         let mut buf = Vec::new();
         enc.encode_one(&map_array, 0, &mut buf).unwrap();
         assert_eq!(buf, vec![0x00], "Expected union=0 => null for a null map");
@@ -1179,8 +1142,8 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(ll_arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         let mut offset = 0;
         let (length0, used0) = decode_zigzag_long(&out[offset..]);
         offset += used0;
@@ -1223,8 +1186,8 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(list_arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         let mut offset = 0;
         let (length0, used0) = decode_zigzag_long(&out[offset..]);
         offset += used0;
@@ -1272,8 +1235,8 @@ mod tests {
             RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(fsl_arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         let mut offset = 0;
         let (arr_len0, used0) = decode_zigzag_long(&out[offset..]);
         offset += used0;
@@ -1320,8 +1283,8 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(struct_array)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
-        encoder.encode_row(&schema, &batch, 1, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 1, &mut out)?;
         let mut offset = 0;
         let (val_a_0, consumed) = decode_zigzag_long(&out[offset..]);
         offset += consumed;
@@ -1353,7 +1316,7 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(decimal_arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
         assert_eq!(out.len(), 16);
         Ok(())
     }
@@ -1369,7 +1332,7 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(decimal_arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
         assert_eq!(out.len(), 32);
         Ok(())
     }
@@ -1384,11 +1347,11 @@ mod tests {
         let schema = ArrowSchema::new(vec![field]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(decimal_arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
-        if let FieldEncoder::Decimal128(_, _, ref mut size_opt) = encoder.fields[0] {
+        if let Encoder::Decimal128(_, _, ref mut size_opt) = encoder.fields[0] {
             *size_opt = None;
         }
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out)?;
+        encoder.encode_row(&batch, 0, &mut out)?;
         let (llen, used) = decode_zigzag_long(&out);
         let data = &out[used..];
         assert_eq!(llen as usize, data.len());
@@ -1403,7 +1366,7 @@ mod tests {
             .unwrap();
         let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
+        encoder.encode_row(&batch, 0, &mut out).unwrap();
         let got = decode_avro_boolean(&out);
         assert_eq!(got, true);
     }
@@ -1416,7 +1379,7 @@ mod tests {
             .unwrap();
         let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
+        encoder.encode_row(&batch, 0, &mut out).unwrap();
         let (decoded, consumed) = decode_zigzag_long(&out);
         assert_eq!(decoded, 42);
         assert_eq!(consumed, out.len());
@@ -1430,7 +1393,7 @@ mod tests {
             .unwrap();
         let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
+        encoder.encode_row(&batch, 0, &mut out).unwrap();
         let (decoded, consumed) = decode_zigzag_long(&out);
         assert_eq!(decoded, -1);
         assert_eq!(consumed, out.len());
@@ -1444,7 +1407,7 @@ mod tests {
             .unwrap();
         let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
+        encoder.encode_row(&batch, 0, &mut out).unwrap();
         let got = decode_avro_f32(&out);
         assert!((got - 3.14).abs() < 1e-7);
     }
@@ -1457,7 +1420,7 @@ mod tests {
             .unwrap();
         let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
+        encoder.encode_row(&batch, 0, &mut out).unwrap();
         let got = decode_avro_f64(&out);
         assert!((got - std::f64::consts::E).abs() < 1e-14);
     }
@@ -1470,7 +1433,7 @@ mod tests {
             .unwrap();
         let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
+        encoder.encode_row(&batch, 0, &mut out).unwrap();
         let got = decode_avro_bytes(&out);
         assert_eq!(got, b"hello");
     }
@@ -1483,7 +1446,7 @@ mod tests {
             .unwrap();
         let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
+        encoder.encode_row(&batch, 0, &mut out).unwrap();
         let got = decode_avro_string(&out);
         assert_eq!(got.0, "Avro!");
     }
@@ -1504,7 +1467,7 @@ mod tests {
         ).unwrap();
         let mut encoder = RecordEncoder::try_new(&schema, false).unwrap();
         let mut out = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out).unwrap();
+        encoder.encode_row(&batch, 0, &mut out).unwrap();
         assert_eq!(out.len(), 5);
         assert_eq!(&out, b"ABCDE");
     }
@@ -1517,12 +1480,12 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(str_arr)])?;
         let mut encoder = RecordEncoder::try_new(&schema, false)?;
         let mut out0 = Vec::new();
-        encoder.encode_row(&schema, &batch, 0, &mut out0)?;
+        encoder.encode_row(&batch, 0, &mut out0)?;
         let (branch, consumed) = decode_zigzag_long(&out0);
         assert_eq!(branch, 0, "Expected union branch=0 => null");
         assert_eq!(consumed, out0.len(), "No payload after branch=0");
         let mut out1 = Vec::new();
-        encoder.encode_row(&schema, &batch, 1, &mut out1)?;
+        encoder.encode_row(&batch, 1, &mut out1)?;
         let (branch, used) = decode_zigzag_long(&out1);
         assert_eq!(branch, 1, "Expected branch=1 => string");
         let got_str = decode_avro_string(&out1[used..]);

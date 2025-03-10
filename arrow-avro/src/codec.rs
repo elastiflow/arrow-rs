@@ -63,6 +63,13 @@ impl AvroDataType {
         Self::new(codec, None, Default::default())
     }
 
+    /// Returns the name of this field
+    fn to_schema<'a>(&self) -> Schema<'a> {
+        let metadata = Arc::try_unwrap(self.metadata.clone())
+            .unwrap_or_else(|arc| (*arc).clone());
+        self.codec.schema(metadata, self.nullability).unwrap()
+    }
+
     /// Returns an arrow [`Field`] with the given name, applying `nullability` if present.
     pub fn field_with_name(&self, name: &str) -> Field {
         let is_nullable = self.nullability.is_some();
@@ -92,6 +99,11 @@ impl AvroField {
             }
         }
         fld
+    }
+
+    /// Returns the name of this field
+    pub fn to_schema<'a>(&self) -> Schema<'a> {
+        self.data_type.to_schema()
     }
 
     /// Returns the [`AvroDataType`]
@@ -126,6 +138,72 @@ impl<'a> TryFrom<&Schema<'a>> for AvroField {
     }
 }
 
+/// Convert an Arrow schema to an Avro [Schema](Schema),
+/// optionally using `impala=true` to produce `[ T, "null" ]` unions.
+pub fn make_schema<'a>(
+    arrow_schema: &'a arrow_schema::Schema,
+    impala_mode: &'a bool,
+) -> Result<Schema<'a>, ArrowError> {
+    let record_fields = arrow_schema
+        .fields()
+        .iter()
+        .map(|fref| make_record_field(fref, impala_mode))
+        .collect::<Result<Vec<_>, _>>()?;
+    let record_name = arrow_schema
+        .metadata()
+        .get("avro.record.name")
+        .cloned()
+        .unwrap_or_else(|| "topLevelRecord".to_string());
+    let record_namespace = arrow_schema
+        .metadata()
+        .get("avro.record.namespace")
+        .cloned();
+    let record = Record {
+        name: Box::leak(record_name.into_boxed_str()),
+        namespace: record_namespace.map(|ns| {
+            let leaked = Box::leak(ns.into_boxed_str());
+            leaked as &'static str
+        }),
+        doc: None,
+        aliases: vec![],
+        fields: record_fields,
+        attributes: Default::default(),
+    };
+    Ok(Schema::Complex(ComplexType::Record(record)))
+}
+
+/// Convert a single Arrow `Field` into an Avro `RecordField`, respecting `impala` union ordering.
+fn make_record_field<'a>(
+    field: &'a Field,
+    impala_mode: &'a bool,
+) -> Result<RecordField<'a>, ArrowError> {
+    let nullability = if *impala_mode {
+        Nullability::NullSecond
+    } else {
+        Nullability::NullFirst
+    };
+    let codec = Codec::from_field(field, nullability)?;
+    let nullable = if field.is_nullable() {
+        Some(nullability)
+    } else {
+        None
+    };
+    let avro_data_type = AvroDataType::new(codec, nullable, field.metadata().clone());
+    // let field_name = Box::leak(field.name().clone().into_boxed_str());
+    let default_val = field
+        .metadata()
+        .get("avro.default")
+        .and_then(|s| serde_json::from_str(s).ok());
+    Ok(RecordField {
+        name: field.name(),
+        doc: None,
+        aliases: vec![],
+        r#type: avro_data_type.to_schema(),
+        default: default_val,
+    })
+}
+
+
 /// An Avro encoding
 #[derive(Debug, Clone)]
 pub enum Codec {
@@ -156,6 +234,157 @@ pub enum Codec {
 }
 
 impl Codec {
+
+    fn from_field(field: &Field, nullability_type: Nullability) -> Result<Self, ArrowError> {
+        let metadata = field.metadata().clone();
+        match field.data_type() {
+            // Primitive Types
+            DataType::Null => Ok(Self::Null),
+            DataType::Boolean => Ok(Self::Boolean),
+            DataType::Int8 | DataType::Int16 | DataType::Int32 => Ok(Self::Int32),
+            DataType::Int64 => Ok(Self::Int64),
+            DataType::Float32 => Ok(Self::Float32),
+            DataType::Float64 => Ok(Self::Float64),
+            DataType::Binary | DataType::LargeBinary => Ok(Self::Binary),
+            DataType::Utf8 | DataType::LargeUtf8 => Ok(Self::String),
+            // Complex Types
+            DataType::Struct(fields) => {
+                let avro_fields: Vec<AvroField> = fields
+                    .iter()
+                    .map(|fref| {
+                        let child_codec = Codec::from_field(fref.as_ref(), nullability_type)?;
+                        let default_val = fref
+                            .metadata()
+                            .get("avro.default")
+                            .and_then(|s| serde_json::from_str(s).ok());
+                        let nullability = if fref.is_nullable() {
+                            Some(nullability_type)
+                        } else {
+                            None
+                        };
+                        Ok(AvroField {
+                            name: fref.name().clone(),
+                            data_type: AvroDataType::new(child_codec, nullability, fref.metadata().clone()),
+                            default: default_val,
+                        })
+                    })
+                    .collect::<Result<_, ArrowError>>()?;
+                Ok(Self::Record(Arc::from(avro_fields)))
+            }
+            DataType::Dictionary(key_type, value_type) => {
+                let valid_key = matches!(
+                key_type.as_ref(),
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+            );
+                let valid_val = matches!(
+                value_type.as_ref(),
+                DataType::Utf8 | DataType::LargeUtf8
+            );
+                match (valid_key && valid_val, metadata.get("avro.enum.symbols")) {
+                    (false, _) => Ok(Self::String),
+                    (true, None) => Ok(Self::String),
+                    (true, Some(sym_json_str)) => {
+                        let parsed: serde_json::Value = serde_json::from_str(sym_json_str)
+                            .map_err(|e| ArrowError::ParseError(format!(
+                                "Invalid JSON in avro.enum.symbols: {e}"
+                            )))?;
+                        if let Some(arr) = parsed.as_array() {
+                            let symbols: Vec<String> = arr
+                                .iter()
+                                .filter_map(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .collect();
+                            Ok(Self::Enum(Arc::from(symbols), Arc::from(vec![])))
+                        } else {
+                            Err(ArrowError::ParseError(
+                                "Expected JSON array for avro.enum.symbols".to_string(),
+                            ))
+                        }
+                    }
+                }
+            }
+            DataType::List(child_field) | DataType::LargeList(child_field) => {
+                let nullability = if child_field.is_nullable() {
+                    Some(nullability_type)
+                } else {
+                    None
+                };
+                let child_codec = Codec::from_field(child_field.as_ref(), nullability_type)?;
+                Ok(Self::Array(
+                    Arc::new(AvroDataType::new(
+                        child_codec,
+                        nullability,
+                        child_field.metadata().clone()),
+                    )
+                ))
+            }
+            DataType::FixedSizeList(child_field, _sz) => {
+                let nullability = if child_field.is_nullable() {
+                    Some(nullability_type)
+                } else {
+                    None
+                };
+                let child_codec = Codec::from_field(child_field.as_ref(), nullability_type)?;
+                Ok(Self::Array(
+                    Arc::new(AvroDataType::new(
+                        child_codec,
+                        nullability,
+                        child_field.metadata().clone()),
+                    )
+                ))
+            }
+            DataType::Map(entry_field, _keys_sorted) => match entry_field.data_type() {
+                DataType::Struct(children) if children.len() == 2 => {
+                    let value_field = &children[1];
+                    let nullability = if value_field.is_nullable() {
+                        Some(nullability_type)
+                    } else {
+                        None
+                    };
+                    let val_codec = Codec::from_field(value_field, nullability_type)?;
+                    Ok(Self::Map(Arc::new(AvroDataType::new(
+                        val_codec,
+                        nullability,
+                        value_field.metadata().clone()),
+                    )))
+                }
+                _ => Ok(Self::String),
+            },
+            DataType::FixedSizeBinary(n) => {
+                let logical_type = metadata.get("logicalType").map(|s| s.as_str());
+                match (*n, logical_type) {
+                    (16, Some("uuid")) => Ok(Self::Uuid),
+                    (12, Some("duration")) => Ok(Self::Duration),
+                    _ => Ok(Self::Fixed(*n)),
+                }
+            }
+            // Logical Types
+            DataType::Interval(IntervalUnit::MonthDayNano) => Ok(Self::Duration),
+            DataType::Decimal128(p, s) => {
+                Ok(Self::Decimal(*p as usize, Some(*s as usize), Some(16)))
+            }
+            DataType::Decimal256(p, s) => {
+                Ok(Self::Decimal(*p as usize, Some(*s as usize), Some(32)))
+            }
+            DataType::Date32 => Ok(Self::Date32),
+            DataType::Time32(TimeUnit::Millisecond) => Ok(Self::TimeMillis),
+            DataType::Time64(TimeUnit::Microsecond) => Ok(Self::TimeMicros),
+            DataType::Timestamp(TimeUnit::Millisecond, tz_opt) => {
+                let is_utc = tz_opt.as_deref() == Some("+00:00");
+                Ok(Self::TimestampMillis(is_utc))
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, tz_opt) => {
+                let is_utc = tz_opt.as_deref() == Some("+00:00");
+                Ok(Self::TimestampMicros(is_utc))
+            }
+            other => {
+                Err(ArrowError::AvroError(format!(
+                    "Unrecognized Avro logicalType={other}")
+                ))
+            }
+        }
+    }
+    
     /// Convert this to an Arrow `DataType`
     pub(crate) fn data_type(&self) -> DataType {
         match self {
@@ -231,6 +460,272 @@ impl Codec {
             Self::Duration => DataType::Interval(IntervalUnit::MonthDayNano),
         }
     }
+    pub(crate) fn schema<'a>(
+        &self,
+        metadata: HashMap<String, String>,
+        nullability: Option<Nullability>,
+    ) -> Result<Schema<'a>, ArrowError> {
+        let base = match self {
+            Self::Null => Schema::TypeName(TypeName::Primitive(PrimitiveType::Null)),
+            Self::Boolean => Schema::TypeName(TypeName::Primitive(PrimitiveType::Boolean)),
+            Self::Int32 => Schema::TypeName(TypeName::Primitive(PrimitiveType::Int)),
+            Self::Int64 => Schema::TypeName(TypeName::Primitive(PrimitiveType::Long)),
+            Self::Float32 => Schema::TypeName(TypeName::Primitive(PrimitiveType::Float)),
+            Self::Float64 => Schema::TypeName(TypeName::Primitive(PrimitiveType::Double)),
+            Self::Binary => Schema::TypeName(TypeName::Primitive(PrimitiveType::Bytes)),
+            Self::String => Schema::TypeName(TypeName::Primitive(PrimitiveType::String)),
+            Self::Record(fields) => {
+                let record_fields = fields
+                    .iter()
+                    .map(|field| RecordField {
+                        name: Box::leak(field.name().to_string().into_boxed_str()),
+                        doc: None,
+                        aliases: vec![],
+                        r#type: field.data_type.to_schema(),
+                        default: field.default.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                // TODO: Make metadata part of lifetime
+                let record_name = metadata
+                    .get("avro.record.name")
+                    .cloned()
+                    .unwrap_or_else(|| "record".to_string());
+                let record_namespace = metadata
+                    .get("avro.record.namespace")
+                    .cloned();
+                let mut attributes = Attributes::default();
+                copy_metadata_to_attributes(&metadata, &mut attributes);
+                Schema::Complex(ComplexType::Record(Record {
+                    name: Box::leak(record_name.into_boxed_str()),
+                    namespace: record_namespace.map(|ns| {
+                        let leaked = Box::leak(ns.into_boxed_str());
+                        leaked as &'a str
+                    }),
+                    doc: None,
+                    aliases: vec![],
+                    fields: record_fields,
+                    attributes,
+                }))
+            }
+            Self::Enum(symbols, _ordinals) => {
+                let enum_name = metadata
+                    .get("avro.enum.name")
+                    .cloned()
+                    .unwrap_or_else(|| "enum".to_string());
+                let enum_namespace = metadata
+                    .get("avro.enum.namespace")
+                    .cloned();
+                let mut attributes = Attributes::default();
+                copy_metadata_to_attributes(&metadata, &mut attributes);
+                let mut leaked_syms = Vec::with_capacity(symbols.len());
+                for sym in symbols.iter() {
+                    let leaked: &'a str = Box::leak(sym.clone().into_boxed_str());
+                    leaked_syms.push(leaked);
+                }
+                Schema::Complex(ComplexType::Enum(Enum {
+                    name: Box::leak(enum_name.into_boxed_str()),
+                    namespace: enum_namespace.map(|ns| {
+                        let leaked = Box::leak(ns.into_boxed_str());
+                        leaked as &'a str
+                    }),
+                    doc: None,
+                    aliases: vec![],
+                    symbols: leaked_syms,
+                    default: None,
+                    attributes,
+                }))
+            }
+            Self::Array(child) => {
+                let items_schema = child.to_schema();
+                let mut attributes = Attributes::default();
+                copy_metadata_to_attributes(&metadata, &mut attributes);
+                Schema::Complex(ComplexType::Array(Array {
+                    items: Box::new(items_schema),
+                    attributes,
+                }))
+            }
+            Self::Map(value_type) => {
+                let value_schema = value_type.to_schema();
+                let mut attributes = Attributes::default();
+                copy_metadata_to_attributes(&metadata, &mut attributes);
+                Schema::Complex(ComplexType::Map(Map {
+                    values: Box::new(value_schema),
+                    attributes,
+                }))
+            }
+            Self::Fixed(size) => {
+                let fixed_name = metadata
+                    .get("avro.fixed.name")
+                    .cloned()
+                    .unwrap_or_else(|| format!("fixed_{size}"));
+                let fixed_namespace = metadata
+                    .get("avro.fixed.namespace")
+                    .cloned();
+                let mut attributes = Attributes::default();
+                copy_metadata_to_attributes(&metadata, &mut attributes);
+                Schema::Complex(ComplexType::Fixed(Fixed {
+                    name: Box::leak(fixed_name.into_boxed_str()),
+                    namespace: fixed_namespace.map(|ns| {
+                        let leaked = Box::leak(ns.into_boxed_str());
+                        leaked as &'a str
+                    }),
+                    aliases: vec![],
+                    size: *size as usize,
+                    attributes,
+                }))
+            }
+            Self::Decimal(precision, scale, size_opt) => {
+                let p = *precision;
+                let s = scale.unwrap_or(0);
+                let mut attrs = Attributes {
+                    logical_type: Some("decimal"),
+                    additional: HashMap::from([
+                        ("precision", serde_json::Value::Number(p.into())),
+                        ("scale", serde_json::Value::Number(s.into())),
+                    ]),
+                };
+                copy_metadata_to_attributes(&metadata, &mut attrs);
+                if let Some(size) = size_opt {
+                    let fixed_name = metadata
+                        .get("avro.fixed.name")
+                        .cloned()
+                        .unwrap_or_else(|| format!("decimal_fixed_{size}_{p}_{s}"));
+                    let fixed_namespace = metadata
+                        .get("avro.fixed.namespace")
+                        .cloned();
+                    Schema::Complex(ComplexType::Fixed(Fixed {
+                        name: Box::leak(fixed_name.into_boxed_str()),
+                        namespace: fixed_namespace.map(|ns| {
+                            let leaked = Box::leak(ns.into_boxed_str());
+                            leaked as &'a str
+                        }),
+                        aliases: vec![],
+                        size: *size,
+                        attributes: attrs,
+                    }))
+                } else {
+                    Schema::Type(Type {
+                        r#type: TypeName::Primitive(PrimitiveType::Bytes),
+                        attributes: attrs,
+                    })
+                }
+            }
+            Self::Uuid => {
+                let mut attrs = Attributes::default();
+                attrs.logical_type = Some("uuid");
+                copy_metadata_to_attributes(&metadata, &mut attrs);
+                let fixed_name = metadata
+                    .get("avro.fixed.name")
+                    .cloned()
+                    .unwrap_or_else(|| "fixed_16_uuid".to_string());
+                let fixed_namespace = metadata
+                    .get("avro.fixed.namespace")
+                    .cloned();
+                Schema::Complex(ComplexType::Fixed(Fixed {
+                    name: Box::leak(fixed_name.into_boxed_str()),
+                    namespace: fixed_namespace.map(|ns| {
+                        let leaked = Box::leak(ns.into_boxed_str());
+                        leaked as &'a str
+                    }),
+                    aliases: vec![],
+                    size: 16,
+                    attributes: attrs,
+                }))
+            }
+            Self::Date32 => {
+                let mut attrs = Attributes::default();
+                attrs.logical_type = Some("date");
+                copy_metadata_to_attributes(&metadata, &mut attrs);
+                Schema::Type(Type {
+                    r#type: TypeName::Primitive(PrimitiveType::Int),
+                    attributes: attrs,
+                })
+            }
+            Self::TimeMillis => {
+                let mut attrs = Attributes::default();
+                attrs.logical_type = Some("time-millis");
+                copy_metadata_to_attributes(&metadata, &mut attrs);
+                Schema::Type(Type {
+                    r#type: TypeName::Primitive(PrimitiveType::Int),
+                    attributes: attrs,
+                })
+            }
+            Self::TimeMicros => {
+                let mut attrs = Attributes::default();
+                attrs.logical_type = Some("time-micros");
+                copy_metadata_to_attributes(&metadata, &mut attrs);
+                Schema::Type(Type {
+                    r#type: TypeName::Primitive(PrimitiveType::Long),
+                    attributes: attrs,
+                })
+            }
+            Self::TimestampMillis(is_utc) => {
+                let mut attrs = Attributes::default();
+                let lt = if *is_utc {
+                    "timestamp-millis"
+                } else {
+                    "local-timestamp-millis"
+                };
+                attrs.logical_type = Some(lt);
+                copy_metadata_to_attributes(&metadata, &mut attrs);
+                Schema::Type(Type {
+                    r#type: TypeName::Primitive(PrimitiveType::Long),
+                    attributes: attrs,
+                })
+            }
+            Self::TimestampMicros(is_utc) => {
+                let mut attrs = Attributes::default();
+                let lt = if *is_utc {
+                    "timestamp-micros"
+                } else {
+                    "local-timestamp-micros"
+                };
+                attrs.logical_type = Some(lt);
+                copy_metadata_to_attributes(&metadata, &mut attrs);
+                Schema::Type(Type {
+                    r#type: TypeName::Primitive(PrimitiveType::Long),
+                    attributes: attrs,
+                })
+            }
+            Self::Duration => {
+                let mut attrs = Attributes::default();
+                attrs.logical_type = Some("duration");
+                copy_metadata_to_attributes(&metadata, &mut attrs);
+                let fixed_name = metadata
+                    .get("avro.fixed.name")
+                    .cloned()
+                    .unwrap_or_else(|| "fixed_12_duration".to_string());
+                let fixed_namespace = metadata
+                    .get("avro.fixed.namespace")
+                    .cloned();
+                Schema::Complex(ComplexType::Fixed(Fixed {
+                    name: Box::leak(fixed_name.into_boxed_str()),
+                    namespace: fixed_namespace.map(|ns| {
+                        let leaked = Box::leak(ns.into_boxed_str());
+                        leaked as &'a str
+                    }),
+                    aliases: vec![],
+                    size: 12,
+                    attributes: attrs,
+                }))
+            }
+        };
+        if let Some(nul) = nullability {
+            let union = match nul {
+                Nullability::NullFirst => vec![
+                    Schema::TypeName(TypeName::Primitive(PrimitiveType::Null)),
+                    base,
+                ],
+                Nullability::NullSecond => vec![
+                    base,
+                    Schema::TypeName(TypeName::Primitive(PrimitiveType::Null)),
+                ],
+            };
+            Ok(Schema::Union(union))
+        } else {
+            Ok(base)
+        }
+    }
 }
 
 impl From<PrimitiveType> for Codec {
@@ -274,32 +769,6 @@ impl<'a> Resolver<'a> {
             .cloned()
             .ok_or_else(|| ArrowError::ParseError(format!("Failed to resolve {ns}.{nm}")))
     }
-}
-
-fn parse_decimal_attributes(
-    attributes: &Attributes,
-    fallback_size: Option<usize>,
-    precision_required: bool,
-) -> Result<(usize, usize, Option<usize>), ArrowError> {
-    let precision = attributes
-        .additional
-        .get("precision")
-        .and_then(|v| v.as_u64())
-        .or(if precision_required { None } else { Some(10) })
-        .ok_or_else(|| ArrowError::ParseError("Decimal requires precision".to_string()))?
-        as usize;
-    let scale = attributes
-        .additional
-        .get("scale")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let size = attributes
-        .additional
-        .get("size")
-        .and_then(|v| v.as_u64())
-        .map(|s| s as usize)
-        .or(fallback_size);
-    Ok((precision, scale, size))
 }
 
 /// Parses a [`AvroDataType`] from the provided [`Schema`], plus optional `namespace`.
@@ -368,7 +837,6 @@ fn make_data_type<'a>(
                 if let Ok(symbols_json) = serde_json::to_string(&e.symbols) {
                     md.insert("avro.enum.symbols".to_string(), symbols_json);
                 }
-
                 let en = AvroDataType {
                     nullability: None,
                     metadata: Arc::new(md),
@@ -500,181 +968,6 @@ fn fixed_fallback(md: Arc<HashMap<String, String>>, size: i32) -> AvroDataType {
     }
 }
 
-/// Convert an Arrow schema to an Avro [Schema](Schema),
-/// optionally using `impala=true` to produce `[ T, "null" ]` unions.
-pub fn arrow_schema_to_avro_schema(
-    arrow_schema: &arrow_schema::Schema,
-    impala: bool
-) -> Result<Schema<'static>, ArrowError> {
-    let record_fields = arrow_schema
-        .fields()
-        .iter()
-        .map(|f| arrow_field_to_avro_field(f, impala))
-        .collect::<Result<Vec<_>, _>>()?;
-    let record_name = arrow_schema
-        .metadata()
-        .get("avro.record.name")
-        .cloned()
-        .unwrap_or_else(|| "root".to_string());
-    let record_namespace = arrow_schema
-        .metadata()
-        .get("avro.record.namespace")
-        .cloned();
-    let record = Record {
-        name: Box::leak(record_name.into_boxed_str()),
-        namespace: record_namespace.map(|ns| {
-            let leaked = Box::leak(ns.into_boxed_str());
-            leaked as &'static str
-        }),
-        doc: None,
-        aliases: vec![],
-        fields: record_fields,
-        attributes: Default::default(),
-    };
-    Ok(Schema::Complex(ComplexType::Record(record)))
-}
-
-/// Convert a single Arrow `Field` into an Avro `RecordField`, respecting `impala` union ordering.
-fn arrow_field_to_avro_field(field: &Field, impala: bool) -> Result<RecordField<'static>, ArrowError> {
-    let avro_data_type = arrow_field_to_avro_datatype(field, impala)?;
-    let field_name = Box::leak(field.name().clone().into_boxed_str());
-    let default_val = field
-        .metadata()
-        .get("avro.default")
-        .and_then(|s| serde_json::from_str(s).ok());
-    let sch = field_to_schema(&avro_data_type)?;
-    Ok(RecordField {
-        name: field_name,
-        doc: None,
-        aliases: vec![],
-        r#type: sch,
-        default: default_val,
-    })
-}
-
-/// Convert an Arrow `Field` to `AvroDataType`, using `impala` to choose null ordering.
-pub fn arrow_field_to_avro_datatype(field: &Field, impala: bool) -> Result<AvroDataType, ArrowError> {
-    let dt = field.data_type();
-    let metadata = field.metadata().clone();
-    let codec = match dt {
-        DataType::Null => Codec::Null,
-        DataType::Boolean => Codec::Boolean,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 => Codec::Int32,
-        DataType::Int64 => Codec::Int64,
-        DataType::Float32 => Codec::Float32,
-        DataType::Float64 => Codec::Float64,
-        DataType::Binary | DataType::LargeBinary => Codec::Binary,
-        DataType::Utf8 | DataType::LargeUtf8 => Codec::String,
-        DataType::Struct(fields) => {
-            let avro_fields: Vec<AvroField> = fields
-                .iter()
-                .map(|fref| {
-                    let child_avro = arrow_field_to_avro_datatype(fref.as_ref(), impala)?;
-                    let default_val = fref
-                        .metadata()
-                        .get("avro.default")
-                        .and_then(|s| serde_json::from_str(s).ok());
-                    Ok(AvroField {
-                        name: fref.name().clone(),
-                        data_type: child_avro,
-                        default: default_val,
-                    })
-                })
-                .collect::<Result<_, ArrowError>>()?;
-            Codec::Record(Arc::from(avro_fields))
-        }
-        DataType::Dictionary(key_type, value_type) => {
-            let valid_key = matches!(
-                key_type.as_ref(),
-                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-            );
-            let valid_val = matches!(
-                value_type.as_ref(),
-                DataType::Utf8 | DataType::LargeUtf8
-            );
-            match (valid_key && valid_val, metadata.get("avro.enum.symbols")) {
-                (false, _) => Codec::String,
-                (true, None) => Codec::String,
-                (true, Some(sym_json_str)) => {
-                    let parsed: serde_json::Value = serde_json::from_str(sym_json_str)
-                        .map_err(|e| ArrowError::ParseError(format!(
-                            "Invalid JSON in avro.enum.symbols: {e}"
-                        )))?;
-                    if let Some(arr) = parsed.as_array() {
-                        let symbols: Vec<String> = arr
-                            .iter()
-                            .filter_map(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .collect();
-                        Codec::Enum(Arc::from(symbols), Arc::from(vec![]))
-                    } else {
-                        return Err(ArrowError::ParseError(
-                            "Expected JSON array for avro.enum.symbols".to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-        DataType::List(child_field) | DataType::LargeList(child_field) => {
-            let child_avro = arrow_field_to_avro_datatype(child_field.as_ref(), impala)?;
-            Codec::Array(Arc::new(child_avro))
-        }
-        DataType::FixedSizeList(child_field, _sz) => {
-            let child_avro = arrow_field_to_avro_datatype(child_field.as_ref(), impala)?;
-            Codec::Array(Arc::new(child_avro))
-        }
-        DataType::Map(entry_field, _keys_sorted) => match entry_field.data_type() {
-            DataType::Struct(children) if children.len() == 2 => {
-                let value_field = &children[1];
-                let val_avro = arrow_field_to_avro_datatype(value_field, impala)?;
-                Codec::Map(Arc::new(val_avro))
-            }
-            _ => Codec::String,
-        },
-        DataType::FixedSizeBinary(n) => {
-            let logical_type = metadata.get("logicalType").map(|s| s.as_str());
-            match (*n, logical_type) {
-                (16, Some("uuid")) => Codec::Uuid,
-                (12, Some("duration")) => Codec::Duration,
-                _ => Codec::Fixed(*n),
-            }
-        }
-        DataType::Interval(IntervalUnit::MonthDayNano) => Codec::Duration,
-        DataType::Decimal128(p, s) => {
-            Codec::Decimal(*p as usize, Some(*s as usize), Some(16))
-        }
-        DataType::Decimal256(p, s) => {
-            Codec::Decimal(*p as usize, Some(*s as usize), Some(32))
-        }
-        DataType::Date32 => Codec::Date32,
-        DataType::Time32(TimeUnit::Millisecond) => Codec::TimeMillis,
-        DataType::Time64(TimeUnit::Microsecond) => Codec::TimeMicros,
-        DataType::Timestamp(TimeUnit::Millisecond, tz_opt) => {
-            let is_utc = tz_opt.as_deref() == Some("+00:00");
-            Codec::TimestampMillis(is_utc)
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, tz_opt) => {
-            let is_utc = tz_opt.as_deref() == Some("+00:00");
-            Codec::TimestampMicros(is_utc)
-        }
-        other => {
-            return Err(ArrowError::AvroError(format!(
-                "Unrecognized Avro logicalType={other}")
-            ));
-        }
-    };
-    let nullability = if field.is_nullable() {
-        if impala {
-            Some(Nullability::NullSecond)
-        } else {
-            Some(Nullability::NullFirst)
-        }
-    } else {
-        None
-    };
-    Ok(AvroDataType::new(codec, nullability, metadata))
-}
-
 fn copy_metadata_to_attributes(
     source: &HashMap<String, String>,
     target: &mut Attributes,
@@ -706,287 +999,30 @@ fn copy_metadata_to_attributes(
     }
 }
 
-/// Convert an [`AvroDataType`] back into a [`Schema`], e.g. `[ "null", T ]` or `[ T, "null" ]`,
-/// depending on the `Nullability`.
-pub fn field_to_schema(data_type: &AvroDataType) -> Result<Schema<'static>, ArrowError> {
-    let base = match &data_type.codec {
-        Codec::Boolean => Schema::TypeName(TypeName::Primitive(PrimitiveType::Boolean)),
-        Codec::Int32 => Schema::TypeName(TypeName::Primitive(PrimitiveType::Int)),
-        Codec::Int64 => Schema::TypeName(TypeName::Primitive(PrimitiveType::Long)),
-        Codec::Float32 => Schema::TypeName(TypeName::Primitive(PrimitiveType::Float)),
-        Codec::Float64 => Schema::TypeName(TypeName::Primitive(PrimitiveType::Double)),
-        Codec::Binary => Schema::TypeName(TypeName::Primitive(PrimitiveType::Bytes)),
-        Codec::String => Schema::TypeName(TypeName::Primitive(PrimitiveType::String)),
-        Codec::Record(fields) => {
-            let record_fields = fields
-                .iter()
-                .map(|field| RecordField {
-                    name: Box::leak(field.name().to_string().into_boxed_str()),
-                    doc: None,
-                    aliases: vec![],
-                    r#type: field_to_schema(&field.data_type).unwrap(),
-                    default: field.default.clone(),
-                })
-                .collect::<Vec<_>>();
-            let record_name = data_type
-                .metadata
-                .get("avro.record.name")
-                .cloned()
-                .unwrap_or_else(|| "record".to_string());
-            let record_namespace = data_type
-                .metadata
-                .get("avro.record.namespace")
-                .cloned();
-            let mut attributes = Attributes::default();
-            copy_metadata_to_attributes(&data_type.metadata, &mut attributes);
-            Schema::Complex(ComplexType::Record(Record {
-                name: Box::leak(record_name.into_boxed_str()),
-                namespace: record_namespace.map(|ns| {
-                    let leaked = Box::leak(ns.into_boxed_str());
-                    leaked as &'static str
-                }),
-                doc: None,
-                aliases: vec![],
-                fields: record_fields,
-                attributes,
-            }))
-        }
-        Codec::Enum(symbols, _ordinals) => {
-            let enum_name = data_type
-                .metadata
-                .get("avro.enum.name")
-                .cloned()
-                .unwrap_or_else(|| "enum".to_string());
-            let enum_namespace = data_type
-                .metadata
-                .get("avro.enum.namespace")
-                .cloned();
-            let mut attributes = Attributes::default();
-            copy_metadata_to_attributes(&data_type.metadata, &mut attributes);
-            let mut leaked_syms = Vec::with_capacity(symbols.len());
-            for sym in symbols.iter() {
-                let leaked: &'static str = Box::leak(sym.clone().into_boxed_str());
-                leaked_syms.push(leaked);
-            }
-            Schema::Complex(ComplexType::Enum(Enum {
-                name: Box::leak(enum_name.into_boxed_str()),
-                namespace: enum_namespace.map(|ns| {
-                    let leaked = Box::leak(ns.into_boxed_str());
-                    leaked as &'static str
-                }),
-                doc: None,
-                aliases: vec![],
-                symbols: leaked_syms,
-                default: None,
-                attributes,
-            }))
-        }
-        Codec::Array(child) => {
-            let items_schema = field_to_schema(child)?;
-            let mut attributes = Attributes::default();
-            copy_metadata_to_attributes(&data_type.metadata, &mut attributes);
-            Schema::Complex(ComplexType::Array(Array {
-                items: Box::new(items_schema),
-                attributes,
-            }))
-        }
-        Codec::Map(value_type) => {
-            let value_schema = field_to_schema(value_type)?;
-            let mut attributes = Attributes::default();
-            copy_metadata_to_attributes(&data_type.metadata, &mut attributes);
-            Schema::Complex(ComplexType::Map(Map {
-                values: Box::new(value_schema),
-                attributes,
-            }))
-        }
-        Codec::Fixed(size) => {
-            let fixed_name = data_type
-                .metadata
-                .get("avro.fixed.name")
-                .cloned()
-                .unwrap_or_else(|| format!("fixed_{size}"));
-            let fixed_namespace = data_type
-                .metadata
-                .get("avro.fixed.namespace")
-                .cloned();
-
-            let mut attributes = Attributes::default();
-            copy_metadata_to_attributes(&data_type.metadata, &mut attributes);
-            Schema::Complex(ComplexType::Fixed(Fixed {
-                name: Box::leak(fixed_name.into_boxed_str()),
-                namespace: fixed_namespace.map(|ns| {
-                    let leaked = Box::leak(ns.into_boxed_str());
-                    leaked as &'static str
-                }),
-                aliases: vec![],
-                size: *size as usize,
-                attributes,
-            }))
-        }
-        Codec::Decimal(precision, scale, size_opt) => {
-            let p = *precision;
-            let s = scale.unwrap_or(0);
-            let mut attrs = Attributes {
-                logical_type: Some("decimal"),
-                additional: HashMap::from([
-                    ("precision", serde_json::Value::Number(p.into())),
-                    ("scale", serde_json::Value::Number(s.into())),
-                ]),
-            };
-            copy_metadata_to_attributes(&data_type.metadata, &mut attrs);
-            if let Some(size) = size_opt {
-                let fixed_name = data_type
-                    .metadata
-                    .get("avro.fixed.name")
-                    .cloned()
-                    .unwrap_or_else(|| format!("decimal_fixed_{size}_{p}_{s}"));
-                let fixed_namespace = data_type
-                    .metadata
-                    .get("avro.fixed.namespace")
-                    .cloned();
-
-                Schema::Complex(ComplexType::Fixed(Fixed {
-                    name: Box::leak(fixed_name.into_boxed_str()),
-                    namespace: fixed_namespace.map(|ns| {
-                        let leaked = Box::leak(ns.into_boxed_str());
-                        leaked as &'static str
-                    }),
-                    aliases: vec![],
-                    size: *size,
-                    attributes: attrs,
-                }))
-            } else {
-                Schema::Type(Type {
-                    r#type: TypeName::Primitive(PrimitiveType::Bytes),
-                    attributes: attrs,
-                })
-            }
-        }
-        Codec::Uuid => {
-            let mut attrs = Attributes::default();
-            attrs.logical_type = Some("uuid");
-            copy_metadata_to_attributes(&data_type.metadata, &mut attrs);
-            let fixed_name = data_type
-                .metadata
-                .get("avro.fixed.name")
-                .cloned()
-                .unwrap_or_else(|| "fixed_16_uuid".to_string());
-            let fixed_namespace = data_type
-                .metadata
-                .get("avro.fixed.namespace")
-                .cloned();
-            Schema::Complex(ComplexType::Fixed(Fixed {
-                name: Box::leak(fixed_name.into_boxed_str()),
-                namespace: fixed_namespace.map(|ns| {
-                    let leaked = Box::leak(ns.into_boxed_str());
-                    leaked as &'static str
-                }),
-                aliases: vec![],
-                size: 16,
-                attributes: attrs,
-            }))
-        }
-        Codec::Date32 => {
-            let mut attrs = Attributes::default();
-            attrs.logical_type = Some("date");
-            copy_metadata_to_attributes(&data_type.metadata, &mut attrs);
-            Schema::Type(Type {
-                r#type: TypeName::Primitive(PrimitiveType::Int),
-                attributes: attrs,
-            })
-        }
-        Codec::TimeMillis => {
-            let mut attrs = Attributes::default();
-            attrs.logical_type = Some("time-millis");
-            copy_metadata_to_attributes(&data_type.metadata, &mut attrs);
-            Schema::Type(Type {
-                r#type: TypeName::Primitive(PrimitiveType::Int),
-                attributes: attrs,
-            })
-        }
-        Codec::TimeMicros => {
-            let mut attrs = Attributes::default();
-            attrs.logical_type = Some("time-micros");
-            copy_metadata_to_attributes(&data_type.metadata, &mut attrs);
-
-            Schema::Type(Type {
-                r#type: TypeName::Primitive(PrimitiveType::Long),
-                attributes: attrs,
-            })
-        }
-        Codec::TimestampMillis(is_utc) => {
-            let mut attrs = Attributes::default();
-            let lt = if *is_utc {
-                "timestamp-millis"
-            } else {
-                "local-timestamp-millis"
-            };
-            attrs.logical_type = Some(lt);
-            copy_metadata_to_attributes(&data_type.metadata, &mut attrs);
-            Schema::Type(Type {
-                r#type: TypeName::Primitive(PrimitiveType::Long),
-                attributes: attrs,
-            })
-        }
-        Codec::TimestampMicros(is_utc) => {
-            let mut attrs = Attributes::default();
-            let lt = if *is_utc {
-                "timestamp-micros"
-            } else {
-                "local-timestamp-micros"
-            };
-            attrs.logical_type = Some(lt);
-            copy_metadata_to_attributes(&data_type.metadata, &mut attrs);
-            Schema::Type(Type {
-                r#type: TypeName::Primitive(PrimitiveType::Long),
-                attributes: attrs,
-            })
-        }
-        Codec::Duration => {
-            let mut attrs = Attributes::default();
-            attrs.logical_type = Some("duration");
-            copy_metadata_to_attributes(&data_type.metadata, &mut attrs);
-            let fixed_name = data_type
-                .metadata
-                .get("avro.fixed.name")
-                .cloned()
-                .unwrap_or_else(|| "fixed_12_duration".to_string());
-            let fixed_namespace = data_type
-                .metadata
-                .get("avro.fixed.namespace")
-                .cloned();
-            Schema::Complex(ComplexType::Fixed(Fixed {
-                name: Box::leak(fixed_name.into_boxed_str()),
-                namespace: fixed_namespace.map(|ns| {
-                    let leaked = Box::leak(ns.into_boxed_str());
-                    leaked as &'static str
-                }),
-                aliases: vec![],
-                size: 12,
-                attributes: attrs,
-            }))
-        }
-        other => {
-            return Err(ArrowError::AvroError(format!(
-                "Unrecognized Avro Type={other:?}")
-            ));
-        }
-    };
-    if let Some(nul) = data_type.nullability {
-        let union = match nul {
-            Nullability::NullFirst => vec![
-                Schema::TypeName(TypeName::Primitive(PrimitiveType::Null)),
-                base,
-            ],
-            Nullability::NullSecond => vec![
-                base,
-                Schema::TypeName(TypeName::Primitive(PrimitiveType::Null)),
-            ],
-        };
-        Ok(Schema::Union(union))
-    } else {
-        Ok(base)
-    }
+fn parse_decimal_attributes(
+    attributes: &Attributes,
+    fallback_size: Option<usize>,
+    precision_required: bool,
+) -> Result<(usize, usize, Option<usize>), ArrowError> {
+    let precision = attributes
+        .additional
+        .get("precision")
+        .and_then(|v| v.as_u64())
+        .or(if precision_required { None } else { Some(10) })
+        .ok_or_else(|| ArrowError::ParseError("Decimal requires precision".to_string()))?
+        as usize;
+    let scale = attributes
+        .additional
+        .get("scale")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let size = attributes
+        .additional
+        .get("size")
+        .and_then(|v| v.as_u64())
+        .map(|s| s as usize)
+        .or(fallback_size);
+    Ok((precision, scale, size))
 }
 
 #[cfg(test)]
@@ -999,7 +1035,7 @@ mod tests {
     use std::sync::Arc;
 
     fn arrow_schema_round_trip(schema: &ArrowSchema) -> Result<AvroDataType, ArrowError> {
-        let avro_schema = arrow_schema_to_avro_schema(schema, false)?;
+        let avro_schema = make_schema(schema, &false)?;
         let mut resolver = Resolver::default();
         let avro_dt = make_data_type(&avro_schema, None, &mut resolver)?;
         Ok(avro_dt)
@@ -1200,7 +1236,7 @@ mod tests {
             }
             ref other => panic!("Expected a Map codec, got {other:?}"),
         }
-        let avro_sch = arrow_schema_to_avro_schema(&arrow_schema, false)?;
+        let avro_sch = make_schema(&arrow_schema, &false)?;
         if let Schema::Complex(ComplexType::Record(r)) = avro_sch {
             assert_eq!(r.fields.len(), 1);
             let top_f = &r.fields[0];
@@ -1270,7 +1306,7 @@ mod tests {
         let item_field = Field::new("sub", DataType::Utf8, true);
         let fsl_field = Field::new("fsl_col", DataType::FixedSizeList(Arc::new(item_field), 2), true);
         let arrow_schema = ArrowSchema::new(vec![fsl_field]);
-        let avro_sch = arrow_schema_to_avro_schema(&arrow_schema, false).unwrap();
+        let avro_sch = make_schema(&arrow_schema, &false).unwrap();
         let mut resolver = Resolver::default();
         let dt = make_data_type(&avro_sch, None, &mut resolver).unwrap();
         match &dt.codec {
@@ -1297,7 +1333,7 @@ mod tests {
         let struct_type = DataType::Struct(vec![child_a.clone(), child_b.clone()].into());
         let top_field = Field::new("my_struct", struct_type, false);
         let arrow_schema = ArrowSchema::new(vec![top_field]);
-        let avro_sch = arrow_schema_to_avro_schema(&arrow_schema, false).unwrap();
+        let avro_sch = make_schema(&arrow_schema, &false).unwrap();
         let mut resolver = Resolver::default();
         let dt = make_data_type(&avro_sch, None, &mut resolver).unwrap();
         match &dt.codec {
@@ -1348,7 +1384,7 @@ mod tests {
             }
             ref other => panic!("Expected decimal, got {other:?}"),
         }
-        let avro_sch = arrow_schema_to_avro_schema(&arrow_schema, false)?;
+        let avro_sch = make_schema(&arrow_schema, &false)?;
         match avro_sch {
             Schema::Complex(ComplexType::Record(r)) => {
                 assert_eq!(r.fields.len(), 1);
@@ -1488,7 +1524,7 @@ mod tests {
             Field::new("str_col", DataType::Utf8, false),
             Field::new("fixed4_col", DataType::FixedSizeBinary(4), true),
         ]);
-        let avro_sch = arrow_schema_to_avro_schema(&arrow_schema, false)?;
+        let avro_sch = make_schema(&arrow_schema, &false)?;
         let mut resolver = Resolver::default();
         let top_dt = make_data_type(&avro_sch, None, &mut resolver)?;
         match &top_dt.codec {

@@ -137,7 +137,6 @@ pub struct Record<'a> {
 
 /// A field within a [`Record`]
 ///
-/// **Modified** to preserve any `"default": null` even in out-of-spec union ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordField<'a> {
     #[serde(borrow)]
