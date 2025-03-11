@@ -21,7 +21,6 @@
 //! [Apache Avro]: https://avro.apache.org/
 
 #![warn(missing_docs)]
-#![allow(unused)] // Temporary
 
 pub mod reader;
 mod schema;
@@ -29,6 +28,11 @@ mod schema;
 mod compression;
 
 mod codec;
+pub mod writer;
+
+pub use self::reader::{Decoder, Reader, ReaderBuilder};
+pub use self::compression::{CompressionCodec};
+
 
 #[cfg(test)]
 mod test_util {
