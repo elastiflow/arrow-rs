@@ -40,7 +40,7 @@ pub enum Nullability {
 #[derive(Debug, Clone)]
 pub struct AvroDataType {
     pub nullability: Option<Nullability>,
-    pub metadata: Arc<HashMap<String, String>>,
+    pub metadata: HashMap<String, String>,
     pub codec: Codec,
 }
 
@@ -54,7 +54,7 @@ impl AvroDataType {
         AvroDataType {
             codec,
             nullability,
-            metadata: Arc::new(metadata),
+            metadata,
         }
     }
 
@@ -65,17 +65,13 @@ impl AvroDataType {
 
     /// Returns the name of this field
     fn to_schema<'a>(&self) -> Schema<'a> {
-        let metadata = Arc::try_unwrap(self.metadata.clone())
-            .unwrap_or_else(|arc| (*arc).clone());
-        self.codec.schema(metadata, self.nullability).unwrap()
+        self.codec.schema(self.metadata.clone(), self.nullability).unwrap()
     }
 
     /// Returns an arrow [`Field`] with the given name, applying `nullability` if present.
     pub fn field_with_name(&self, name: &str) -> Field {
         let is_nullable = self.nullability.is_some();
-        let metadata = Arc::try_unwrap(self.metadata.clone())
-            .unwrap_or_else(|arc| (*arc).clone());
-        Field::new(name, self.codec.data_type(), is_nullable).with_metadata(metadata)
+        Field::new(name, self.codec.data_type(), is_nullable).with_metadata(self.metadata.clone())
     }
 }
 
@@ -138,71 +134,114 @@ impl<'a> TryFrom<&Schema<'a>> for AvroField {
     }
 }
 
-/// Convert an Arrow schema to an Avro [Schema](Schema),
-/// optionally using `impala=true` to produce `[ T, "null" ]` unions.
-pub fn make_schema<'a>(
-    arrow_schema: &'a arrow_schema::Schema,
-    impala_mode: &'a bool,
-) -> Result<Schema<'a>, ArrowError> {
-    let record_fields = arrow_schema
-        .fields()
-        .iter()
-        .map(|fref| make_record_field(fref, impala_mode))
-        .collect::<Result<Vec<_>, _>>()?;
-    let record_name = arrow_schema
-        .metadata()
-        .get("avro.record.name")
-        .cloned()
-        .unwrap_or_else(|| "topLevelRecord".to_string());
-    let record_namespace = arrow_schema
-        .metadata()
-        .get("avro.record.namespace")
-        .cloned();
-    let record = Record {
-        name: Box::leak(record_name.into_boxed_str()),
-        namespace: record_namespace.map(|ns| {
-            let leaked = Box::leak(ns.into_boxed_str());
-            leaked as &'static str
-        }),
-        doc: None,
-        aliases: vec![],
-        fields: record_fields,
-        attributes: Default::default(),
-    };
-    Ok(Schema::Complex(ComplexType::Record(record)))
+/// An Avro datatype mapped to the arrow data model
+#[derive(Debug, Clone)]
+pub struct RecordFieldBuilder<'a> {
+    pub impala_mode: &'a bool,
+    pub field:&'a Field,
 }
 
-/// Convert a single Arrow `Field` into an Avro `RecordField`, respecting `impala` union ordering.
-fn make_record_field<'a>(
-    field: &'a Field,
-    impala_mode: &'a bool,
-) -> Result<RecordField<'a>, ArrowError> {
-    let nullability = if *impala_mode {
-        Nullability::NullSecond
-    } else {
-        Nullability::NullFirst
-    };
-    let codec = Codec::from_field(field, nullability)?;
-    let nullable = if field.is_nullable() {
-        Some(nullability)
-    } else {
-        None
-    };
-    let avro_data_type = AvroDataType::new(codec, nullable, field.metadata().clone());
-    // let field_name = Box::leak(field.name().clone().into_boxed_str());
-    let default_val = field
-        .metadata()
-        .get("avro.default")
-        .and_then(|s| serde_json::from_str(s).ok());
-    Ok(RecordField {
-        name: field.name(),
-        doc: None,
-        aliases: vec![],
-        r#type: avro_data_type.to_schema(),
-        default: default_val,
-    })
+impl<'a> RecordFieldBuilder<'a> {
+
+    /// Sets the row-based batch size
+    pub fn with_impala_mode(mut self, impala_mode: &'a bool) -> Self {
+        self.impala_mode = impala_mode;
+        self
+    }
+
+    pub fn finish(self) -> Result<RecordField<'a>, ArrowError> {
+        let nullability = if *self.impala_mode {
+            Nullability::NullSecond
+        } else {
+            Nullability::NullFirst
+        };
+        let nullable = if self.field.is_nullable() {
+            Some(nullability)
+        } else {
+            None
+        };
+        let schema = Codec::from_field(self.field, nullability)?.schema(self.field.metadata().clone(), nullable)?;
+        let default_val = self.field
+            .metadata()
+            .get("avro.default")
+            .and_then(|s| serde_json::from_str(s).ok());
+        Ok(RecordField {
+            name: self.field.name(),
+            doc: None,
+            aliases: vec![],
+            r#type: schema,
+            default: default_val,
+        })
+    }
 }
 
+impl<'a> From<&'a Field> for RecordFieldBuilder<'a> {
+    fn from(field: &'a Field) -> Self {
+        Self {
+            impala_mode: &false,
+            field,
+        }
+    }
+}
+
+/// An Avro datatype mapped to the arrow data model
+#[derive(Debug, Clone)]
+pub struct SchemaBuilder<'a> {
+    pub impala_mode: &'a bool,
+    pub fields: &'a Fields,
+    pub name: &'a str,
+    pub namespace: Option<&'a str>,
+}
+
+impl<'a> SchemaBuilder<'a> {
+
+    /// Sets the row-based batch size
+    pub fn with_impala_mode(mut self, impala_mode: &'a bool) -> Self {
+        self.impala_mode = impala_mode;
+        self
+    }
+
+    pub fn with_name(mut self, name: &'a str) -> Self {
+        self.name = name;
+        self
+    }
+
+    pub fn with_namespace(mut self, namespace: Option<&'a str>) -> Self {
+        self.namespace = namespace;
+        self
+    }
+
+    /// Consume this [`arrow_schema::SchemaBuilder`] yielding the final [`arrow_schema::Schema`]
+    pub fn finish(self) -> Result<Schema<'a>, ArrowError> {
+        let record_fields = self
+            .fields
+            .iter()
+            .map(|fref| RecordFieldBuilder::from(fref.as_ref())
+                .with_impala_mode(&self.impala_mode)
+                .finish()
+            ).collect::<Result<Vec<_>, _>>()?;
+        let record = Record {
+            name: self.name,
+            namespace: self.namespace,
+            doc: None,
+            aliases: vec![],
+            fields: record_fields,
+            attributes: Default::default(),
+        };
+        Ok(Schema::Complex(ComplexType::Record(record)))
+    }
+}
+
+impl<'a> From<&'a arrow_schema::Schema> for SchemaBuilder<'a> {
+    fn from(schema: &'a arrow_schema::Schema) -> Self {
+        Self {
+            impala_mode: &false,
+            fields: &schema.fields(),
+            name: "",
+            namespace: Some(""),
+        }
+    }
+}
 
 /// An Avro encoding
 #[derive(Debug, Clone)]
@@ -236,7 +275,7 @@ pub enum Codec {
 impl Codec {
 
     fn from_field(field: &Field, nullability_type: Nullability) -> Result<Self, ArrowError> {
-        let metadata = field.metadata().clone();
+        let metadata = field.metadata();
         match field.data_type() {
             // Primitive Types
             DataType::Null => Ok(Self::Null),
@@ -384,7 +423,7 @@ impl Codec {
             }
         }
     }
-    
+
     /// Convert this to an Arrow `DataType`
     pub(crate) fn data_type(&self) -> DataType {
         match self {
@@ -405,16 +444,14 @@ impl Codec {
             }
             Self::Array(child_type) => {
                 let child_dt = child_type.codec.data_type();
-                let child_md = Arc::try_unwrap(child_type.metadata.clone())
-                    .unwrap_or_else(|arc| (*arc).clone());
+                let child_md = child_type.metadata.to_owned();
                 let child_field =
                     Field::new(Field::LIST_FIELD_DEFAULT_NAME, child_dt, true).with_metadata(child_md);
                 DataType::List(Arc::new(child_field))
             }
             Self::Map(value_type) => {
                 let val_dt = value_type.codec.data_type();
-                let val_md = Arc::try_unwrap(value_type.metadata.clone())
-                    .unwrap_or_else(|arc| (*arc).clone());
+                let val_md = value_type.metadata.to_owned();
                 let val_field = Field::new("value", val_dt, true).with_metadata(val_md);
                 DataType::Map(
                     Arc::new(Field::new(
@@ -780,7 +817,7 @@ fn make_data_type<'a>(
     match schema {
         Schema::TypeName(TypeName::Primitive(p)) => Ok(AvroDataType {
             nullability: None,
-            metadata: Arc::new(Default::default()),
+            metadata: Default::default(),
             codec: (*p).into(),
         }),
         Schema::TypeName(TypeName::Ref(name)) => resolver.resolve(name, namespace),
@@ -825,21 +862,20 @@ fn make_data_type<'a>(
                     .collect::<Result<Vec<AvroField>, ArrowError>>()?;
                 let rec_dt = AvroDataType {
                     nullability: None,
-                    metadata: Arc::new(r.attributes.field_metadata()),
+                    metadata: r.attributes.field_metadata(),
                     codec: Codec::Record(Arc::from(fields)),
                 };
                 resolver.register(r.name, ns, rec_dt.clone());
                 Ok(rec_dt)
             }
             ComplexType::Enum(e) => {
-                // Insert "avro.enum.symbols" into metadata so we can preserve it.
                 let mut md = e.attributes.field_metadata();
                 if let Ok(symbols_json) = serde_json::to_string(&e.symbols) {
                     md.insert("avro.enum.symbols".to_string(), symbols_json);
                 }
                 let en = AvroDataType {
                     nullability: None,
-                    metadata: Arc::new(md),
+                    metadata: md,
                     codec: Codec::Enum(
                         Arc::from(
                             e.symbols
@@ -857,7 +893,7 @@ fn make_data_type<'a>(
                 let child = make_data_type(&a.items, namespace, resolver)?;
                 Ok(AvroDataType {
                     nullability: None,
-                    metadata: Arc::new(a.attributes.field_metadata()),
+                    metadata: a.attributes.field_metadata(),
                     codec: Codec::Array(Arc::new(child)),
                 })
             }
@@ -865,13 +901,13 @@ fn make_data_type<'a>(
                 let val = make_data_type(&m.values, namespace, resolver)?;
                 Ok(AvroDataType {
                     nullability: None,
-                    metadata: Arc::new(m.attributes.field_metadata()),
+                    metadata: m.attributes.field_metadata(),
                     codec: Codec::Map(Arc::new(val)),
                 })
             }
             ComplexType::Fixed(fx) => {
                 let size = fx.size as i32;
-                let md = Arc::new(fx.attributes.field_metadata());
+                let md = fx.attributes.field_metadata();
                 let dt = match fx.attributes.logical_type.as_deref() {
                     Some("decimal") => {
                         let (precision, scale, _) =
@@ -943,24 +979,20 @@ fn make_data_type<'a>(
                 }
                 (Some(other), _) => {
                     if !dt.metadata.contains_key("logicalType") {
-                        let mut map = (*dt.metadata).clone();
-                        map.insert("logicalType".into(), other.into());
-                        dt.metadata = Arc::new(map);
+                        dt.metadata.insert("logicalType".into(), other.into());
                     }
                 }
                 (None, _) => {}
             }
             for (k, v) in &t.attributes.additional {
-                let mut map = (*dt.metadata).clone();
-                map.insert(k.to_string(), v.to_string());
-                dt.metadata = Arc::new(map);
+                dt.metadata.insert(k.to_string(), v.to_string());
             }
             Ok(dt)
         }
     }
 }
 
-fn fixed_fallback(md: Arc<HashMap<String, String>>, size: i32) -> AvroDataType {
+fn fixed_fallback(md: HashMap<String, String>, size: i32) -> AvroDataType {
     AvroDataType {
         nullability: None,
         metadata: md,
@@ -1035,7 +1067,19 @@ mod tests {
     use std::sync::Arc;
 
     fn arrow_schema_round_trip(schema: &ArrowSchema) -> Result<AvroDataType, ArrowError> {
-        let avro_schema = make_schema(schema, &false)?;
+        let record_name = schema
+            .metadata()
+            .get("avro.record.name")
+            .cloned()
+            .unwrap_or_else(|| "topLevelRecord".to_string());
+        let record_namespace = schema
+            .metadata()
+            .get("avro.record.namespace").map(|s| s.as_str());
+        let avro_schema = SchemaBuilder::from(schema)
+            .with_impala_mode(&false)
+            .with_name(record_name.as_str())
+            .with_namespace(record_namespace)
+            .finish()?;
         let mut resolver = Resolver::default();
         let avro_dt = make_data_type(&avro_schema, None, &mut resolver)?;
         Ok(avro_dt)
@@ -1236,7 +1280,9 @@ mod tests {
             }
             ref other => panic!("Expected a Map codec, got {other:?}"),
         }
-        let avro_sch = make_schema(&arrow_schema, &false)?;
+        let avro_sch = SchemaBuilder::from(&arrow_schema)
+            .with_impala_mode(&false)
+            .finish()?;
         if let Schema::Complex(ComplexType::Record(r)) = avro_sch {
             assert_eq!(r.fields.len(), 1);
             let top_f = &r.fields[0];
@@ -1306,7 +1352,9 @@ mod tests {
         let item_field = Field::new("sub", DataType::Utf8, true);
         let fsl_field = Field::new("fsl_col", DataType::FixedSizeList(Arc::new(item_field), 2), true);
         let arrow_schema = ArrowSchema::new(vec![fsl_field]);
-        let avro_sch = make_schema(&arrow_schema, &false).unwrap();
+        let avro_sch = SchemaBuilder::from(&arrow_schema)
+            .with_impala_mode(&false)
+            .finish().unwrap();
         let mut resolver = Resolver::default();
         let dt = make_data_type(&avro_sch, None, &mut resolver).unwrap();
         match &dt.codec {
@@ -1333,7 +1381,9 @@ mod tests {
         let struct_type = DataType::Struct(vec![child_a.clone(), child_b.clone()].into());
         let top_field = Field::new("my_struct", struct_type, false);
         let arrow_schema = ArrowSchema::new(vec![top_field]);
-        let avro_sch = make_schema(&arrow_schema, &false).unwrap();
+        let avro_sch = SchemaBuilder::from(&arrow_schema)
+            .with_impala_mode(&false)
+            .finish().unwrap();
         let mut resolver = Resolver::default();
         let dt = make_data_type(&avro_sch, None, &mut resolver).unwrap();
         match &dt.codec {
@@ -1384,7 +1434,9 @@ mod tests {
             }
             ref other => panic!("Expected decimal, got {other:?}"),
         }
-        let avro_sch = make_schema(&arrow_schema, &false)?;
+        let avro_sch = SchemaBuilder::from(&arrow_schema)
+            .with_impala_mode(&false)
+            .finish()?;
         match avro_sch {
             Schema::Complex(ComplexType::Record(r)) => {
                 assert_eq!(r.fields.len(), 1);
@@ -1524,7 +1576,9 @@ mod tests {
             Field::new("str_col", DataType::Utf8, false),
             Field::new("fixed4_col", DataType::FixedSizeBinary(4), true),
         ]);
-        let avro_sch = make_schema(&arrow_schema, &false)?;
+        let avro_sch = SchemaBuilder::from(&arrow_schema)
+            .with_impala_mode(&false)
+            .finish()?;
         let mut resolver = Resolver::default();
         let top_dt = make_data_type(&avro_sch, None, &mut resolver)?;
         match &top_dt.codec {

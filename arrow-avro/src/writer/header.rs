@@ -20,7 +20,7 @@
 use std::io::Write;
 
 use arrow_schema::{ArrowError, Schema};
-use crate::codec::make_schema;
+use crate::codec::{SchemaBuilder};
 use crate::compression::CompressionCodec;
 use crate::writer::utils::{
     to_arrow_io_err, write_bytes, write_string,
@@ -52,7 +52,21 @@ impl AvroHeader {
             meta_entries += 1;
         }
         write_zigzag_long(meta_entries as i64, sink)?;
-        let schema =  make_schema(&self.arrow_schema, &self.impala_mode)?;
+        //let schema =  make_schema(&self.arrow_schema, &self.impala_mode)?;
+        let record_name = self.arrow_schema
+            .metadata()
+            .get("avro.record.name")
+            .cloned()
+            .unwrap_or_else(|| "topLevelRecord".to_string());
+        let record_namespace = self.arrow_schema
+            .metadata()
+            .get("avro.record.namespace").map(|s| s.as_str());
+
+        let schema = SchemaBuilder::from(&self.arrow_schema)
+            .with_impala_mode(&self.impala_mode)
+            .with_name(record_name.as_str())
+            .with_namespace(record_namespace)
+            .finish()?;
         let schema_json = serde_json::to_vec(&schema)
             .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
         write_string("avro.schema", sink)?;
