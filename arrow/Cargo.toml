@@ -62,7 +62,7 @@ half = { version = "2.1", default-features = false, optional = true }
 features = ["prettyprint", "ipc_compression", "ffi", "pyarrow"]
 
 [features]
-default = ["csv", "ipc", "json"]
+default = ["csv", "ipc", "json", "avro"]
 ipc_compression = ["ipc", "arrow-ipc/lz4", "arrow-ipc/zstd"]
 csv = ["arrow-csv"]
 ipc = ["arrow-ipc"]
