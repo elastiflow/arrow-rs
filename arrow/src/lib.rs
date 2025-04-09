@@ -387,6 +387,8 @@ pub use arrow_array::ffi_stream;
 pub use arrow_ipc as ipc;
 #[cfg(feature = "json")]
 pub use arrow_json as json;
+#[cfg(feature = "avro")]
+pub use arrow_avro as avro;
 #[cfg(feature = "pyarrow")]
 pub mod pyarrow;
 
