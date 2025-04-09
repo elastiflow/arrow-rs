@@ -80,6 +80,7 @@ rust-version = "1.70"
 arrow = { version = "54.3.1", path = "./arrow", default-features = false }
 arrow-arith = { version = "54.3.1", path = "./arrow-arith" }
 arrow-array = { version = "54.3.1", path = "./arrow-array" }
+arrow-avro = { version = "54.3.1", path = "./arrow-avro" }
 arrow-buffer = { version = "54.3.1", path = "./arrow-buffer" }
 arrow-cast = { version = "54.3.1", path = "./arrow-cast" }
 arrow-csv = { version = "54.3.1", path = "./arrow-csv" }
