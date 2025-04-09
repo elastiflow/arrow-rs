@@ -56,6 +56,8 @@ pub enum ArrowError {
     ParquetError(String),
     /// Error during import or export to/from the C Data Interface
     CDataInterface(String),
+    /// Error during Avro operations.
+    AvroError(String),
     /// Error when a dictionary key is bigger than the key type
     DictionaryKeyOverflowError,
     /// Error when the run end index in a REE array is bigger than the array length
@@ -119,6 +121,9 @@ impl Display for ArrowError {
             }
             ArrowError::CDataInterface(desc) => {
                 write!(f, "C Data interface error: {desc}")
+            }
+            ArrowError::AvroError(desc) => {
+                write!(f, "Avro error: {desc}")
             }
             ArrowError::DictionaryKeyOverflowError => {
                 write!(f, "Dictionary key bigger than the key type")
