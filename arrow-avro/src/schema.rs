@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow_schema::ArrowError;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// The metadata key used for storing the JSON encoded [`Schema`]
 pub const SCHEMA_METADATA_KEY: &str = "avro.schema";
@@ -260,12 +263,214 @@ pub struct Fixed<'a> {
     pub attributes: Attributes<'a>,
 }
 
+/// A store for Avro schemas, indexed by their 64-bit Rabin fingerprint.
+///
+/// This struct allows for efficient storage and retrieval of schemas. When a schema
+/// is registered, its canonical form is computed, and a fingerprint is generated.
+/// This fingerprint is then used as a key for lookup. This mechanism is useful
+/// for handling Avro data where schemas might be referenced by their fingerprint.
+#[derive(Debug)]
+pub struct SchemaStore<'a> {
+    schemas: HashMap<u64, Schema<'a>>,
+}
+
+impl<'a> TryFrom<&'a [Schema<'a>]> for SchemaStore<'a> {
+    type Error = ArrowError;
+
+    /// Creates a `SchemaStore` from a slice of schemas.
+    ///
+    /// Each schema in the slice is registered with the new store.
+    ///
+    /// # Arguments
+    ///
+    /// * `schemas` - A slice of `Schema` objects to populate the store with.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the new `SchemaStore`, or an `ArrowError` if
+    /// any of the schemas fail to register.
+    fn try_from(schemas: &'a [Schema<'a>]) -> Result<Self, Self::Error> {
+        let mut store = SchemaStore::new();
+        for schema in schemas {
+            store.register(schema.clone())?;
+        }
+        Ok(store)
+    }
+}
+
+impl<'a> SchemaStore<'a> {
+    /// Creates a new, empty `SchemaStore`.
+    pub fn new() -> Self {
+        Self {
+            schemas: HashMap::new(),
+        }
+    }
+
+    /// Registers a schema with the store.
+    ///
+    /// This method computes the canonical form of the schema, calculates its
+    /// 64-bit Rabin fingerprint, and stores the schema in a hash map with the
+    /// fingerprint as the key. If a schema with the same fingerprint is already
+    /// present, the existing schema is kept.
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - The Avro schema to register.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the 64-bit fingerprint of the registered schema,
+    /// or an error if the registration process fails.
+    ///
+    /// <https://avro.apache.org/docs/1.11.1/specification/#parsing-canonical-form-for-schemas>
+    pub fn register(&mut self, schema: Schema<'a>) -> Result<u64, ArrowError> {
+        let canonical = Self::generate_canonical_form(&schema);
+        let fp = Self::compute_fingerprint(&canonical);
+        self.schemas.entry(fp).or_insert(schema);
+        Ok(fp)
+    }
+
+    /// Looks up a schema by its fingerprint.
+    ///
+    /// # Arguments
+    ///
+    /// * `fingerprint` - The 64-bit Rabin fingerprint of the schema to look up.
+    ///
+    /// # Returns
+    ///
+    /// An `Option` containing a clone of the schema if found, or `None` if no
+    /// schema with the given fingerprint is registered.
+    pub fn lookup(&self, fingerprint: u64) -> Option<Schema<'a>> {
+        self.schemas.get(&fingerprint).cloned()
+    }
+
+    fn parse_canonical_json(schema: &Schema) -> Value {
+        match schema {
+            Schema::TypeName(tn) => match tn {
+                TypeName::Primitive(pt) => serde_json::to_value(pt).unwrap(),
+                TypeName::Ref(name) => serde_json::to_value(name).unwrap(),
+            },
+            Schema::Union(schemas) => {
+                Value::Array(schemas.iter().map(Self::parse_canonical_json).collect())
+            }
+            Schema::Complex(ct) => match ct {
+                ComplexType::Record(r) => {
+                    let full_name = r
+                        .namespace
+                        .map_or_else(|| r.name.to_string(), |ns| format!("{ns}.{}", r.name));
+                    let fields: Vec<Value> = r
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            json!({ "name": f.name, "type": Self::parse_canonical_json(&f.r#type) })
+                        })
+                        .collect();
+                    json!({ "type": "record", "name": full_name, "fields": fields })
+                }
+                ComplexType::Enum(e) => {
+                    let full_name = e
+                        .namespace
+                        .map_or_else(|| e.name.to_string(), |ns| format!("{ns}.{}", e.name));
+                    json!({ "type": "enum", "name": full_name, "symbols": e.symbols })
+                }
+                ComplexType::Array(a) => {
+                    json!({ "type": "array", "items": Self::parse_canonical_json(&a.items) })
+                }
+                ComplexType::Map(m) => {
+                    json!({ "type": "map", "values": Self::parse_canonical_json(&m.values) })
+                }
+                ComplexType::Fixed(f) => {
+                    let full_name = f
+                        .namespace
+                        .map_or_else(|| f.name.to_string(), |ns| format!("{ns}.{}", f.name));
+                    json!({ "type": "fixed", "name": full_name, "size": f.size })
+                }
+            },
+            Schema::Type(t) => match &t.r#type {
+                TypeName::Primitive(pt) => serde_json::to_value(pt).unwrap(),
+                TypeName::Ref(name) => serde_json::to_value(name).unwrap(),
+            },
+        }
+    }
+
+    #[inline]
+    fn generate_canonical_form(schema: &Schema) -> String {
+        serde_json::to_string(&Self::parse_canonical_json(schema)).unwrap()
+    }
+
+    #[inline]
+    fn compute_fingerprint(canonical_form: &str) -> u64 {
+        fingerprint64(canonical_form.as_bytes())
+    }
+}
+
+static FINGERPRINT_TABLE: OnceLock<[u64; 256]> = OnceLock::new();
+
+/// Compute the 64‑bit Rabin fingerprint described in the Avro spec.
+/// This replaces the old `crc::CRC_64_AVRO` constant, which was
+/// removed from `crc` v3.x.
+///
+/// Spec reference:
+///   EMPTY = 0xc15d213aa4d7a795
+///   fp[i] = (fp >> 8) ^ TABLE[(fp ^ byte) & 0xff]
+///
+/// <https://avro.apache.org/docs/1.11.1/specification/#schema-fingerprints>
+#[inline]
+fn fingerprint64(buf: &[u8]) -> u64 {
+    const EMPTY: u64 = 0xc15d213aa4d7a795;
+    // The lookup table is computed once and cached in a thread-safe manner.
+    let table = FINGERPRINT_TABLE.get_or_init(|| {
+        let mut table = [0u64; 256];
+        for i in 0..256 {
+            let mut fp = i as u64;
+            for _ in 0..8 {
+                fp = (fp >> 1) ^ (EMPTY & (0u64.wrapping_sub(fp & 1)));
+            }
+            table[i] = fp;
+        }
+        table
+    });
+    let mut fp = EMPTY;
+    for &b in buf {
+        fp = (fp >> 8) ^ table[((fp ^ b as u64) & 0xff) as usize];
+    }
+    fp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::codec::{AvroDataType, AvroField};
     use arrow_schema::{DataType, Fields, TimeUnit};
     use serde_json::json;
+
+    fn int_schema() -> Schema<'static> {
+        Schema::TypeName(TypeName::Primitive(PrimitiveType::Int))
+    }
+
+    fn record_schema() -> Schema<'static> {
+        Schema::Complex(ComplexType::Record(Record {
+            name: "record1",
+            namespace: Some("test.namespace"),
+            doc: Some("A test record"),
+            aliases: vec![],
+            fields: vec![
+                Field {
+                    name: "field1",
+                    doc: Some("An integer field"),
+                    r#type: int_schema(),
+                    default: None,
+                },
+                Field {
+                    name: "field2",
+                    doc: None,
+                    r#type: Schema::TypeName(TypeName::Primitive(PrimitiveType::String)),
+                    default: None,
+                },
+            ],
+            attributes: Attributes::default(),
+        }))
+    }
 
     #[test]
     fn test_deserialize() {
@@ -561,5 +766,120 @@ mod tests {
                 attributes: Default::default(),
             }))
         );
+    }
+
+    #[test]
+    fn test_new_schema_store() {
+        let store = SchemaStore::new();
+        assert!(store.schemas.is_empty());
+    }
+
+    #[test]
+    fn test_try_from_schemas() {
+        let schemas = vec![int_schema(), record_schema()];
+        let store = SchemaStore::try_from(schemas.as_slice()).unwrap();
+        assert_eq!(store.schemas.len(), 2);
+        let int_canonical = r#"{"fields":[{"name":"field1","type":"int"},{"name":"field2","type":"string"}],"name":"test.namespace.record1","type":"record"}"#;
+        let int_fp = SchemaStore::compute_fingerprint(int_canonical);
+        assert_eq!(store.lookup(int_fp), Some(record_schema()));
+        let record_canonical = r#""int""#;
+        let record_fp = SchemaStore::compute_fingerprint(record_canonical);
+        assert_eq!(store.lookup(record_fp), Some(int_schema()));
+    }
+
+    #[test]
+    fn test_try_from_with_duplicates() {
+        let schemas = vec![int_schema(), record_schema(), int_schema()];
+        let store = SchemaStore::try_from(schemas.as_slice()).unwrap();
+        assert_eq!(store.schemas.len(), 2);
+        let int_canonical = r#""int""#;
+        let int_fp = SchemaStore::compute_fingerprint(int_canonical);
+        assert_eq!(store.lookup(int_fp), Some(int_schema()));
+    }
+
+    #[test]
+    fn test_register_and_lookup() {
+        let mut store = SchemaStore::new();
+        let schema = int_schema();
+        let fingerprint = store.register(schema.clone()).unwrap();
+        let looked_up = store.lookup(fingerprint);
+        assert_eq!(looked_up, Some(schema));
+        let not_found = store.lookup(fingerprint + 1);
+        assert_eq!(not_found, None);
+    }
+
+    #[test]
+    fn test_register_duplicate_schema() {
+        let mut store = SchemaStore::new();
+        let schema1 = int_schema();
+        let schema2 = int_schema();
+        let fingerprint1 = store.register(schema1).unwrap();
+        let fingerprint2 = store.register(schema2).unwrap();
+        assert_eq!(fingerprint1, fingerprint2);
+        assert_eq!(store.schemas.len(), 1);
+    }
+
+    #[test]
+    fn test_canonical_form_generation_primitive() {
+        let schema = int_schema();
+        let canonical_form = SchemaStore::generate_canonical_form(&schema);
+        assert_eq!(canonical_form, r#""int""#);
+    }
+
+    #[test]
+    fn test_canonical_form_generation_record() {
+        let schema = record_schema();
+        let expected_canonical_form = r#"{"fields":[{"name":"field1","type":"int"},{"name":"field2","type":"string"}],"name":"test.namespace.record1","type":"record"}"#;
+        let canonical_form = SchemaStore::generate_canonical_form(&schema);
+        assert_eq!(canonical_form, expected_canonical_form);
+    }
+
+    #[test]
+    fn test_fingerprint_calculation() {
+        let canonical_form = r#"{"fields":[{"name":"a","type":"long"},{"name":"b","type":"string"}],"name":"test","type":"record"}"#;
+        let expected_fingerprint = 10505236152925314060;
+        let fingerprint = SchemaStore::compute_fingerprint(canonical_form);
+        assert_eq!(fingerprint, expected_fingerprint);
+    }
+
+    #[test]
+    fn test_register_and_lookup_complex_schema() {
+        let mut store = SchemaStore::new();
+        let schema = record_schema();
+        let canonical_form = r#"{"fields":[{"name":"field1","type":"int"},{"name":"field2","type":"string"}],"name":"test.namespace.record1","type":"record"}"#;
+        let expected_fingerprint = SchemaStore::compute_fingerprint(canonical_form);
+        let fingerprint = store.register(schema.clone()).unwrap();
+        assert_eq!(fingerprint, expected_fingerprint);
+        let looked_up = store.lookup(fingerprint);
+        assert_eq!(looked_up, Some(schema));
+    }
+
+    #[test]
+    fn test_canonical_form_strips_attributes() {
+        let schema_with_attrs = Schema::Complex(ComplexType::Record(Record {
+            name: "record_with_attrs",
+            namespace: None,
+            doc: Some("This doc should be stripped"),
+            aliases: vec!["alias1", "alias2"],
+            fields: vec![Field {
+                name: "f1",
+                doc: Some("field doc"),
+                r#type: Schema::Type(Type {
+                    r#type: TypeName::Primitive(PrimitiveType::Bytes),
+                    attributes: Attributes {
+                        logical_type: Some("decimal"),
+                        additional: HashMap::from([("precision", json!(4))]),
+                    },
+                }),
+                default: None,
+            }],
+            attributes: Attributes {
+                logical_type: None,
+                additional: HashMap::from([("custom_attr", json!("value"))]),
+            },
+        }));
+        let expected_canonical_form = r#"{"fields":[{"name":"f1","type":"bytes"}],"name":"record_with_attrs","type":"record"}"#;
+        let canonical_form = SchemaStore::generate_canonical_form(&schema_with_attrs);
+        assert_eq!(canonical_form, expected_canonical_form);
     }
 }

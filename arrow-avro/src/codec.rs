@@ -15,221 +15,156 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::schema::{Attributes, ComplexType, PrimitiveType, Record, Schema, TypeName};
-use arrow_schema::{
-    ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, SchemaBuilder, SchemaRef,
-    TimeUnit, DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE,
+use crate::schema::{
+    Array, Attributes, ComplexType, Enum, Field as SchemaField, Fixed, Map, PrimitiveType, Record,
+    Schema, Type, TypeName,
 };
-use std::borrow::Cow;
+use arrow_schema::{
+    ArrowError, DataType, Field, Fields, IntervalUnit, TimeUnit, DECIMAL128_MAX_PRECISION,
+    DECIMAL128_MAX_SCALE,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Avro types are not nullable, with nullability instead encoded as a union
-/// where one of the variants is the null type.
-///
-/// To accommodate this we special case two-variant unions where one of the
-/// variants is the null type, and use this to derive arrow's notion of nullability
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Nullability {
-    /// The nulls are encoded as the first union variant
     NullFirst,
-    /// The nulls are encoded as the second union variant
     NullSecond,
 }
 
-#[cfg(feature = "canonical_extension_types")]
-fn with_extension_type(codec: &Codec, field: Field) -> Field {
-    match codec {
-        Codec::Uuid => field.with_extension_type(arrow_schema::extension::Uuid),
-        _ => field,
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Promotion {
+    IntToLong,
+    IntToFloat,
+    IntToDouble,
+    LongToFloat,
+    LongToDouble,
+    FloatToDouble,
+    StringToBytes,
+    BytesToString,
 }
 
-/// An Avro datatype mapped to the arrow data model
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumMapping {
+    pub(crate) mapping: Arc<[i32]>,
+    pub(crate) default_index: i32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolutionInfo {
+    Promotion(Promotion),
+    Default(serde_json::Value),
+    EnumMapping(EnumMapping),
+    Record(ResolvedRecord),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRecord {
+    pub writer_to_reader: Arc<[Option<usize>]>,
+    pub default_fields: Arc<[usize]>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct AvroDataType {
-    nullability: Option<Nullability>,
-    metadata: HashMap<String, String>,
-    codec: Codec,
+    pub(crate) codec: Codec,
+    pub(crate) nullability: Option<Nullability>,
+    pub(crate) metadata: HashMap<String, String>,
+    pub(crate) resolution: Option<ResolutionInfo>,
 }
 
 impl AvroDataType {
-    /// Create a new [`AvroDataType`] with the given parts.
+    /// **Public ctor kept for backward‑compatibility** (reader/record.rs depends on it)
     pub fn new(
         codec: Codec,
         metadata: HashMap<String, String>,
         nullability: Option<Nullability>,
     ) -> Self {
-        AvroDataType {
+        Self {
             codec,
             metadata,
             nullability,
+            resolution: None,
         }
     }
 
-    /// Returns an arrow [`Field`] with the given name
-    pub fn field_with_name(&self, name: &str) -> Field {
-        let nullable = self.nullability.is_some();
-        let data_type = self.codec.data_type();
-        let field = Field::new(name, data_type, nullable).with_metadata(self.metadata.clone());
-        #[cfg(feature = "canonical_extension_types")]
-        return with_extension_type(&self.codec, field);
-        #[cfg(not(feature = "canonical_extension_types"))]
-        field
+    fn parsed(codec: Codec, metadata: HashMap<String, String>) -> Self {
+        Self {
+            codec,
+            metadata,
+            nullability: None,
+            resolution: None,
+        }
     }
 
-    /// Returns a reference to the codec used by this data type
-    ///
-    /// The codec determines how Avro data is encoded and mapped to Arrow data types.
-    /// This is useful when we need to inspect or use the specific encoding of a field.
+    fn resolved(
+        codec: Codec,
+        metadata: HashMap<String, String>,
+        nullability: Option<Nullability>,
+        resolution: Option<ResolutionInfo>,
+    ) -> Self {
+        Self {
+            codec,
+            metadata,
+            nullability,
+            resolution,
+        }
+    }
+
+    pub fn field_with_name(&self, name: &str) -> Field {
+        let f = Field::new(name, self.codec.data_type(), self.nullability.is_some())
+            .with_metadata(self.metadata.clone());
+        #[cfg(feature = "canonical_extension_types")]
+        return match self.codec {
+            Codec::Uuid => f.with_extension_type(arrow_schema::extension::Uuid),
+            _ => f,
+        };
+        #[cfg(not(feature = "canonical_extension_types"))]
+        f
+    }
+
     pub fn codec(&self) -> &Codec {
         &self.codec
     }
-
-    /// Returns the nullability status of this data type
-    ///
-    /// In Avro, nullability is represented through unions with null types.
-    /// The returned value indicates how nulls are encoded in the Avro format:
-    /// - `Some(Nullability::NullFirst)` - Nulls are encoded as the first union variant
-    /// - `Some(Nullability::NullSecond)` - Nulls are encoded as the second union variant
-    /// - `None` - The type is not nullable
     pub fn nullability(&self) -> Option<Nullability> {
         self.nullability
     }
 }
 
-/// A named [`AvroDataType`]
-#[derive(Debug, Clone)]
-pub struct AvroField {
-    name: String,
-    data_type: AvroDataType,
-}
-
-impl AvroField {
-    /// Returns the arrow [`Field`]
-    pub fn field(&self) -> Field {
-        self.data_type.field_with_name(&self.name)
-    }
-
-    /// Returns the [`AvroDataType`]
-    pub fn data_type(&self) -> &AvroDataType {
-        &self.data_type
-    }
-
-    /// Returns a new [`AvroField`] with Utf8View support enabled
-    ///
-    /// This will convert any Utf8 codecs to Utf8View codecs. This method is used to
-    /// enable potential performance optimizations in string-heavy workloads by using
-    /// Arrow's StringViewArray data structure.
-    ///
-    /// Returns a new `AvroField` with the same structure, but with string types
-    /// converted to use `Utf8View` instead of `Utf8`.
-    pub fn with_utf8view(&self) -> Self {
-        let mut field = self.clone();
-        if let Codec::Utf8 = field.data_type.codec {
-            field.data_type.codec = Codec::Utf8View;
-        }
-        field
-    }
-
-    /// Returns the name of this Avro field
-    ///
-    /// This is the field name as defined in the Avro schema.
-    /// It's used to identify fields within a record structure.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl<'a> TryFrom<&Schema<'a>> for AvroField {
-    type Error = ArrowError;
-
-    fn try_from(schema: &Schema<'a>) -> Result<Self, Self::Error> {
-        match schema {
-            Schema::Complex(ComplexType::Record(r)) => {
-                let mut resolver = Resolver::default();
-                let data_type = make_data_type(schema, None, &mut resolver, false)?;
-                Ok(AvroField {
-                    data_type,
-                    name: r.name.to_string(),
-                })
-            }
-            _ => Err(ArrowError::ParseError(format!(
-                "Expected record got {schema:?}"
-            ))),
-        }
-    }
-}
-
-/// An Avro encoding
-///
-/// <https://avro.apache.org/docs/1.11.1/specification/#encodings>
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Codec {
-    /// Represents Avro null type, maps to Arrow's Null data type
     Null,
-    /// Represents Avro boolean type, maps to Arrow's Boolean data type
     Boolean,
-    /// Represents Avro int type, maps to Arrow's Int32 data type
     Int32,
-    /// Represents Avro long type, maps to Arrow's Int64 data type
     Int64,
-    /// Represents Avro float type, maps to Arrow's Float32 data type
     Float32,
-    /// Represents Avro double type, maps to Arrow's Float64 data type
     Float64,
-    /// Represents Avro bytes type, maps to Arrow's Binary data type
     Binary,
-    /// String data represented as UTF-8 encoded bytes, corresponding to Arrow's StringArray
     Utf8,
-    /// String data represented as UTF-8 encoded bytes with an optimized view representation,
-    /// corresponding to Arrow's StringViewArray which provides better performance for string operations
-    ///
-    /// The Utf8View option can be enabled via `ReadOptions::use_utf8view`.
     Utf8View,
-    /// Represents Avro date logical type, maps to Arrow's Date32 data type
     Date32,
-    /// Represents Avro time-millis logical type, maps to Arrow's Time32(TimeUnit::Millisecond) data type
     TimeMillis,
-    /// Represents Avro time-micros logical type, maps to Arrow's Time64(TimeUnit::Microsecond) data type
     TimeMicros,
-    /// Represents Avro timestamp-millis or local-timestamp-millis logical type
-    ///
-    /// Maps to Arrow's Timestamp(TimeUnit::Millisecond) data type
-    /// The boolean parameter indicates whether the timestamp has a UTC timezone (true) or is local time (false)
     TimestampMillis(bool),
-    /// Represents Avro timestamp-micros or local-timestamp-micros logical type
-    ///
-    /// Maps to Arrow's Timestamp(TimeUnit::Microsecond) data type
-    /// The boolean parameter indicates whether the timestamp has a UTC timezone (true) or is local time (false)
     TimestampMicros(bool),
-    /// Represents Avro fixed type, maps to Arrow's FixedSizeBinary data type
-    /// The i32 parameter indicates the fixed binary size
     Fixed(i32),
-    /// Represents Avro decimal type, maps to Arrow's Decimal128 or Decimal256 data types
-    ///
-    /// The fields are `(precision, scale, fixed_size)`.
-    /// - `precision` (`usize`): Total number of digits.
-    /// - `scale` (`Option<usize>`): Number of fractional digits.
-    /// - `fixed_size` (`Option<usize>`): Size in bytes if backed by a `fixed` type, otherwise `None`.
     Decimal(usize, Option<usize>, Option<usize>),
-    /// Represents Avro Uuid type, a FixedSizeBinary with a length of 16.
     Uuid,
-    /// Represents an Avro enum, maps to Arrow's Dictionary(Int32, Utf8) type.
-    ///
-    /// The enclosed value contains the enum's symbols.
     Enum(Arc<[String]>),
-    /// Represents Avro array type, maps to Arrow's List data type
     List(Arc<AvroDataType>),
-    /// Represents Avro record type, maps to Arrow's Struct data type
     Struct(Arc<[AvroField]>),
-    /// Represents Avro map type, maps to Arrow's Map data type
     Map(Arc<AvroDataType>),
-    /// Represents Avro duration logical type, maps to Arrow's Interval(IntervalUnit::MonthDayNano) data type
     Interval,
 }
 
 impl Codec {
+    fn with_utf8view(self, use_utf8view: bool) -> Self {
+        if use_utf8view && matches!(self, Self::Utf8) {
+            Self::Utf8View
+        } else {
+            self
+        }
+    }
+
     fn data_type(&self) -> DataType {
         match self {
             Self::Null => DataType::Null,
@@ -244,48 +179,49 @@ impl Codec {
             Self::Date32 => DataType::Date32,
             Self::TimeMillis => DataType::Time32(TimeUnit::Millisecond),
             Self::TimeMicros => DataType::Time64(TimeUnit::Microsecond),
-            Self::TimestampMillis(is_utc) => {
-                DataType::Timestamp(TimeUnit::Millisecond, is_utc.then(|| "+00:00".into()))
+            Self::TimestampMillis(utc) => {
+                DataType::Timestamp(TimeUnit::Millisecond, utc.then(|| "+00:00".into()))
             }
-            Self::TimestampMicros(is_utc) => {
-                DataType::Timestamp(TimeUnit::Microsecond, is_utc.then(|| "+00:00".into()))
+            Self::TimestampMicros(utc) => {
+                DataType::Timestamp(TimeUnit::Microsecond, utc.then(|| "+00:00".into()))
             }
             Self::Interval => DataType::Interval(IntervalUnit::MonthDayNano),
-            Self::Fixed(size) => DataType::FixedSizeBinary(*size),
-            Self::Decimal(precision, scale, size) => {
-                let p = *precision as u8;
-                let s = scale.unwrap_or(0) as i8;
-                let too_large_for_128 = match *size {
-                    Some(sz) => sz > 16,
-                    None => {
-                        (p as usize) > DECIMAL128_MAX_PRECISION as usize
-                            || (s as usize) > DECIMAL128_MAX_SCALE as usize
-                    }
-                };
-                if too_large_for_128 {
-                    DataType::Decimal256(p, s)
+            Self::Fixed(sz) => DataType::FixedSizeBinary(*sz),
+            Self::Decimal(p, s, sz) => {
+                let p8 = *p as u8;
+                let s8 = s.unwrap_or(0) as i8;
+                let needs256 = sz.map_or_else(
+                    || {
+                        (*p > DECIMAL128_MAX_PRECISION as usize)
+                            || (s.unwrap_or(0) > DECIMAL128_MAX_SCALE as usize)
+                    },
+                    |b| b > 16,
+                );
+                if needs256 {
+                    DataType::Decimal256(p8, s8)
                 } else {
-                    DataType::Decimal128(p, s)
+                    DataType::Decimal128(p8, s8)
                 }
             }
             Self::Uuid => DataType::FixedSizeBinary(16),
-            Self::Enum(_) => {
-                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
-            }
-            Self::List(f) => {
-                DataType::List(Arc::new(f.field_with_name(Field::LIST_FIELD_DEFAULT_NAME)))
-            }
-            Self::Struct(f) => DataType::Struct(f.iter().map(|x| x.field()).collect()),
-            Self::Map(value_type) => {
-                let val_dt = value_type.codec.data_type();
-                let val_field = Field::new("value", val_dt, value_type.nullability.is_some())
-                    .with_metadata(value_type.metadata.clone());
+            Self::Enum(_) => DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            Self::List(child) => DataType::List(Arc::new(
+                child.field_with_name(Field::LIST_FIELD_DEFAULT_NAME),
+            )),
+            Self::Struct(flds) => DataType::Struct(flds.iter().map(|f| f.field()).collect()),
+            Self::Map(val) => {
+                let vfield = Field::new(
+                    "value",
+                    val.codec.data_type(),
+                    val.nullability.is_some(),
+                )
+                    .with_metadata(val.metadata.clone());
                 DataType::Map(
                     Arc::new(Field::new(
                         "entries",
                         DataType::Struct(Fields::from(vec![
                             Field::new("key", DataType::Utf8, false),
-                            val_field,
+                            vfield,
                         ])),
                         false,
                     )),
@@ -297,293 +233,606 @@ impl Codec {
 }
 
 impl From<PrimitiveType> for Codec {
-    fn from(value: PrimitiveType) -> Self {
-        match value {
-            PrimitiveType::Null => Self::Null,
-            PrimitiveType::Boolean => Self::Boolean,
-            PrimitiveType::Int => Self::Int32,
-            PrimitiveType::Long => Self::Int64,
-            PrimitiveType::Float => Self::Float32,
-            PrimitiveType::Double => Self::Float64,
-            PrimitiveType::Bytes => Self::Binary,
-            PrimitiveType::String => Self::Utf8,
+    fn from(pt: PrimitiveType) -> Self {
+        use PrimitiveType::*;
+        match pt {
+            Null => Codec::Null,
+            Boolean => Codec::Boolean,
+            Int => Codec::Int32,
+            Long => Codec::Int64,
+            Float => Codec::Float32,
+            Double => Codec::Float64,
+            Bytes => Codec::Binary,
+            String => Codec::Utf8,
         }
     }
 }
 
-fn parse_decimal_attributes(
-    attributes: &Attributes,
+#[derive(Debug, Clone, PartialEq)]
+pub struct AvroField {
+    name: String,
+    data_type: AvroDataType,
+}
+
+impl AvroField {
+    pub fn field(&self) -> Field {
+        self.data_type.field_with_name(&self.name)
+    }
+    pub fn data_type(&self) -> &AvroDataType {
+        &self.data_type
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn resolve_from_writer_and_reader<'a>(
+        writer: &Schema<'a>,
+        reader: &Schema<'a>,
+        use_utf8view: bool,
+    ) -> Result<Self, ArrowError> {
+        let mut res = SchemaResolver::new(use_utf8view);
+        let dt = res.visit(Some(writer), reader, None)?;
+        let top_name = match reader {
+            Schema::Complex(ComplexType::Record(r)) => r.name.to_string(),
+            _ => "root".to_string(),
+        };
+        Ok(Self {
+            name: top_name,
+            data_type: dt,
+        })
+    }
+}
+
+impl<'a> TryFrom<&Schema<'a>> for AvroField {
+    type Error = ArrowError;
+    fn try_from(schema: &Schema<'a>) -> Result<Self, Self::Error> {
+        if let Schema::Complex(ComplexType::Record(r)) = schema {
+            let mut res = SchemaResolver::new(false);
+            let dt = res.visit(None, schema, None)?;
+            Ok(Self {
+                name: r.name.to_string(),
+                data_type: dt,
+            })
+        } else {
+            Err(ArrowError::ParseError(
+                "Expected top‑level record".to_string(),
+            ))
+        }
+    }
+}
+
+#[derive(Default)]
+struct NameCache<'a> {
+    named: HashMap<(&'a str, &'a str), AvroDataType>,
+    resolved: HashMap<(&'a str, &'a str), AvroDataType>,
+}
+
+impl<'a> NameCache<'a> {
+    fn lookup_named(&self, name: &str, ns: Option<&'a str>) -> Option<AvroDataType> {
+        let (nsp, nm) = name
+            .rsplit_once('.')
+            .unwrap_or_else(|| (ns.unwrap_or(""), name));
+        self.named.get(&(nsp, nm)).cloned()
+    }
+    fn insert_named(
+        &mut self,
+        name: &'a str,
+        ns: Option<&'a str>,
+        dt: AvroDataType,
+    ) -> AvroDataType {
+        self.named.insert((name, ns.unwrap_or("")), dt.clone());
+        dt
+    }
+}
+
+struct SchemaResolver<'a> {
+    cache: NameCache<'a>,
+    use_utf8view: bool,
+}
+
+impl<'a> SchemaResolver<'a> {
+    fn new(use_utf8view: bool) -> Self {
+        Self {
+            cache: Default::default(),
+            use_utf8view,
+        }
+    }
+
+    fn visit(
+        &mut self,
+        writer: Option<&Schema<'a>>,
+        reader: &Schema<'a>,
+        namespace: Option<&'a str>,
+    ) -> Result<AvroDataType, ArrowError> {
+        match writer {
+            None => self.parse(reader, namespace),
+            Some(w) => self.resolve(w, reader, namespace),
+        }
+    }
+
+    fn parse(
+        &mut self,
+        schema: &Schema<'a>,
+        namespace: Option<&'a str>,
+    ) -> Result<AvroDataType, ArrowError> {
+        match schema {
+            Schema::TypeName(TypeName::Primitive(p)) => Ok(AvroDataType::parsed(
+                Codec::from(*p).with_utf8view(self.use_utf8view),
+                Default::default(),
+            )),
+            Schema::TypeName(TypeName::Ref(name)) => self
+                .cache
+                .lookup_named(name, namespace)
+                .ok_or_else(|| ArrowError::ParseError(format!("Failed to resolve .{name}"))),
+            Schema::Union(branches) => self.parse_nullable_union(branches, namespace),
+            Schema::Complex(ct) => self.parse_complex(ct, namespace),
+            Schema::Type(t) => {
+                let mut dt = self.parse(&Schema::TypeName(t.r#type.clone()), namespace)?;
+                self.apply_logical_type(&mut dt, &t.attributes, None)?;
+                Ok(dt)
+            }
+        }
+    }
+
+    fn parse_nullable_union(
+        &mut self,
+        branches: &[Schema<'a>],
+        namespace: Option<&'a str>,
+    ) -> Result<AvroDataType, ArrowError> {
+        if branches.len() != 2 {
+            return Err(ArrowError::NotYetImplemented(
+                "Full unions not implemented".into(),
+            ));
+        }
+        let (null_pos, nonnull) = if Self::is_null(&branches[0]) {
+            (Nullability::NullFirst, &branches[1])
+        } else if Self::is_null(&branches[1]) {
+            (Nullability::NullSecond, &branches[0])
+        } else {
+            return Err(ArrowError::ParseError(
+                "Two‑branch union missing \"null\"".into(),
+            ));
+        };
+        let mut dt = self.parse(nonnull, namespace)?;
+        dt.nullability = Some(null_pos);
+        Ok(dt)
+    }
+
+    fn parse_complex(
+        &mut self,
+        ct: &ComplexType<'a>,
+        namespace: Option<&'a str>,
+    ) -> Result<AvroDataType, ArrowError> {
+        match ct {
+            ComplexType::Record(r) => self.parse_record(r, namespace),
+            ComplexType::Enum(e) => self.parse_enum(e, namespace),
+            ComplexType::Fixed(f) => self.parse_fixed(f, namespace),
+            ComplexType::Array(arr) => {
+                let item = self.parse(&arr.items, namespace)?;
+                Ok(AvroDataType::parsed(
+                    Codec::List(Arc::new(item)),
+                    arr.attributes.field_metadata(),
+                ))
+            }
+            ComplexType::Map(mp) => {
+                let v = self.parse(&mp.values, namespace)?;
+                Ok(AvroDataType::parsed(
+                    Codec::Map(Arc::new(v)),
+                    mp.attributes.field_metadata(),
+                ))
+            }
+        }
+    }
+
+    fn parse_record(
+        &mut self,
+        r: &Record<'a>,
+        namespace: Option<&'a str>,
+    ) -> Result<AvroDataType, ArrowError> {
+        let ns = r.namespace.or(namespace);
+        // placeholder to allow recursion
+        let placeholder = AvroDataType::parsed(
+            Codec::Struct(Arc::new([])),
+            r.attributes.field_metadata(),
+        );
+        self.cache.insert_named(r.name, ns, placeholder);
+        let mut fields = Vec::with_capacity(r.fields.len());
+        for f in &r.fields {
+            let dt = self.parse(&f.r#type, ns)?;
+            fields.push(AvroField {
+                name: f.name.to_string(),
+                data_type: dt,
+            });
+        }
+        let struct_dt = AvroDataType::parsed(
+            Codec::Struct(Arc::from(fields)),
+            r.attributes.field_metadata(),
+        );
+        self.cache.insert_named(r.name, ns, struct_dt.clone());
+        Ok(struct_dt)
+    }
+
+    fn parse_enum(
+        &mut self,
+        e: &Enum<'a>,
+        namespace: Option<&'a str>,
+    ) -> Result<AvroDataType, ArrowError> {
+        let symbols = Arc::<[String]>::from(e.symbols.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let mut md = e.attributes.field_metadata();
+        md.insert(
+            "avro.enum.symbols".into(),
+            serde_json::to_string(&e.symbols).unwrap(),
+        );
+        let dt = AvroDataType::parsed(Codec::Enum(symbols), md);
+        self.cache.insert_named(e.name, e.namespace.or(namespace), dt.clone());
+        Ok(dt)
+    }
+
+    fn parse_fixed(
+        &mut self,
+        f: &Fixed<'a>,
+        namespace: Option<&'a str>,
+    ) -> Result<AvroDataType, ArrowError> {
+        let size_i32 = i32::try_from(f.size)
+            .map_err(|e| ArrowError::ParseError(format!("Fixed size overflow: {e}")))?;
+        let mut md = f.attributes.field_metadata();
+        let codec = match f.attributes.logical_type {
+            Some("decimal") => {
+                let (p, s, _) = parse_decimal_attrs(&f.attributes, Some(f.size), true)?;
+                Codec::Decimal(p, Some(s), Some(f.size))
+            }
+            Some("duration") => {
+                if f.size != 12 {
+                    return Err(ArrowError::ParseError(
+                        "Duration fixed must have size 12".into(),
+                    ));
+                }
+                Codec::Interval
+            }
+            _ => Codec::Fixed(size_i32),
+        };
+        let dt = AvroDataType::parsed(codec, md);
+        self.cache.insert_named(f.name, f.namespace.or(namespace), dt.clone());
+        Ok(dt)
+    }
+
+    fn resolve(
+        &mut self,
+        writer: &Schema<'a>,
+        reader: &Schema<'a>,
+        namespace: Option<&'a str>,
+    ) -> Result<AvroDataType, ArrowError> {
+        match (writer, reader) {
+            (Schema::TypeName(TypeName::Primitive(wp)), Schema::TypeName(TypeName::Primitive(rp)))
+            | (
+                Schema::Type(Type {
+                                 r#type: TypeName::Primitive(wp),
+                                 ..
+                             }),
+                Schema::Type(Type {
+                                 r#type: TypeName::Primitive(rp),
+                                 ..
+                             }),
+            ) => self.resolve_primitives(*wp, *rp, reader),
+            (
+                Schema::TypeName(TypeName::Primitive(wp)),
+                Schema::Type(r_t),
+            ) if matches!(r_t.r#type, TypeName::Primitive(_)) => {
+                if let TypeName::Primitive(rp) = r_t.r#type {
+                    self.resolve_primitives(*wp, rp, reader)
+                } else {
+                    unreachable!()
+                }
+            }
+            (
+                Schema::Complex(ComplexType::Record(wr)),
+                Schema::Complex(ComplexType::Record(rr)),
+            ) => self.resolve_records(wr, rr, namespace),
+            (
+                Schema::Complex(ComplexType::Enum(we)),
+                Schema::Complex(ComplexType::Enum(re)),
+            ) => self.resolve_enums(we, re),
+            (
+                Schema::Complex(ComplexType::Fixed(wf)),
+                Schema::Complex(ComplexType::Fixed(rf)),
+            ) if wf.size == rf.size => self.parse(reader, namespace),
+            (
+                Schema::Complex(ComplexType::Array(wa)),
+                Schema::Complex(ComplexType::Array(ra)),
+            ) => {
+                let child = self.visit(Some(&wa.items), &ra.items, namespace)?;
+                Ok(AvroDataType::resolved(
+                    Codec::List(Arc::new(child)),
+                    ra.attributes.field_metadata(),
+                    None,
+                    None,
+                ))
+            }
+            (
+                Schema::Complex(ComplexType::Map(wm)),
+                Schema::Complex(ComplexType::Map(rm)),
+            ) => {
+                let val = self.visit(Some(&wm.values), &rm.values, namespace)?;
+                Ok(AvroDataType::resolved(
+                    Codec::Map(Arc::new(val)),
+                    rm.attributes.field_metadata(),
+                    None,
+                    None,
+                ))
+            }
+            (Schema::Union(wu), Schema::Union(ru)) => {
+                self.resolve_nullable_union(wu, ru, namespace)
+            }
+            (w_nonunion, Schema::Union(ru)) if Self::is_nullable_union(ru) => {
+                let (null_pos, r_nonnull) = if Self::is_null(&ru[0]) {
+                    (Nullability::NullFirst, &ru[1])
+                } else {
+                    (Nullability::NullSecond, &ru[0])
+                };
+                let mut dt = self.visit(Some(w_nonunion), r_nonnull, namespace)?;
+                dt.nullability = Some(null_pos);
+                Ok(dt)
+            }
+            (Schema::Union(wu), r_nonunion) if Self::is_nullable_union(wu) => {
+                let w_nonnull = if Self::is_null(&wu[0]) { &wu[1] } else { &wu[0] };
+                self.visit(Some(w_nonnull), r_nonunion, namespace)
+            }
+            _ => Err(ArrowError::ParseError(format!(
+                "Schemas incompatible\nwriter: {writer:?}\nreader: {reader:?}"
+            ))),
+        }
+    }
+
+    fn resolve_primitives(
+        &mut self,
+        wp: PrimitiveType,
+        rp: PrimitiveType,
+        reader_schema: &Schema<'a>,
+    ) -> Result<AvroDataType, ArrowError> {
+        if wp == rp {
+            return self.parse(reader_schema, None);
+        }
+        use PrimitiveType::*;
+        let prom = match (wp, rp) {
+            (Int, Long) => Promotion::IntToLong,
+            (Int, Float) => Promotion::IntToFloat,
+            (Int, Double) => Promotion::IntToDouble,
+            (Long, Float) => Promotion::LongToFloat,
+            (Long, Double) => Promotion::LongToDouble,
+            (Float, Double) => Promotion::FloatToDouble,
+            (String, Bytes) => Promotion::StringToBytes,
+            (Bytes, String) => Promotion::BytesToString,
+            _ => {
+                return Err(ArrowError::ParseError(format!(
+                    "Illegal promotion {wp:?}→{rp:?}"
+                )))
+            }
+        };
+        let mut dt = self.parse(reader_schema, None)?;
+        dt.resolution = Some(ResolutionInfo::Promotion(prom));
+        Ok(dt)
+    }
+
+    fn resolve_enums(
+        &mut self,
+        w: &Enum<'a>,
+        r: &Enum<'a>,
+    ) -> Result<AvroDataType, ArrowError> {
+        let name_ok = w.name == r.name || r.aliases.iter().any(|&a| a == w.name);
+        if !name_ok {
+            return Err(ArrowError::ParseError(format!(
+                "Enum name mismatch writer={}, reader={}",
+                w.name, r.name
+            )));
+        }
+        let mut mapping = vec![0_i32; w.symbols.len()];
+        let mut def_idx = None;
+        for (i, &wsym) in w.symbols.iter().enumerate() {
+            if let Some(p) = r.symbols.iter().position(|&rs| rs == wsym) {
+                mapping[i] = p as i32;
+            } else if let Some(def) = r.default {
+                let p = r
+                    .symbols
+                    .iter()
+                    .position(|&rs| rs == def)
+                    .ok_or_else(|| {
+                        ArrowError::ParseError("Reader enum default not in symbol list".into())
+                    })?;
+                mapping[i] = p as i32;
+            } else {
+                return Err(ArrowError::ParseError(format!(
+                    "Writer enum symbol '{}' not in reader enum",
+                    wsym
+                )));
+            }
+            def_idx = def_idx.or_else(|| {
+                r.default
+                    .and_then(|d| r.symbols.iter().position(|&s| s == d))
+                    .map(|p| p as i32)
+            });
+        }
+        let enum_codec = Codec::Enum(
+            Arc::<[String]>::from(r.symbols.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+        );
+        Ok(AvroDataType::resolved(
+            enum_codec,
+            r.attributes.field_metadata(),
+            None,
+            Some(ResolutionInfo::EnumMapping(EnumMapping {
+                mapping: Arc::from(mapping),
+                default_index: def_idx.unwrap_or(0),
+            })),
+        ))
+    }
+
+    fn resolve_records(
+        &mut self,
+        w: &Record<'a>,
+        r: &Record<'a>,
+        namespace: Option<&'a str>,
+    ) -> Result<AvroDataType, ArrowError> {
+        let same = w.name == r.name
+            || r.aliases.iter().any(|&a| a == w.name)
+            || w.aliases.iter().any(|&a| a == r.name);
+        if !same {
+            return Err(ArrowError::ParseError(format!(
+                "Record name mismatch writer={}, reader={}",
+                w.name, r.name
+            )));
+        }
+        if let Some(prev) = self.cache.resolved.get(&(w.name, r.name)).cloned() {
+            return Ok(prev);
+        }
+        let ns = r.namespace.or(namespace);
+        let mut w_lookup: HashMap<&str, &SchemaField<'a>> = w.fields.iter().map(|f| (f.name, f)).collect();
+        let mut reader_fields = Vec::with_capacity(r.fields.len());
+        let mut w_to_r = vec![None; w.fields.len()];
+        let mut defaults = Vec::new();
+
+        for (r_idx, rf) in r.fields.iter().enumerate() {
+            if let Some(wf) = w_lookup.get(rf.name) {
+                let child = self.visit(Some(&wf.r#type), &rf.r#type, ns)?;
+                reader_fields.push(AvroField {
+                    name: rf.name.to_string(),
+                    data_type: child,
+                });
+                let w_pos = w.fields.iter().position(|f| std::ptr::eq(*wf, f)).unwrap();
+                w_to_r[w_pos] = Some(r_idx);
+            } else {
+                if let Some(def_raw) = rf.default {
+                    let def_val: serde_json::Value =
+                        serde_json::from_str(def_raw).unwrap_or_else(|_| def_raw.into());
+                    let mut child = self.visit(None, &rf.r#type, ns)?;
+                    child.resolution = Some(ResolutionInfo::Default(def_val));
+                    reader_fields.push(AvroField {
+                        name: rf.name.to_string(),
+                        data_type: child,
+                    });
+                    defaults.push(r_idx);
+                } else {
+                    return Err(ArrowError::ParseError(format!(
+                        "Field '{}' missing in writer and no default",
+                        rf.name
+                    )));
+                }
+            }
+        }
+        let mut md = r.attributes.field_metadata();
+        if !defaults.is_empty() {
+            md.insert(
+                "avro.resolution.defaults".into(),
+                serde_json::to_string(&defaults).unwrap(),
+            );
+        }
+        let dt = AvroDataType::resolved(
+            Codec::Struct(Arc::from(reader_fields)),
+            md,
+            None,
+            Some(ResolutionInfo::Record(ResolvedRecord {
+                writer_to_reader: Arc::from(w_to_r),
+                default_fields: Arc::from(defaults),
+            })),
+        );
+        self.cache.resolved.insert((w.name, r.name), dt.clone());
+        Ok(dt)
+    }
+
+    fn resolve_nullable_union(
+        &mut self,
+        wu: &[Schema<'a>],
+        ru: &[Schema<'a>],
+        namespace: Option<&'a str>,
+    ) -> Result<AvroDataType, ArrowError> {
+        if !Self::is_nullable_union(wu) || !Self::is_nullable_union(ru) {
+            return Err(ArrowError::NotYetImplemented(
+                "Full union resolution not implemented".into(),
+            ));
+        }
+        let (null_pos, w_nonnull) = if Self::is_null(&wu[0]) {
+            (Nullability::NullFirst, &wu[1])
+        } else {
+            (Nullability::NullSecond, &wu[0])
+        };
+        let r_nonnull = if Self::is_null(&ru[0]) { &ru[1] } else { &ru[0] };
+        let mut dt = self.visit(Some(w_nonnull), r_nonnull, namespace)?;
+        dt.nullability = Some(null_pos);
+        Ok(dt)
+    }
+
+    #[inline]
+    fn is_null(s: &Schema) -> bool {
+        matches!(
+            s,
+            Schema::TypeName(TypeName::Primitive(PrimitiveType::Null))
+                | Schema::Type(Type {
+                    r#type: TypeName::Primitive(PrimitiveType::Null),
+                    ..
+                })
+        )
+    }
+    #[inline]
+    fn is_nullable_union(branches: &[Schema<'_>]) -> bool {
+        branches.len() == 2 && (Self::is_null(&branches[0]) || Self::is_null(&branches[1]))
+    }
+
+    fn apply_logical_type(
+        &self,
+        dt: &mut AvroDataType,
+        attrs: &Attributes,
+        fallback_size: Option<usize>,
+    ) -> Result<(), ArrowError> {
+        match (&attrs.logical_type, &mut dt.codec) {
+            (Some("decimal"), c @ Codec::Binary) => {
+                let (p, s, _) = parse_decimal_attrs(attrs, fallback_size, false)?;
+                *c = Codec::Decimal(p, Some(s), fallback_size);
+            }
+            (Some("date"), c @ Codec::Int32) => *c = Codec::Date32,
+            (Some("time-millis"), c @ Codec::Int32) => *c = Codec::TimeMillis,
+            (Some("time-micros"), c @ Codec::Int64) => *c = Codec::TimeMicros,
+            (Some("timestamp-millis"), c @ Codec::Int64) => *c = Codec::TimestampMillis(true),
+            (Some("timestamp-micros"), c @ Codec::Int64) => *c = Codec::TimestampMicros(true),
+            (Some("local-timestamp-millis"), c @ Codec::Int64) => {
+                *c = Codec::TimestampMillis(false)
+            }
+            (Some("local-timestamp-micros"), c @ Codec::Int64) => {
+                *c = Codec::TimestampMicros(false)
+            }
+            (Some("uuid"), c @ Codec::Utf8) => *c = Codec::Uuid,
+            (Some(other), _) => {
+                dt.metadata.insert("logicalType".into(), other.to_string());
+            }
+            (None, _) => {}
+        }
+        for (k, v) in &attrs.additional {
+            dt.metadata.insert(k.to_string(), v.to_string());
+        }
+        Ok(())
+    }
+}
+
+fn parse_decimal_attrs(
+    attrs: &Attributes,
     fallback_size: Option<usize>,
     precision_required: bool,
 ) -> Result<(usize, usize, Option<usize>), ArrowError> {
-    let precision = attributes
+    let precision = attrs
         .additional
         .get("precision")
         .and_then(|v| v.as_u64())
         .or(if precision_required { None } else { Some(10) })
-        .ok_or_else(|| ArrowError::ParseError("Decimal requires precision".to_string()))?
-        as usize;
-    let scale = attributes
+        .ok_or_else(|| ArrowError::ParseError("Decimal requires precision".into()))? as usize;
+    let scale = attrs
         .additional
         .get("scale")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
-    let size = attributes
+    let size = attrs
         .additional
         .get("size")
         .and_then(|v| v.as_u64())
         .map(|s| s as usize)
         .or(fallback_size);
     Ok((precision, scale, size))
-}
-
-impl Codec {
-    /// Converts a string codec to use Utf8View if requested
-    ///
-    /// The conversion only happens if both:
-    /// 1. `use_utf8view` is true
-    /// 2. The codec is currently `Utf8`
-    ///
-    /// # Example
-    /// ```
-    /// # use arrow_avro::codec::Codec;
-    /// let utf8_codec1 = Codec::Utf8;
-    /// let utf8_codec2 = Codec::Utf8;
-    ///
-    /// // Convert to Utf8View
-    /// let view_codec = utf8_codec1.with_utf8view(true);
-    /// assert!(matches!(view_codec, Codec::Utf8View));
-    ///
-    /// // Don't convert if use_utf8view is false
-    /// let unchanged_codec = utf8_codec2.with_utf8view(false);
-    /// assert!(matches!(unchanged_codec, Codec::Utf8));
-    /// ```
-    pub fn with_utf8view(self, use_utf8view: bool) -> Self {
-        if use_utf8view && matches!(self, Self::Utf8) {
-            Self::Utf8View
-        } else {
-            self
-        }
-    }
-}
-
-/// Resolves Avro type names to [`AvroDataType`]
-///
-/// See <https://avro.apache.org/docs/1.11.1/specification/#names>
-#[derive(Debug, Default)]
-struct Resolver<'a> {
-    map: HashMap<(&'a str, &'a str), AvroDataType>,
-}
-
-impl<'a> Resolver<'a> {
-    fn register(&mut self, name: &'a str, namespace: Option<&'a str>, schema: AvroDataType) {
-        self.map.insert((name, namespace.unwrap_or("")), schema);
-    }
-
-    fn resolve(&self, name: &str, namespace: Option<&'a str>) -> Result<AvroDataType, ArrowError> {
-        let (namespace, name) = name
-            .rsplit_once('.')
-            .unwrap_or_else(|| (namespace.unwrap_or(""), name));
-
-        self.map
-            .get(&(namespace, name))
-            .ok_or_else(|| ArrowError::ParseError(format!("Failed to resolve {namespace}.{name}")))
-            .cloned()
-    }
-}
-
-/// Parses a [`AvroDataType`] from the provided [`Schema`] and the given `name` and `namespace`
-///
-/// `name`: is name used to refer to `schema` in its parent
-/// `namespace`: an optional qualifier used as part of a type hierarchy
-/// If the data type is a string, convert to use Utf8View if requested
-///
-/// This function is used during the schema conversion process to determine whether
-/// string data should be represented as StringArray (default) or StringViewArray.
-///
-/// `use_utf8view`: if true, use Utf8View instead of Utf8 for string types
-///
-/// See [`Resolver`] for more information
-fn make_data_type<'a>(
-    schema: &Schema<'a>,
-    namespace: Option<&'a str>,
-    resolver: &mut Resolver<'a>,
-    use_utf8view: bool,
-) -> Result<AvroDataType, ArrowError> {
-    match schema {
-        Schema::TypeName(TypeName::Primitive(p)) => {
-            let codec: Codec = (*p).into();
-            let codec = codec.with_utf8view(use_utf8view);
-            Ok(AvroDataType {
-                nullability: None,
-                metadata: Default::default(),
-                codec,
-            })
-        }
-        Schema::TypeName(TypeName::Ref(name)) => resolver.resolve(name, namespace),
-        Schema::Union(f) => {
-            // Special case the common case of nullable primitives
-            let null = f
-                .iter()
-                .position(|x| x == &Schema::TypeName(TypeName::Primitive(PrimitiveType::Null)));
-            match (f.len() == 2, null) {
-                (true, Some(0)) => {
-                    let mut field = make_data_type(&f[1], namespace, resolver, use_utf8view)?;
-                    field.nullability = Some(Nullability::NullFirst);
-                    Ok(field)
-                }
-                (true, Some(1)) => {
-                    let mut field = make_data_type(&f[0], namespace, resolver, use_utf8view)?;
-                    field.nullability = Some(Nullability::NullSecond);
-                    Ok(field)
-                }
-                _ => Err(ArrowError::NotYetImplemented(format!(
-                    "Union of {f:?} not currently supported"
-                ))),
-            }
-        }
-        Schema::Complex(c) => match c {
-            ComplexType::Record(r) => {
-                let namespace = r.namespace.or(namespace);
-                let fields = r
-                    .fields
-                    .iter()
-                    .map(|field| {
-                        Ok(AvroField {
-                            name: field.name.to_string(),
-                            data_type: make_data_type(
-                                &field.r#type,
-                                namespace,
-                                resolver,
-                                use_utf8view,
-                            )?,
-                        })
-                    })
-                    .collect::<Result<_, ArrowError>>()?;
-                let field = AvroDataType {
-                    nullability: None,
-                    codec: Codec::Struct(fields),
-                    metadata: r.attributes.field_metadata(),
-                };
-                resolver.register(r.name, namespace, field.clone());
-                Ok(field)
-            }
-            ComplexType::Array(a) => {
-                let mut field =
-                    make_data_type(a.items.as_ref(), namespace, resolver, use_utf8view)?;
-                Ok(AvroDataType {
-                    nullability: None,
-                    metadata: a.attributes.field_metadata(),
-                    codec: Codec::List(Arc::new(field)),
-                })
-            }
-            ComplexType::Fixed(f) => {
-                let size = f.size.try_into().map_err(|e| {
-                    ArrowError::ParseError(format!("Overflow converting size to i32: {e}"))
-                })?;
-                let md = f.attributes.field_metadata();
-                let field = match f.attributes.logical_type {
-                    Some("decimal") => {
-                        let (precision, scale, _) =
-                            parse_decimal_attributes(&f.attributes, Some(size as usize), true)?;
-                        AvroDataType {
-                            nullability: None,
-                            metadata: md,
-                            codec: Codec::Decimal(precision, Some(scale), Some(size as usize)),
-                        }
-                    }
-                    Some("duration") => {
-                        if size != 12 {
-                            return Err(ArrowError::ParseError(format!(
-                                "Invalid fixed size for Duration: {size}, must be 12"
-                            )));
-                        };
-                        AvroDataType {
-                            nullability: None,
-                            metadata: md,
-                            codec: Codec::Interval,
-                        }
-                    }
-                    _ => AvroDataType {
-                        nullability: None,
-                        metadata: md,
-                        codec: Codec::Fixed(size),
-                    },
-                };
-                resolver.register(f.name, namespace, field.clone());
-                Ok(field)
-            }
-            ComplexType::Enum(e) => {
-                let namespace = e.namespace.or(namespace);
-                let symbols = e
-                    .symbols
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Arc<[String]>>();
-
-                let mut metadata = e.attributes.field_metadata();
-                let symbols_json = serde_json::to_string(&e.symbols).map_err(|e| {
-                    ArrowError::ParseError(format!("Failed to serialize enum symbols: {e}"))
-                })?;
-                metadata.insert("avro.enum.symbols".to_string(), symbols_json);
-                let field = AvroDataType {
-                    nullability: None,
-                    metadata,
-                    codec: Codec::Enum(symbols),
-                };
-                resolver.register(e.name, namespace, field.clone());
-                Ok(field)
-            }
-            ComplexType::Map(m) => {
-                let val = make_data_type(&m.values, namespace, resolver, use_utf8view)?;
-                Ok(AvroDataType {
-                    nullability: None,
-                    metadata: m.attributes.field_metadata(),
-                    codec: Codec::Map(Arc::new(val)),
-                })
-            }
-        },
-        Schema::Type(t) => {
-            let mut field = make_data_type(
-                &Schema::TypeName(t.r#type.clone()),
-                namespace,
-                resolver,
-                use_utf8view,
-            )?;
-
-            // https://avro.apache.org/docs/1.11.1/specification/#logical-types
-            match (t.attributes.logical_type, &mut field.codec) {
-                (Some("decimal"), c @ Codec::Binary) => {
-                    let (prec, sc, _) = parse_decimal_attributes(&t.attributes, None, false)?;
-                    *c = Codec::Decimal(prec, Some(sc), None);
-                }
-                (Some("date"), c @ Codec::Int32) => *c = Codec::Date32,
-                (Some("time-millis"), c @ Codec::Int32) => *c = Codec::TimeMillis,
-                (Some("time-micros"), c @ Codec::Int64) => *c = Codec::TimeMicros,
-                (Some("timestamp-millis"), c @ Codec::Int64) => *c = Codec::TimestampMillis(true),
-                (Some("timestamp-micros"), c @ Codec::Int64) => *c = Codec::TimestampMicros(true),
-                (Some("local-timestamp-millis"), c @ Codec::Int64) => {
-                    *c = Codec::TimestampMillis(false)
-                }
-                (Some("local-timestamp-micros"), c @ Codec::Int64) => {
-                    *c = Codec::TimestampMicros(false)
-                }
-                (Some("uuid"), c @ Codec::Utf8) => *c = Codec::Uuid,
-                (Some(logical), _) => {
-                    // Insert unrecognized logical type into metadata map
-                    field.metadata.insert("logicalType".into(), logical.into());
-                }
-                (None, _) => {}
-            }
-
-            if !t.attributes.additional.is_empty() {
-                for (k, v) in &t.attributes.additional {
-                    field.metadata.insert(k.to_string(), v.to_string());
-                }
-            }
-            Ok(field)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -594,6 +843,72 @@ mod tests {
     };
     use serde_json;
     use std::collections::HashMap;
+
+    fn parse_schema(json: &str) -> Schema<'_> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn int_to_long_promotion() {
+        let w = parse_schema(r#""int""#);
+        let r = parse_schema(r#""long""#);
+        let field = AvroField::resolve_from_writer_and_reader(&w, &r, false).unwrap();
+        assert!(matches!(field.data_type.codec(), Codec::Int64));
+        matches!(
+            &field.data_type.resolution,
+            Some(ResolutionInfo::Promotion(
+                Promotion::IntToLong
+            ))
+        );
+    }
+
+    #[test]
+    fn added_field_with_default() {
+        let w = parse_schema(
+            r#"{"type":"record","name":"R","fields":[{"name":"id","type":"int"}]}"#,
+        );
+        let r = parse_schema(
+            r#"{"type":"record","name":"R","fields":[
+                   {"name":"id","type":"int"},
+                   {"name":"country","type":"string","default":"US"}
+              ]}"#,
+        );
+        let root = AvroField::resolve_from_writer_and_reader(&w, &r, false).unwrap();
+        if let Codec::Struct(fields) = root.data_type.codec() {
+            assert_eq!(fields.len(), 2);
+            // Ensure the second field carries default info
+            assert!(matches!(
+                &fields[1].data_type.resolution,
+                Some(ResolutionInfo::Default(_))
+            ));
+        } else {
+            panic!("expected struct codec");
+        }
+    }
+
+    #[test]
+    fn enum_symbol_mapping() {
+        let w = parse_schema(
+            r#"{"type":"enum","name":"Color","symbols":["RED","GREEN"]}"#,
+        );
+        let r = parse_schema(
+            r#"{
+                "type":"enum",
+                "name":"Color",
+                "symbols":["RED","BLUE"],
+                "default":"BLUE"
+            }"#,
+        );
+        let field = AvroField::resolve_from_writer_and_reader(&w, &r, false).unwrap();
+        if let Codec::Enum(_) = field.data_type.codec() {
+            assert!(matches!(
+                &field.data_type.resolution,
+                Some(ResolutionInfo::EnumMapping(_))
+            ));
+        } else {
+            panic!("expected enum codec");
+        }
+    }
 
     fn create_schema_with_logical_type(
         primitive_type: PrimitiveType,
@@ -625,102 +940,79 @@ mod tests {
         }))
     }
 
+    macro_rules! assert_codec {
+        ($schema:expr, $codec_pat:pat, $utf8view:expr) => {{
+            let mut parser = SchemaResolver::new($utf8view);
+            let result = parser.parse(&$schema, None).unwrap();
+            assert!(matches!(result.codec, $codec_pat));
+        }};
+    }
+
     #[test]
     fn test_date_logical_type() {
         let schema = create_schema_with_logical_type(PrimitiveType::Int, "date");
-
-        let mut resolver = Resolver::default();
-        let result = make_data_type(&schema, None, &mut resolver, false).unwrap();
-
-        assert!(matches!(result.codec, Codec::Date32));
+        assert_codec!(schema, Codec::Date32, false);
     }
 
     #[test]
     fn test_time_millis_logical_type() {
         let schema = create_schema_with_logical_type(PrimitiveType::Int, "time-millis");
-
-        let mut resolver = Resolver::default();
-        let result = make_data_type(&schema, None, &mut resolver, false).unwrap();
-
-        assert!(matches!(result.codec, Codec::TimeMillis));
+        assert_codec!(schema, Codec::TimeMillis, false);
     }
 
     #[test]
     fn test_time_micros_logical_type() {
         let schema = create_schema_with_logical_type(PrimitiveType::Long, "time-micros");
-
-        let mut resolver = Resolver::default();
-        let result = make_data_type(&schema, None, &mut resolver, false).unwrap();
-
-        assert!(matches!(result.codec, Codec::TimeMicros));
+        assert_codec!(schema, Codec::TimeMicros, false);
     }
 
     #[test]
     fn test_timestamp_millis_logical_type() {
         let schema = create_schema_with_logical_type(PrimitiveType::Long, "timestamp-millis");
-
-        let mut resolver = Resolver::default();
-        let result = make_data_type(&schema, None, &mut resolver, false).unwrap();
-
-        assert!(matches!(result.codec, Codec::TimestampMillis(true)));
+        assert_codec!(schema, Codec::TimestampMillis(true), false);
     }
 
     #[test]
     fn test_timestamp_micros_logical_type() {
         let schema = create_schema_with_logical_type(PrimitiveType::Long, "timestamp-micros");
-
-        let mut resolver = Resolver::default();
-        let result = make_data_type(&schema, None, &mut resolver, false).unwrap();
-
-        assert!(matches!(result.codec, Codec::TimestampMicros(true)));
+        assert_codec!(schema, Codec::TimestampMicros(true), false);
     }
 
     #[test]
     fn test_local_timestamp_millis_logical_type() {
-        let schema = create_schema_with_logical_type(PrimitiveType::Long, "local-timestamp-millis");
-
-        let mut resolver = Resolver::default();
-        let result = make_data_type(&schema, None, &mut resolver, false).unwrap();
-
-        assert!(matches!(result.codec, Codec::TimestampMillis(false)));
+        let schema =
+            create_schema_with_logical_type(PrimitiveType::Long, "local-timestamp-millis");
+        assert_codec!(schema, Codec::TimestampMillis(false), false);
     }
 
     #[test]
     fn test_local_timestamp_micros_logical_type() {
-        let schema = create_schema_with_logical_type(PrimitiveType::Long, "local-timestamp-micros");
-
-        let mut resolver = Resolver::default();
-        let result = make_data_type(&schema, None, &mut resolver, false).unwrap();
-
-        assert!(matches!(result.codec, Codec::TimestampMicros(false)));
+        let schema =
+            create_schema_with_logical_type(PrimitiveType::Long, "local-timestamp-micros");
+        assert_codec!(schema, Codec::TimestampMicros(false), false);
     }
 
     #[test]
     fn test_uuid_type() {
         let mut codec = Codec::Fixed(16);
-
         if let c @ Codec::Fixed(16) = &mut codec {
             *c = Codec::Uuid;
         }
-
         assert!(matches!(codec, Codec::Uuid));
     }
 
     #[test]
     fn test_duration_logical_type() {
         let mut codec = Codec::Fixed(12);
-
         if let c @ Codec::Fixed(12) = &mut codec {
             *c = Codec::Interval;
         }
-
         assert!(matches!(codec, Codec::Interval));
     }
 
     #[test]
     fn test_decimal_logical_type_not_implemented() {
         let mut codec = Codec::Fixed(16);
-
         let process_decimal = || -> Result<(), ArrowError> {
             if let Codec::Fixed(_) = codec {
                 return Err(ArrowError::NotYetImplemented(
@@ -729,9 +1021,7 @@ mod tests {
             }
             Ok(())
         };
-
         let result = process_decimal();
-
         assert!(result.is_err());
         if let Err(ArrowError::NotYetImplemented(msg)) = result {
             assert!(msg.contains("Decimals are not currently supported"));
@@ -743,10 +1033,8 @@ mod tests {
     #[test]
     fn test_unknown_logical_type_added_to_metadata() {
         let schema = create_schema_with_logical_type(PrimitiveType::Int, "custom-type");
-
-        let mut resolver = Resolver::default();
-        let result = make_data_type(&schema, None, &mut resolver, false).unwrap();
-
+        let mut parser = SchemaResolver::new(false);
+        let result = parser.parse(&schema, None).unwrap();
         assert_eq!(
             result.metadata.get("logicalType"),
             Some(&"custom-type".to_string())
@@ -756,34 +1044,28 @@ mod tests {
     #[test]
     fn test_string_with_utf8view_enabled() {
         let schema = Schema::TypeName(TypeName::Primitive(PrimitiveType::String));
-
-        let mut resolver = Resolver::default();
-        let result = make_data_type(&schema, None, &mut resolver, true).unwrap();
-
+        let mut parser = SchemaResolver::new(true);
+        let result = parser.parse(&schema, None).unwrap();
         assert!(matches!(result.codec, Codec::Utf8View));
     }
 
     #[test]
     fn test_string_without_utf8view_enabled() {
         let schema = Schema::TypeName(TypeName::Primitive(PrimitiveType::String));
-
-        let mut resolver = Resolver::default();
-        let result = make_data_type(&schema, None, &mut resolver, false).unwrap();
-
+        let mut parser = SchemaResolver::new(false);
+        let result = parser.parse(&schema, None).unwrap();
         assert!(matches!(result.codec, Codec::Utf8));
     }
 
     #[test]
     fn test_record_with_string_and_utf8view_enabled() {
         let field_schema = Schema::TypeName(TypeName::Primitive(PrimitiveType::String));
-
         let avro_field = crate::schema::Field {
             name: "string_field",
             r#type: field_schema,
             default: None,
             doc: None,
         };
-
         let record = Record {
             name: "test_record",
             namespace: None,
@@ -792,15 +1074,12 @@ mod tests {
             fields: vec![avro_field],
             attributes: Attributes::default(),
         };
-
         let schema = Schema::Complex(ComplexType::Record(record));
-
-        let mut resolver = Resolver::default();
-        let result = make_data_type(&schema, None, &mut resolver, true).unwrap();
+        let mut parser = SchemaResolver::new(true);
+        let result = parser.parse(&schema, None).unwrap();
 
         if let Codec::Struct(fields) = &result.codec {
-            let first_field_codec = &fields[0].data_type().codec;
-            assert!(matches!(first_field_codec, Codec::Utf8View));
+            assert!(matches!(fields[0].data_type().codec, Codec::Utf8View));
         } else {
             panic!("Expected Struct codec");
         }

@@ -87,7 +87,7 @@
 //!
 
 use crate::codec::AvroField;
-use crate::schema::Schema as AvroSchema;
+use crate::schema::{Schema as AvroSchema, SchemaStore};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
 use block::BlockDecoder;
@@ -196,7 +196,9 @@ pub struct ReaderBuilder {
     batch_size: usize,
     strict_mode: bool,
     utf8_view: bool,
-    schema: Option<AvroSchema<'static>>,
+    reader_schema: Option<AvroSchema<'static>>,
+    writer_schema_store: Option<SchemaStore<'static>>,
+    static_store_mode: bool,
 }
 
 impl Default for ReaderBuilder {
@@ -205,7 +207,9 @@ impl Default for ReaderBuilder {
             batch_size: 1024,
             strict_mode: false,
             utf8_view: false,
-            schema: None,
+            reader_schema: None,
+            writer_schema_store: None,
+            static_store_mode: false,
         }
     }
 }
@@ -215,9 +219,20 @@ impl ReaderBuilder {
     /// - `batch_size` = 1024
     /// - `strict_mode` = false
     /// - `utf8_view` = false
-    /// - `schema` = None
+    /// - `reader_schema` = None
+    /// - `writer_schema_store` = None
+    /// - `static_store_mode` = false
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn validate_impl(&self) -> Result<(), ArrowError> {
+        if self.writer_schema_store.is_some() && self.reader_schema.is_none() {
+            return Err(ArrowError::ParseError(
+                "A reader schema must be set when setting a writer schema store".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn make_record_decoder(&self, schema: &AvroSchema<'_>) -> Result<RecordDecoder, ArrowError> {
@@ -231,7 +246,7 @@ impl ReaderBuilder {
 
     fn build_impl<R: BufRead>(self, reader: &mut R) -> Result<(Header, Decoder), ArrowError> {
         let header = read_header(reader)?;
-        let record_decoder = if let Some(schema) = &self.schema {
+        let record_decoder = if let Some(schema) = &self.reader_schema {
             self.make_record_decoder(schema)?
         } else {
             let avro_schema: Option<AvroSchema<'_>> = header
@@ -272,16 +287,37 @@ impl ReaderBuilder {
         self
     }
 
-    /// Sets the Avro schema.
+    /// Sets the Avro Reader Schema.
     ///
-    /// If a schema is not provided, the schema will be read from the Avro file header.
-    pub fn with_schema(mut self, schema: AvroSchema<'static>) -> Self {
-        self.schema = Some(schema);
+    /// If a reader schema is not provided, the reader schema will be read from the Avro file header.
+    /// This schema must match the desired arrow `Schema` to be decoded into.
+    pub fn with_reader_schema(mut self, reader_schema: AvroSchema<'static>) -> Self {
+        self.reader_schema = Some(reader_schema);
+        self
+    }
+
+    /// Sets the Avro Writer Schema Store.
+    ///
+    /// If a writer schema is not provided, the writer schema will be read from the Avro file header.
+    /// `with_writer_schema_store` requires a reader schema having been set, i.e. `with_reader_schema()`.
+    /// Note: All writer schemas must be resolvable with the set reader schema per the Avro specifications
+    pub fn with_writer_schema_store(mut self, writer_schema_store: SchemaStore<'static>) -> Self {
+        self.writer_schema_store = Some(writer_schema_store);
+        self
+    }
+
+    /// Controls whether new Avro writer schemas will attempt to be resolved and decoded when a
+    /// `SchemaStore` was provided. If set to `true`, then only schemas provided in the `SchemaStore` will be used.
+    ///
+    /// `with_static_store_mode` requires a writer schema store to have been set, i.e. `with_writer_schema_store()`.
+    pub fn with_static_store_mode(mut self, static_store_mode: bool) -> Self {
+        self.static_store_mode = static_store_mode;
         self
     }
 
     /// Create a [`Reader`] from this builder and a `BufRead`
     pub fn build<R: BufRead>(self, mut reader: R) -> Result<Reader<R>, ArrowError> {
+        self.validate_impl()?;
         let (header, decoder) = self.build_impl(&mut reader)?;
         Ok(Reader {
             reader,
@@ -298,9 +334,10 @@ impl ReaderBuilder {
     /// reading and parsing the Avro file's header. This will
     /// not create a full [`Reader`].
     pub fn build_decoder<R: BufRead>(self, mut reader: R) -> Result<Decoder, ArrowError> {
-        match self.schema {
-            Some(ref schema) => {
-                let record_decoder = self.make_record_decoder(schema)?;
+        self.validate_impl()?;
+        match self.reader_schema {
+            Some(ref reader_schema) => {
+                let record_decoder = self.make_record_decoder(reader_schema)?;
                 Ok(Decoder::new(record_decoder, self.batch_size))
             }
             None => {
@@ -611,7 +648,7 @@ mod test {
             let mut reader_placeholder = Cursor::new(&[] as &[u8]);
             let builder = ReaderBuilder::new()
                 .with_batch_size(1)
-                .with_schema(schema_s2);
+                .with_reader_schema(schema_s2);
             let decoder_result = builder.build_decoder(&mut reader_placeholder);
             let decoder = match decoder_result {
                 Ok(decoder) => decoder,
