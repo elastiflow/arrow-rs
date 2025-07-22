@@ -232,8 +232,9 @@ impl HeaderDecoder {
                 }
                 HeaderDecoderState::Sync => {
                     let to_decode = buf.len().min(self.bytes_remaining);
-                    let write = &mut self.sync_marker[16 - to_decode..];
-                    write[..to_decode].copy_from_slice(&buf[..to_decode]);
+                    let start_pos = 16 - self.bytes_remaining;
+                    self.sync_marker[start_pos..start_pos + to_decode].copy_from_slice(&buf[..to_decode]);
+
                     self.bytes_remaining -= to_decode;
                     buf = &buf[to_decode..];
                     if self.bytes_remaining == 0 {
@@ -353,5 +354,53 @@ mod test {
             u128::from_le_bytes(header.sync()),
             325166208089902833952788552656412487328
         );
+    }
+
+    #[test]
+    fn test_chunked_sync_marker() {
+        // A minimal valid header: Magic bytes, 0-byte metadata block, and a sync marker.
+        let sync_marker = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mut header_bytes = MAGIC.to_vec();
+        header_bytes.push(0); // 0-byte metadata block
+        header_bytes.extend_from_slice(&sync_marker);
+
+        // Define chunk sizes to split the header data into
+        let chunk_sizes = [1, 2, 3, 4, 5, 5];
+        assert_eq!(chunk_sizes.iter().sum::<usize>(), header_bytes.len() - 1);
+
+        let mut decoder = HeaderDecoder::default();
+        let mut consumed = 0;
+
+        for &chunk_size in &chunk_sizes {
+            let end = consumed + chunk_size;
+            decoder.decode(&header_bytes[consumed..end]).unwrap();
+            consumed = end;
+        }
+        decoder.decode(&header_bytes[consumed..]).unwrap();
+
+        let header = decoder.flush().expect("Failed to flush header");
+
+        assert_eq!(header.sync(), sync_marker, "Chunked sync marker should be correctly assembled");
+    }
+
+    #[test]
+    fn test_chunked_sync_marker_real_file() {
+        let file_path = arrow_test_data("avro/alltypes_plain.avro");
+        let file = File::open(file_path).unwrap();
+
+        // Wrap the file reader in a BufReader with a tiny buffer size (e.g., 5 bytes).
+        // This forces the header, which is much larger than 5 bytes, to be read
+        // in multiple small chunks, exercising the state machine and specifically
+        // the sync marker assembly logic.
+        let reader = BufReader::with_capacity(5, file);
+
+        let header = read_header(reader).expect("Reading header in small chunks should succeed");
+
+        // Actual sync marker from the alltypes_plain.avro file pulled with hexdump
+        let expected_sync_marker = [
+            0xde, 0x17, 0x69, 0xb0, 0xfb, 0x61, 0x5f, 0x8e,
+            0x3c, 0x42, 0xe6, 0x62, 0x99, 0x11, 0xc0, 0xaa,
+        ];
+        assert_eq!(header.sync(), expected_sync_marker, "Sync marker should be correctly assembled from chunked reads");
     }
 }
