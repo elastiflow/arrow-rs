@@ -204,17 +204,15 @@ impl Codec {
                 }
             }
             Self::Uuid => DataType::FixedSizeBinary(16),
-            Self::Enum(_) => DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            Self::Enum(_) => {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            }
             Self::List(child) => DataType::List(Arc::new(
                 child.field_with_name(Field::LIST_FIELD_DEFAULT_NAME),
             )),
             Self::Struct(flds) => DataType::Struct(flds.iter().map(|f| f.field()).collect()),
             Self::Map(val) => {
-                let vfield = Field::new(
-                    "value",
-                    val.codec.data_type(),
-                    val.nullability.is_some(),
-                )
+                let vfield = Field::new("value", val.codec.data_type(), val.nullability.is_some())
                     .with_metadata(val.metadata.clone());
                 DataType::Map(
                     Arc::new(Field::new(
@@ -298,6 +296,19 @@ impl<'a> TryFrom<&Schema<'a>> for AvroField {
                 "Expected top‑level record".to_string(),
             ))
         }
+    }
+}
+
+/// Check whether two Avro schemas (writer and reader) are compatible under the
+/// Avro schema‑resolution rules.
+///
+pub fn check_schema_compatibility<'a>(
+    writer: &Schema<'a>,
+    reader: &Schema<'a>,
+) -> Result<(), ArrowError> {
+    match AvroField::resolve_from_writer_and_reader(writer, reader, false) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -431,10 +442,8 @@ impl<'a> SchemaResolver<'a> {
     ) -> Result<AvroDataType, ArrowError> {
         let ns = r.namespace.or(namespace);
         // placeholder to allow recursion
-        let placeholder = AvroDataType::parsed(
-            Codec::Struct(Arc::new([])),
-            r.attributes.field_metadata(),
-        );
+        let placeholder =
+            AvroDataType::parsed(Codec::Struct(Arc::new([])), r.attributes.field_metadata());
         self.cache.insert_named(r.name, ns, placeholder);
         let mut fields = Vec::with_capacity(r.fields.len());
         for f in &r.fields {
@@ -457,14 +466,16 @@ impl<'a> SchemaResolver<'a> {
         e: &Enum<'a>,
         namespace: Option<&'a str>,
     ) -> Result<AvroDataType, ArrowError> {
-        let symbols = Arc::<[String]>::from(e.symbols.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let symbols =
+            Arc::<[String]>::from(e.symbols.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         let mut md = e.attributes.field_metadata();
         md.insert(
             "avro.enum.symbols".into(),
             serde_json::to_string(&e.symbols).unwrap(),
         );
         let dt = AvroDataType::parsed(Codec::Enum(symbols), md);
-        self.cache.insert_named(e.name, e.namespace.or(namespace), dt.clone());
+        self.cache
+            .insert_named(e.name, e.namespace.or(namespace), dt.clone());
         Ok(dt)
     }
 
@@ -492,7 +503,8 @@ impl<'a> SchemaResolver<'a> {
             _ => Codec::Fixed(size_i32),
         };
         let dt = AvroDataType::parsed(codec, md);
-        self.cache.insert_named(f.name, f.namespace.or(namespace), dt.clone());
+        self.cache
+            .insert_named(f.name, f.namespace.or(namespace), dt.clone());
         Ok(dt)
     }
 
@@ -503,21 +515,23 @@ impl<'a> SchemaResolver<'a> {
         namespace: Option<&'a str>,
     ) -> Result<AvroDataType, ArrowError> {
         match (writer, reader) {
-            (Schema::TypeName(TypeName::Primitive(wp)), Schema::TypeName(TypeName::Primitive(rp)))
-            | (
-                Schema::Type(Type {
-                                 r#type: TypeName::Primitive(wp),
-                                 ..
-                             }),
-                Schema::Type(Type {
-                                 r#type: TypeName::Primitive(rp),
-                                 ..
-                             }),
-            ) => self.resolve_primitives(*wp, *rp, reader),
             (
                 Schema::TypeName(TypeName::Primitive(wp)),
-                Schema::Type(r_t),
-            ) if matches!(r_t.r#type, TypeName::Primitive(_)) => {
+                Schema::TypeName(TypeName::Primitive(rp)),
+            )
+            | (
+                Schema::Type(Type {
+                    r#type: TypeName::Primitive(wp),
+                    ..
+                }),
+                Schema::Type(Type {
+                    r#type: TypeName::Primitive(rp),
+                    ..
+                }),
+            ) => self.resolve_primitives(*wp, *rp, reader),
+            (Schema::TypeName(TypeName::Primitive(wp)), Schema::Type(r_t))
+                if matches!(r_t.r#type, TypeName::Primitive(_)) =>
+            {
                 if let TypeName::Primitive(rp) = r_t.r#type {
                     self.resolve_primitives(*wp, rp, reader)
                 } else {
@@ -528,18 +542,15 @@ impl<'a> SchemaResolver<'a> {
                 Schema::Complex(ComplexType::Record(wr)),
                 Schema::Complex(ComplexType::Record(rr)),
             ) => self.resolve_records(wr, rr, namespace),
-            (
-                Schema::Complex(ComplexType::Enum(we)),
-                Schema::Complex(ComplexType::Enum(re)),
-            ) => self.resolve_enums(we, re),
-            (
-                Schema::Complex(ComplexType::Fixed(wf)),
-                Schema::Complex(ComplexType::Fixed(rf)),
-            ) if wf.size == rf.size => self.parse(reader, namespace),
-            (
-                Schema::Complex(ComplexType::Array(wa)),
-                Schema::Complex(ComplexType::Array(ra)),
-            ) => {
+            (Schema::Complex(ComplexType::Enum(we)), Schema::Complex(ComplexType::Enum(re))) => {
+                self.resolve_enums(we, re)
+            }
+            (Schema::Complex(ComplexType::Fixed(wf)), Schema::Complex(ComplexType::Fixed(rf)))
+                if wf.size == rf.size =>
+            {
+                self.parse(reader, namespace)
+            }
+            (Schema::Complex(ComplexType::Array(wa)), Schema::Complex(ComplexType::Array(ra))) => {
                 let child = self.visit(Some(&wa.items), &ra.items, namespace)?;
                 Ok(AvroDataType::resolved(
                     Codec::List(Arc::new(child)),
@@ -548,10 +559,7 @@ impl<'a> SchemaResolver<'a> {
                     None,
                 ))
             }
-            (
-                Schema::Complex(ComplexType::Map(wm)),
-                Schema::Complex(ComplexType::Map(rm)),
-            ) => {
+            (Schema::Complex(ComplexType::Map(wm)), Schema::Complex(ComplexType::Map(rm))) => {
                 let val = self.visit(Some(&wm.values), &rm.values, namespace)?;
                 Ok(AvroDataType::resolved(
                     Codec::Map(Arc::new(val)),
@@ -574,7 +582,11 @@ impl<'a> SchemaResolver<'a> {
                 Ok(dt)
             }
             (Schema::Union(wu), r_nonunion) if Self::is_nullable_union(wu) => {
-                let w_nonnull = if Self::is_null(&wu[0]) { &wu[1] } else { &wu[0] };
+                let w_nonnull = if Self::is_null(&wu[0]) {
+                    &wu[1]
+                } else {
+                    &wu[0]
+                };
                 self.visit(Some(w_nonnull), r_nonunion, namespace)
             }
             _ => Err(ArrowError::ParseError(format!(
@@ -613,11 +625,7 @@ impl<'a> SchemaResolver<'a> {
         Ok(dt)
     }
 
-    fn resolve_enums(
-        &mut self,
-        w: &Enum<'a>,
-        r: &Enum<'a>,
-    ) -> Result<AvroDataType, ArrowError> {
+    fn resolve_enums(&mut self, w: &Enum<'a>, r: &Enum<'a>) -> Result<AvroDataType, ArrowError> {
         let name_ok = w.name == r.name || r.aliases.iter().any(|&a| a == w.name);
         if !name_ok {
             return Err(ArrowError::ParseError(format!(
@@ -631,13 +639,9 @@ impl<'a> SchemaResolver<'a> {
             if let Some(p) = r.symbols.iter().position(|&rs| rs == wsym) {
                 mapping[i] = p as i32;
             } else if let Some(def) = r.default {
-                let p = r
-                    .symbols
-                    .iter()
-                    .position(|&rs| rs == def)
-                    .ok_or_else(|| {
-                        ArrowError::ParseError("Reader enum default not in symbol list".into())
-                    })?;
+                let p = r.symbols.iter().position(|&rs| rs == def).ok_or_else(|| {
+                    ArrowError::ParseError("Reader enum default not in symbol list".into())
+                })?;
                 mapping[i] = p as i32;
             } else {
                 return Err(ArrowError::ParseError(format!(
@@ -651,9 +655,9 @@ impl<'a> SchemaResolver<'a> {
                     .map(|p| p as i32)
             });
         }
-        let enum_codec = Codec::Enum(
-            Arc::<[String]>::from(r.symbols.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
-        );
+        let enum_codec = Codec::Enum(Arc::<[String]>::from(
+            r.symbols.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        ));
         Ok(AvroDataType::resolved(
             enum_codec,
             r.attributes.field_metadata(),
@@ -684,7 +688,8 @@ impl<'a> SchemaResolver<'a> {
             return Ok(prev);
         }
         let ns = r.namespace.or(namespace);
-        let mut w_lookup: HashMap<&str, &SchemaField<'a>> = w.fields.iter().map(|f| (f.name, f)).collect();
+        let mut w_lookup: HashMap<&str, &SchemaField<'a>> =
+            w.fields.iter().map(|f| (f.name, f)).collect();
         let mut reader_fields = Vec::with_capacity(r.fields.len());
         let mut w_to_r = vec![None; w.fields.len()];
         let mut defaults = Vec::new();
@@ -753,7 +758,11 @@ impl<'a> SchemaResolver<'a> {
         } else {
             (Nullability::NullSecond, &wu[0])
         };
-        let r_nonnull = if Self::is_null(&ru[0]) { &ru[1] } else { &ru[0] };
+        let r_nonnull = if Self::is_null(&ru[0]) {
+            &ru[1]
+        } else {
+            &ru[0]
+        };
         let mut dt = self.visit(Some(w_nonnull), r_nonnull, namespace)?;
         dt.nullability = Some(null_pos);
         Ok(dt)
@@ -820,7 +829,8 @@ fn parse_decimal_attrs(
         .get("precision")
         .and_then(|v| v.as_u64())
         .or(if precision_required { None } else { Some(10) })
-        .ok_or_else(|| ArrowError::ParseError("Decimal requires precision".into()))? as usize;
+        .ok_or_else(|| ArrowError::ParseError("Decimal requires precision".into()))?
+        as usize;
     let scale = attrs
         .additional
         .get("scale")
@@ -856,17 +866,14 @@ mod tests {
         assert!(matches!(field.data_type.codec(), Codec::Int64));
         matches!(
             &field.data_type.resolution,
-            Some(ResolutionInfo::Promotion(
-                Promotion::IntToLong
-            ))
+            Some(ResolutionInfo::Promotion(Promotion::IntToLong))
         );
     }
 
     #[test]
     fn added_field_with_default() {
-        let w = parse_schema(
-            r#"{"type":"record","name":"R","fields":[{"name":"id","type":"int"}]}"#,
-        );
+        let w =
+            parse_schema(r#"{"type":"record","name":"R","fields":[{"name":"id","type":"int"}]}"#);
         let r = parse_schema(
             r#"{"type":"record","name":"R","fields":[
                    {"name":"id","type":"int"},
@@ -888,9 +895,7 @@ mod tests {
 
     #[test]
     fn enum_symbol_mapping() {
-        let w = parse_schema(
-            r#"{"type":"enum","name":"Color","symbols":["RED","GREEN"]}"#,
-        );
+        let w = parse_schema(r#"{"type":"enum","name":"Color","symbols":["RED","GREEN"]}"#);
         let r = parse_schema(
             r#"{
                 "type":"enum",
@@ -980,15 +985,13 @@ mod tests {
 
     #[test]
     fn test_local_timestamp_millis_logical_type() {
-        let schema =
-            create_schema_with_logical_type(PrimitiveType::Long, "local-timestamp-millis");
+        let schema = create_schema_with_logical_type(PrimitiveType::Long, "local-timestamp-millis");
         assert_codec!(schema, Codec::TimestampMillis(false), false);
     }
 
     #[test]
     fn test_local_timestamp_micros_logical_type() {
-        let schema =
-            create_schema_with_logical_type(PrimitiveType::Long, "local-timestamp-micros");
+        let schema = create_schema_with_logical_type(PrimitiveType::Long, "local-timestamp-micros");
         assert_codec!(schema, Codec::TimestampMicros(false), false);
     }
 
