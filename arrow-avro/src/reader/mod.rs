@@ -87,7 +87,9 @@
 //!
 
 use crate::codec::AvroField;
-use crate::schema::{compare_schemas, Fingerprint, HashType, Schema as AvroSchema, SchemaStore, SINGLE_OBJECT_MAGIC};
+use crate::schema::{
+    compare_schemas, Fingerprint, HashType, Schema as AvroSchema, SchemaStore, SINGLE_OBJECT_MAGIC,
+};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
 use block::BlockDecoder;
@@ -116,8 +118,7 @@ const RABIN_FP_LEN: usize = 8;
 const MD5_FP_LEN: usize = 16;
 const SHA256_FP_LEN: usize = 32;
 
-/// Fast helper: how many bytes does a fingerprint prefix occupy, *including* the
-/// 2‑byte magic?
+/// Fast helper: how many bytes does a fingerprint prefix occupy.
 #[inline]
 const fn prefix_len(ht: HashType) -> usize {
     2 + match ht {
@@ -682,11 +683,15 @@ impl<R: BufRead> RecordBatchReader for Reader<R> {
 
 #[cfg(test)]
 mod test {
-    use crate::codec::{AvroDataType, AvroField, Codec};
+    use crate::codec::{
+        AvroDataType, AvroField, Codec, EnumMapping, Nullability, Promotion, ResolutionInfo,
+        ResolvedRecord,
+    };
     use crate::compression::CompressionCodec;
     use crate::reader::record::RecordDecoder;
     use crate::reader::vlq::VLQDecoder;
     use crate::reader::{read_header, Decoder, ReaderBuilder};
+    use crate::schema::{PrimitiveType, Schema as AvroSchema, TypeName};
     use crate::test_util::arrow_test_data;
     use arrow_array::types::{Int32Type, IntervalMonthDayNanoType};
     use arrow_array::*;
@@ -1147,5 +1152,76 @@ mod test {
         )
         .unwrap();
         assert_eq!(&expected_uuid_array, uuid_array);
+    }
+
+    fn schema_from_json(js: &str) -> AvroSchema<'static> {
+        let static_js = Box::leak(js.to_string().into_boxed_str());
+        serde_json::from_str(static_js).expect("valid Avro schema JSON")
+    }
+
+    #[test]
+    fn schema_resolution_promotion_int_to_long() {
+        let writer = schema_from_json(r#""int""#);
+        let reader = schema_from_json(r#""long""#);
+        let field = AvroField::resolve_from_writer_and_reader(&writer, &reader, false)
+            .expect("promotion should succeed");
+        match &field.data_type().resolution {
+            Some(ResolutionInfo::Promotion(Promotion::IntToLong)) => {}
+            other => panic!("unexpected resolution info: {other:?}"),
+        }
+        assert_eq!(field.data_type().codec, Codec::Int64);
+    }
+
+    #[test]
+    fn schema_resolution_nullable_union() {
+        let writer = schema_from_json(r#""string""#);
+        let reader = schema_from_json(r#"["null","string"]"#);
+        let field = AvroField::resolve_from_writer_and_reader(&writer, &reader, false).unwrap();
+        assert_eq!(field.data_type().codec, Codec::Utf8);
+        assert_eq!(field.data_type().nullability, Some(Nullability::NullFirst));
+    }
+
+    #[test]
+    fn schema_resolution_enum_mapping() {
+        let writer = schema_from_json(
+            r#"{
+                "type":"enum","name":"E","symbols":["A","B"]
+            }"#,
+        );
+        let reader = schema_from_json(
+            r#"{
+                "type":"enum","name":"E",
+                "symbols":["B","A","C"],
+                "default":"C"
+            }"#,
+        );
+        let field = AvroField::resolve_from_writer_and_reader(&writer, &reader, false).unwrap();
+        match &field.data_type().resolution {
+            Some(ResolutionInfo::EnumMapping(EnumMapping {
+                mapping,
+                default_index,
+            })) => {
+                assert_eq!(&**mapping, &[1, 0]);
+                assert_eq!(*default_index, 2);
+            }
+            other => panic!("unexpected resolution info: {other:?}"),
+        }
+    }
+    
+    #[test]
+    fn schema_resolution_recursive_rejected() {
+        let schema_json = r#"{
+            "type":"record","name":"LongList",
+            "fields":[
+                {"name":"value","type":"long"},
+                {"name":"next","type":["null","LongList"]}
+            ]
+        }"#;
+        let schema = schema_from_json(schema_json);
+        let err = AvroField::try_from(&schema).unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to resolve .LongList"),
+            "unexpected error message: {err}"
+        );
     }
 }

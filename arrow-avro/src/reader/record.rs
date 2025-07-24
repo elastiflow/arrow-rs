@@ -20,11 +20,12 @@ use crate::codec::{
 };
 use crate::reader::cursor::AvroCursor;
 use arrow_array::builder::{
-    ArrayBuilder, Decimal128Builder, Decimal256Builder, IntervalMonthDayNanoBuilder,
+    ArrayBuilder, BooleanBufferBuilder, Decimal128Builder, Decimal256Builder,
+    IntervalMonthDayNanoBuilder, NullBufferBuilder,
 };
 use arrow_array::types::*;
 use arrow_array::*;
-use arrow_buffer::*;
+use arrow_buffer::{i256, Buffer, BufferBuilder, NullBuffer, OffsetBuffer, OffsetBufferBuilder};
 use arrow_schema::{
     ArrowError, DataType, Field as ArrowField, FieldRef, Fields, Schema as ArrowSchema, SchemaRef,
 };
@@ -33,6 +34,7 @@ use std::sync::Arc;
 
 const DEFAULT_CAPACITY: usize = 1024;
 
+/// A builder for creating a [`RecordDecoder`].
 #[derive(Debug)]
 pub(crate) struct RecordDecoderBuilder<'a> {
     data_type: &'a AvroDataType,
@@ -40,6 +42,7 @@ pub(crate) struct RecordDecoderBuilder<'a> {
 }
 
 impl<'a> RecordDecoderBuilder<'a> {
+    /// Creates a new [`RecordDecoderBuilder`].
     pub(crate) fn new(data_type: &'a AvroDataType) -> Self {
         Self {
             data_type,
@@ -47,16 +50,19 @@ impl<'a> RecordDecoderBuilder<'a> {
         }
     }
 
+    /// Configures the decoder to use [`StringViewArray`] for string types.
     pub(crate) fn with_utf8_view(mut self, flag: bool) -> Self {
         self.use_utf8view = flag;
         self
     }
 
+    /// Builds the [`RecordDecoder`].
     pub(crate) fn build(self) -> Result<RecordDecoder, ArrowError> {
         RecordDecoder::try_new_with_options(self.data_type, self.use_utf8view)
     }
 }
 
+/// Decodes Avro records into an Arrow [`RecordBatch`].
 #[derive(Debug)]
 pub(crate) struct RecordDecoder {
     schema: SchemaRef,
@@ -64,6 +70,16 @@ pub(crate) struct RecordDecoder {
 }
 
 impl RecordDecoder {
+    /// Creates a new [`RecordDecoder`] from the provided [`AvroDataType`] with additional options.
+    ///
+    /// This method allows you to customize how the Avro data is decoded into Arrow arrays.
+    ///
+    /// # Arguments
+    /// * `data_type` - The Avro data type to decode.
+    /// * `use_utf8view` - A flag indicating whether to use `Utf8View` for string types.
+    ///
+    /// # Errors
+    /// This function will return an error if the provided `data_type` is not a `Record`.
     pub(crate) fn try_new_with_options(
         data_type: &AvroDataType,
         use_utf8view: bool,
@@ -78,16 +94,18 @@ impl RecordDecoder {
                 fields: field_decoders,
             }),
             _ => Err(ArrowError::ParseError(
-                "Top‑level Avro schema must be a record".to_string(),
+                "Top-level Avro schema must be a record".into(),
             )),
         }
     }
 
+    /// Returns the Arrow [`SchemaRef`] for the decoded records.
     #[inline]
     pub(crate) fn schema(&self) -> &SchemaRef {
         &self.schema
     }
 
+    /// Decodes a specified number of records from the buffer.
     pub(crate) fn decode(&mut self, buf: &[u8], count: usize) -> Result<usize, ArrowError> {
         let mut cursor = AvroCursor::new(buf);
         for _ in 0..count {
@@ -98,6 +116,7 @@ impl RecordDecoder {
         Ok(cursor.position())
     }
 
+    /// Flushes the decoded records into a [`RecordBatch`].
     pub(crate) fn flush(&mut self) -> Result<RecordBatch, ArrowError> {
         let arrays = self
             .fields
@@ -108,54 +127,47 @@ impl RecordDecoder {
     }
 }
 
+/// Internal decoder for a single Avro data type.
 #[derive(Debug)]
 enum Decoder {
-    /* -- Primitive & logical types --------------------------------------- */
     Null(usize),
     Boolean(BooleanBufferBuilder),
-    Int32(Vec<i32>),
-    Int64(Vec<i64>),
-    Float32(Vec<f32>),
-    Float64(Vec<f64>),
-
-    /* -- Promotions ------------------------------------------------------ */
-    Int32ToInt64(Vec<i64>),
-    Int32ToFloat32(Vec<f32>),
-    Int32ToFloat64(Vec<f64>),
-    Int64ToFloat32(Vec<f32>),
-    Int64ToFloat64(Vec<f64>),
-    Float32ToFloat64(Vec<f64>),
-    BytesToString(OffsetBufferBuilder<i32>, Vec<u8>),
-    StringToBytes(OffsetBufferBuilder<i32>, Vec<u8>),
-
-    /* -- Logical & complex ---------------------------------------------- */
-    Date32(Vec<i32>),
-    TimeMillis(Vec<i32>),
-    TimeMicros(Vec<i64>),
-    TimestampMillis(bool, Vec<i64>),
-    TimestampMicros(bool, Vec<i64>),
-    Binary(OffsetBufferBuilder<i32>, Vec<u8>),
-    String(OffsetBufferBuilder<i32>, Vec<u8>),
-    StringView(OffsetBufferBuilder<i32>, Vec<u8>),
-    Fixed(i32, Vec<u8>),
+    Int32(BufferBuilder<i32>),
+    Int64(BufferBuilder<i64>),
+    Float32(BufferBuilder<f32>),
+    Float64(BufferBuilder<f64>),
+    Int32ToInt64(BufferBuilder<i64>),
+    Int32ToFloat32(BufferBuilder<f32>),
+    Int32ToFloat64(BufferBuilder<f64>),
+    Int64ToFloat32(BufferBuilder<f32>),
+    Int64ToFloat64(BufferBuilder<f64>),
+    Float32ToFloat64(BufferBuilder<f64>),
+    BytesToString(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
+    StringToBytes(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
+    Date32(BufferBuilder<i32>),
+    TimeMillis(BufferBuilder<i32>),
+    TimeMicros(BufferBuilder<i64>),
+    TimestampMillis(bool, BufferBuilder<i64>),
+    TimestampMicros(bool, BufferBuilder<i64>),
+    Binary(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
+    /// String data encoded as UTF-8 bytes, mapped to Arrow's StringArray
+    String(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
+    /// String data encoded as UTF-8 bytes, but mapped to Arrow's StringViewArray
+    StringView(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
+    Fixed(i32, BufferBuilder<u8>),
     Decimal128(usize, Option<usize>, Option<usize>, Decimal128Builder),
     Decimal256(usize, Option<usize>, Option<usize>, Decimal256Builder),
-    Uuid(Vec<u8>),
+    Uuid(BufferBuilder<u8>),
     Duration(IntervalMonthDayNanoBuilder),
-    /// `Option<EnumMapping>` – `None` means no mapping required
-    Enum(Vec<i32>, Arc<[String]>, Option<EnumMapping>),
-
-    /* -- Containers ------------------------------------------------------ */
+    Enum(BufferBuilder<i32>, Arc<[String]>, Option<EnumMapping>),
     Array(FieldRef, OffsetBufferBuilder<i32>, Box<Decoder>),
     Map(
         FieldRef,
         OffsetBufferBuilder<i32>,
         OffsetBufferBuilder<i32>,
-        Vec<u8>,
+        BufferBuilder<u8>,
         Box<Decoder>,
     ),
-
-    /* -- Record with resolution info ------------------------------------ */
     Record {
         arrow_fields: Fields,
         field_decoders: Vec<Decoder>,
@@ -166,84 +178,77 @@ enum Decoder {
 }
 
 impl Decoder {
-    /// Internal constructor that honours `use_utf8view`
+    /// Tries to create a new `Decoder` for the given Avro data type, with an option for Utf8View.
     fn try_new_with_view(data_type: &AvroDataType, use_utf8view: bool) -> Result<Self, ArrowError> {
         use Decoder::*;
         let make_child = |dt: &AvroDataType| Decoder::try_new_with_view(dt, use_utf8view);
-
-        /* ---------------- select base variant ------------------------- */
         let base = match data_type.codec() {
-            &Codec::Null => Null(0),
-            &Codec::Boolean => Boolean(BooleanBufferBuilder::new(DEFAULT_CAPACITY)),
-            &Codec::Int32 => Int32(Vec::with_capacity(DEFAULT_CAPACITY)),
-            &Codec::Int64 => Int64(Vec::with_capacity(DEFAULT_CAPACITY)),
-            &Codec::Float32 => Float32(Vec::with_capacity(DEFAULT_CAPACITY)),
-            &Codec::Float64 => Float64(Vec::with_capacity(DEFAULT_CAPACITY)),
-
-            /* ---- anything else --------------------------------------- */
+            Codec::Null => Null(0),
+            Codec::Boolean => Boolean(BooleanBufferBuilder::new(DEFAULT_CAPACITY)),
+            Codec::Int32 => Int32(BufferBuilder::new(DEFAULT_CAPACITY)),
+            Codec::Int64 => Int64(BufferBuilder::new(DEFAULT_CAPACITY)),
+            Codec::Float32 => Float32(BufferBuilder::new(DEFAULT_CAPACITY)),
+            Codec::Float64 => Float64(BufferBuilder::new(DEFAULT_CAPACITY)),
             _ => match data_type.resolution.as_ref() {
                 Some(ResolutionInfo::Promotion(p)) => match p {
-                    Promotion::IntToLong => Int32ToInt64(Vec::with_capacity(DEFAULT_CAPACITY)),
-                    Promotion::IntToFloat => Int32ToFloat32(Vec::with_capacity(DEFAULT_CAPACITY)),
-                    Promotion::IntToDouble => Int32ToFloat64(Vec::with_capacity(DEFAULT_CAPACITY)),
-                    Promotion::LongToFloat => Int64ToFloat32(Vec::with_capacity(DEFAULT_CAPACITY)),
-                    Promotion::LongToDouble => Int64ToFloat64(Vec::with_capacity(DEFAULT_CAPACITY)),
+                    Promotion::IntToLong => Int32ToInt64(BufferBuilder::new(DEFAULT_CAPACITY)),
+                    Promotion::IntToFloat => Int32ToFloat32(BufferBuilder::new(DEFAULT_CAPACITY)),
+                    Promotion::IntToDouble => Int32ToFloat64(BufferBuilder::new(DEFAULT_CAPACITY)),
+                    Promotion::LongToFloat => Int64ToFloat32(BufferBuilder::new(DEFAULT_CAPACITY)),
+                    Promotion::LongToDouble => Int64ToFloat64(BufferBuilder::new(DEFAULT_CAPACITY)),
                     Promotion::FloatToDouble => {
-                        Float32ToFloat64(Vec::with_capacity(DEFAULT_CAPACITY))
+                        Float32ToFloat64(BufferBuilder::new(DEFAULT_CAPACITY))
                     }
                     Promotion::BytesToString => BytesToString(
                         OffsetBufferBuilder::new(DEFAULT_CAPACITY),
-                        Vec::with_capacity(DEFAULT_CAPACITY),
+                        BufferBuilder::new(DEFAULT_CAPACITY),
                     ),
                     Promotion::StringToBytes => StringToBytes(
                         OffsetBufferBuilder::new(DEFAULT_CAPACITY),
-                        Vec::with_capacity(DEFAULT_CAPACITY),
+                        BufferBuilder::new(DEFAULT_CAPACITY),
                     ),
                 },
-                /* ---- non‑promotion codecs ----------------------------- */
                 _ => match data_type.codec() {
-                    &Codec::Binary => Binary(
+                    Codec::Binary => Binary(
                         OffsetBufferBuilder::new(DEFAULT_CAPACITY),
-                        Vec::with_capacity(DEFAULT_CAPACITY),
+                        BufferBuilder::new(DEFAULT_CAPACITY),
                     ),
-                    &Codec::Utf8 => String(
+                    Codec::Utf8 => String(
                         OffsetBufferBuilder::new(DEFAULT_CAPACITY),
-                        Vec::with_capacity(DEFAULT_CAPACITY),
+                        BufferBuilder::new(DEFAULT_CAPACITY),
                     ),
-                    &Codec::Utf8View if use_utf8view => StringView(
+                    Codec::Utf8View if use_utf8view => StringView(
                         OffsetBufferBuilder::new(DEFAULT_CAPACITY),
-                        Vec::with_capacity(DEFAULT_CAPACITY),
+                        BufferBuilder::new(DEFAULT_CAPACITY),
                     ),
-                    &Codec::Date32 => Date32(Vec::with_capacity(DEFAULT_CAPACITY)),
-                    &Codec::TimeMillis => TimeMillis(Vec::with_capacity(DEFAULT_CAPACITY)),
-                    &Codec::TimeMicros => TimeMicros(Vec::with_capacity(DEFAULT_CAPACITY)),
-                    &Codec::TimestampMillis(utc) => {
-                        TimestampMillis(utc, Vec::with_capacity(DEFAULT_CAPACITY))
+                    Codec::Date32 => Date32(BufferBuilder::new(DEFAULT_CAPACITY)),
+                    Codec::TimeMillis => TimeMillis(BufferBuilder::new(DEFAULT_CAPACITY)),
+                    Codec::TimeMicros => TimeMicros(BufferBuilder::new(DEFAULT_CAPACITY)),
+                    Codec::TimestampMillis(utc) => {
+                        TimestampMillis(*utc, BufferBuilder::new(DEFAULT_CAPACITY))
                     }
-                    &Codec::TimestampMicros(utc) => {
-                        TimestampMicros(utc, Vec::with_capacity(DEFAULT_CAPACITY))
+                    Codec::TimestampMicros(utc) => {
+                        TimestampMicros(*utc, BufferBuilder::new(DEFAULT_CAPACITY))
                     }
-                    &Codec::Fixed(sz) => Fixed(sz, Vec::with_capacity(DEFAULT_CAPACITY)),
-                    &Codec::Decimal(p, s, size) => {
-                        let prec = p as u8;
+                    Codec::Fixed(sz) => Fixed(*sz, BufferBuilder::new(DEFAULT_CAPACITY)),
+                    Codec::Decimal(p, s, size) => {
+                        let prec = *p as u8;
                         let scale = s.unwrap_or(0) as i8;
                         match size {
-                            Some(sz) if sz > 16 => {
+                            Some(sz) if *sz > 16 => {
                                 let b = Decimal256Builder::new()
                                     .with_precision_and_scale(prec, scale)?;
-                                Decimal256(p, s, size, b)
+                                Decimal256(*p, *s, *size, b)
                             }
                             _ => {
                                 let b = Decimal128Builder::new()
                                     .with_precision_and_scale(prec, scale)?;
-                                Decimal128(p, s, size, b)
+                                Decimal128(*p, *s, *size, b)
                             }
                         }
                     }
-                    &Codec::Uuid => Uuid(Vec::with_capacity(DEFAULT_CAPACITY)),
-                    &Codec::Interval => Duration(IntervalMonthDayNanoBuilder::new()),
-
-                    /* ----- containers ---------------------------------- */
+                    Codec::Uuid => Uuid(BufferBuilder::new(DEFAULT_CAPACITY)),
+                    Codec::Interval => Duration(IntervalMonthDayNanoBuilder::new()),
                     Codec::List(child) => Array(
                         Arc::new(child.field_with_name("item")),
                         OffsetBufferBuilder::new(DEFAULT_CAPACITY),
@@ -263,7 +268,7 @@ impl Decoder {
                             map_field,
                             OffsetBufferBuilder::new(DEFAULT_CAPACITY),
                             OffsetBufferBuilder::new(DEFAULT_CAPACITY),
-                            Vec::with_capacity(DEFAULT_CAPACITY),
+                            BufferBuilder::new(DEFAULT_CAPACITY),
                             Box::new(make_child(val)?),
                         )
                     }
@@ -273,7 +278,7 @@ impl Decoder {
                             _ => None,
                         };
                         Enum(
-                            Vec::with_capacity(DEFAULT_CAPACITY),
+                            BufferBuilder::new(DEFAULT_CAPACITY),
                             symbols.clone(),
                             mapping,
                         )
@@ -299,13 +304,12 @@ impl Decoder {
                             defaults: defs,
                         }
                     }
-                    /* the earlier primitive variants are unreachable here */
-                    _ => unreachable!("primitive codecs handled earlier"),
+                    Codec::Union(child) => make_child(child)?,
+                    _ => unreachable!("primitive cases handled earlier"),
                 },
             },
         };
 
-        /* Wrap with nullability if necessary */
         Ok(match data_type.nullability() {
             Some(n) => {
                 Decoder::Nullable(n, NullBufferBuilder::new(DEFAULT_CAPACITY), Box::new(base))
@@ -314,82 +318,70 @@ impl Decoder {
         })
     }
 
-    /// Convenience wrapper retained for tests and existing code.
-    fn try_new(data_type: &AvroDataType) -> Result<Self, ArrowError> {
-        Decoder::try_new_with_view(data_type, false)
+    /// Convenience used by tests/benches.
+    pub(crate) fn try_new(data_type: &AvroDataType) -> Result<Self, ArrowError> {
+        Self::try_new_with_view(data_type, false)
     }
 
+    /// Decodes a single value from the buffer according to the decoder's type.
     fn decode(&mut self, buf: &mut AvroCursor<'_>) -> Result<(), ArrowError> {
         use Decoder::*;
         match self {
-            /* ----- primitives & logical -------------------------------- */
             Null(n) => *n += 1,
             Boolean(b) => b.append(buf.get_bool()?),
-            Int32(v) => v.push(buf.get_int()?),
-            Int64(v) => v.push(buf.get_long()?),
-            Float32(v) => v.push(buf.get_float()?),
-            Float64(v) => v.push(buf.get_double()?),
-
-            /* ----- promotions ----------------------------------------- */
-            Int32ToInt64(v) => v.push(buf.get_int()? as i64),
-            Int32ToFloat32(v) => v.push(buf.get_int()? as f32),
-            Int32ToFloat64(v) => v.push(buf.get_int()? as f64),
-            Int64ToFloat32(v) => v.push(buf.get_long()? as f32),
-            Int64ToFloat64(v) => v.push(buf.get_long()? as f64),
-            Float32ToFloat64(v) => v.push(buf.get_float()? as f64),
-            BytesToString(off, data) => {
-                let b = buf.get_bytes()?;
-                off.push_length(b.len());
-                data.extend_from_slice(b);
+            Int32(bldr) => bldr.append(buf.get_int()?),
+            Int64(bldr) => bldr.append(buf.get_long()?),
+            Float32(bldr) => bldr.append(buf.get_float()?),
+            Float64(bldr) => bldr.append(buf.get_double()?),
+            Int32ToInt64(b) => b.append(buf.get_int()? as i64),
+            Int32ToFloat32(b) => b.append(buf.get_int()? as f32),
+            Int32ToFloat64(b) => b.append(buf.get_int()? as f64),
+            Int64ToFloat32(b) => b.append(buf.get_long()? as f32),
+            Int64ToFloat64(b) => b.append(buf.get_long()? as f64),
+            Float32ToFloat64(b) => b.append(buf.get_float()? as f64),
+            BytesToString(off, data)
+            | String(off, data)
+            | StringView(off, data)
+            | Binary(off, data) => {
+                let bytes = buf.get_bytes()?;
+                off.push_length(bytes.len());
+                data.append_slice(bytes);
             }
             StringToBytes(off, data) => {
                 let s = buf.get_bytes()?;
                 off.push_length(s.len());
-                data.extend_from_slice(s);
+                data.append_slice(s);
             }
-
-            /* ----- binary / string ------------------------------------ */
-            Binary(off, data) | String(off, data) | StringView(off, data) => {
-                let s = buf.get_bytes()?;
-                off.push_length(s.len());
-                data.extend_from_slice(s);
-            }
-
-            /* ----- UUID ----------------------------------------------- */
-            Uuid(v) => {
+            Uuid(data) => {
                 let txt = std::str::from_utf8(buf.get_bytes()?)
                     .map_err(|e| ArrowError::ParseError(e.to_string()))?;
-                v.extend_from_slice(
+                data.append_slice(
                     uuid::Uuid::try_parse(txt)
                         .map_err(|e| ArrowError::ParseError(e.to_string()))?
                         .as_bytes(),
                 );
             }
-
-            /* ----- time & fixed/decimal -------------------------------- */
-            Date32(v) => v.push(buf.get_int()?),
-            TimeMillis(v) => v.push(buf.get_int()?),
-            TimeMicros(v) => v.push(buf.get_long()?),
-            TimestampMillis(_, v) | TimestampMicros(_, v) => v.push(buf.get_long()?),
-            Fixed(len, dst) => dst.extend_from_slice(buf.get_fixed(*len as usize)?),
-            Decimal128(_, _, sz, bldr) => {
+            Date32(b) | TimeMillis(b) => b.append(buf.get_int()?),
+            TimeMicros(b) | TimestampMillis(_, b) | TimestampMicros(_, b) => {
+                b.append(buf.get_long()?)
+            }
+            Fixed(len, b) => b.append_slice(buf.get_fixed(*len as usize)?),
+            Decimal128(_, _, sz, builder) => {
                 let raw = if let Some(s) = sz {
                     buf.get_fixed(*s)?
                 } else {
                     buf.get_bytes()?
                 };
-                bldr.append_value(i128::from_be_bytes(sign_extend_to::<16>(raw)?));
+                builder.append_value(i128::from_be_bytes(sign_extend_to::<16>(raw)?));
             }
-            Decimal256(_, _, sz, bldr) => {
+            Decimal256(_, _, sz, builder) => {
                 let raw = if let Some(s) = sz {
                     buf.get_fixed(*s)?
                 } else {
                     buf.get_bytes()?
                 };
-                bldr.append_value(i256::from_be_bytes(sign_extend_to::<32>(raw)?));
+                builder.append_value(i256::from_be_bytes(sign_extend_to::<32>(raw)?));
             }
-
-            /* ----- duration logical type ------------------------------ */
             Duration(bldr) => {
                 let raw = buf.get_fixed(12)?;
                 let months = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as i32;
@@ -397,18 +389,14 @@ impl Decoder {
                 let millis = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as i64;
                 bldr.append_value(IntervalMonthDayNano::new(months, days, millis * 1_000_000));
             }
-
-            /* ----- enum ----------------------------------------------- */
-            Enum(idx, _symbols, mapping) => {
+            Enum(keys, _symbols, mapping) => {
                 let w = buf.get_int()?;
                 let final_idx = mapping
                     .as_ref()
                     .and_then(|m| m.mapping.get(w as usize).copied())
                     .unwrap_or(w);
-                idx.push(final_idx);
+                keys.append(final_idx);
             }
-
-            /* ----- arrays and maps ------------------------------------ */
             Array(_, off, item_dec) => {
                 let n = read_items(buf, |c| item_dec.decode(c))?;
                 off.push_length(n);
@@ -417,13 +405,11 @@ impl Decoder {
                 let n = read_items(buf, |c| {
                     let k = c.get_bytes()?;
                     key_off.push_length(k.len());
-                    key_data.extend_from_slice(k);
+                    key_data.append_slice(k);
                     val_dec.decode(c)
                 })?;
                 map_off.push_length(n);
             }
-
-            /* ----- record with resolution ----------------------------- */
             Record {
                 mapping,
                 defaults,
@@ -431,16 +417,15 @@ impl Decoder {
                 ..
             } => {
                 if let Some(map) = mapping {
-                    for (w_pos, rdr_idx) in map.iter().enumerate() {
-                        if let Some(r_pos) = rdr_idx {
-                            field_decoders[*r_pos].decode(buf)?;
-                        } else {
-                            skip_value(buf)?;
+                    for (w_idx, rdr_idx) in map.iter().enumerate() {
+                        match rdr_idx {
+                            Some(pos) => field_decoders[*pos].decode(buf)?,
+                            None => skip_value(buf)?,
                         }
                     }
                     if let Some(def) = defaults {
                         for &idx in def.iter() {
-                            field_decoders[idx].append_null();
+                            field_decoders[idx].append_null(); // default value handling later
                         }
                     }
                 } else {
@@ -449,16 +434,14 @@ impl Decoder {
                     }
                 }
             }
-
-            /* ----- nullable ------------------------------------------- */
-            Nullable(order, nb, inner) => {
+            Nullable(order, nulls, inner) => {
                 let branch = buf.read_vlq()?;
-                let not_null = match order {
+                let is_present = match order {
                     Nullability::NullFirst => branch != 0,
                     Nullability::NullSecond => branch == 0,
                 };
-                nb.append(not_null);
-                if not_null {
+                nulls.append(is_present);
+                if is_present {
                     inner.decode(buf)?;
                 } else {
                     inner.append_null();
@@ -468,39 +451,36 @@ impl Decoder {
         Ok(())
     }
 
+    /// Appends a null value to the decoder's buffer.
     fn append_null(&mut self) {
         use Decoder::*;
         match self {
-            /* primitives ------------------------------------------------ */
             Null(n) => *n += 1,
             Boolean(b) => b.append(false),
-            Int32(v) | Date32(v) | TimeMillis(v) => v.push(0),
-            Int64(v)
-            | TimeMicros(v)
-            | TimestampMillis(_, v)
-            | TimestampMicros(_, v)
-            | Int32ToInt64(v) => v.push(0),
-            Float32(v) | Int32ToFloat32(v) | Int64ToFloat32(v) => v.push(0.0),
-            Float64(v) | Int32ToFloat64(v) | Int64ToFloat64(v) | Float32ToFloat64(v) => v.push(0.0),
-
-            /* variable‑length bytes / strings --------------------------- */
+            Int32(b) | Date32(b) | TimeMillis(b) => b.append(0),
+            Int64(b)
+            | TimeMicros(b)
+            | TimestampMillis(_, b)
+            | TimestampMicros(_, b)
+            | Int32ToInt64(b) => b.append(0),
+            Float32(b) | Int32ToFloat32(b) | Int64ToFloat32(b) => b.append(0.0),
+            Float64(b) | Int32ToFloat64(b) | Int64ToFloat64(b) | Float32ToFloat64(b) => {
+                b.append(0.0)
+            }
             Binary(off, _)
             | String(off, _)
             | StringView(off, _)
             | BytesToString(off, _)
             | StringToBytes(off, _) => off.push_length(0),
-
-            /* misc ------------------------------------------------------ */
-            Uuid(v) => v.extend([0u8; 16]),
-            Fixed(len, buf) => buf.extend(std::iter::repeat(0).take(*len as usize)),
+            Uuid(b) => b.append_slice(&[0u8; 16]),
+            Fixed(len, b) => b.append_slice(&vec![0u8; *len as usize]),
             Decimal128(_, _, _, bldr) => bldr.append_null(),
             Decimal256(_, _, _, bldr) => bldr.append_null(),
             Duration(bldr) => bldr.append_null(),
-            Enum(idx, _, opt_map) => {
-                let dflt = opt_map.as_ref().map(|m| m.default_index).unwrap_or(0);
-                idx.push(dflt);
+            Enum(keys, _, mapping) => {
+                let dflt = mapping.as_ref().map(|m| m.default_index).unwrap_or(0);
+                keys.append(dflt);
             }
-
             Array(_, off, child) => {
                 off.push_length(0);
                 child.append_null();
@@ -518,115 +498,107 @@ impl Decoder {
         }
     }
 
+    /// Flushes the buffered data into an [`ArrayRef`].
     fn flush(&mut self, nulls: Option<NullBuffer>) -> Result<ArrayRef, ArrowError> {
         use Decoder::*;
         Ok(match self {
-            /* -- promotions ------------------------------------------- */
-            Int32ToInt64(v) => Arc::new(PrimitiveArray::<Int64Type>::new(
-                flush_vals(v).into(),
+            Int32ToInt64(b) => Arc::new(PrimitiveArray::<Int64Type>::new(
+                flush_prim(b).into(),
                 nulls,
             )),
-            Int32ToFloat32(v) | Int64ToFloat32(v) => Arc::new(PrimitiveArray::<Float32Type>::new(
-                flush_vals(v).into(),
+            Int32ToFloat32(b) | Int64ToFloat32(b) => Arc::new(PrimitiveArray::<Float32Type>::new(
+                flush_prim(b).into(),
                 nulls,
             )),
-            Int32ToFloat64(v) | Int64ToFloat64(v) | Float32ToFloat64(v) => Arc::new(
-                PrimitiveArray::<Float64Type>::new(flush_vals(v).into(), nulls),
+            Int32ToFloat64(b) | Int64ToFloat64(b) | Float32ToFloat64(b) => Arc::new(
+                PrimitiveArray::<Float64Type>::new(flush_prim(b).into(), nulls),
             ),
             BytesToString(off, data) | String(off, data) => {
                 let o = flush_offsets(off);
-                let d: Buffer = flush_vals(data).into();
+                let d = flush_bytes(data);
                 Arc::new(StringArray::new(o, d, nulls))
             }
             StringToBytes(off, data) | Binary(off, data) => {
                 let o = flush_offsets(off);
-                let d: Buffer = flush_vals(data).into();
+                let d = flush_bytes(data);
                 Arc::new(BinaryArray::new(o, d, nulls))
             }
             StringView(off, data) => {
                 let o = flush_offsets(off);
-                let d: Buffer = flush_vals(data).into();
-                let base = StringArray::new(o, d, nulls.clone());
+                let d = flush_bytes(data);
+                let base = StringArray::new(o.clone(), d.clone(), None);
                 let vals: Vec<&str> = (0..base.len())
                     .map(|i| if base.is_valid(i) { base.value(i) } else { "" })
                     .collect();
                 Arc::new(StringViewArray::from(vals))
             }
-
-            /* -- original primitive & logical ------------------------- */
             Null(n) => Arc::new(NullArray::new(*n)),
             Boolean(b) => Arc::new(BooleanArray::new(b.finish(), nulls)),
-            Int32(v) => Arc::new(PrimitiveArray::<Int32Type>::new(
-                flush_vals(v).into(),
+            Int32(b) => Arc::new(PrimitiveArray::<Int32Type>::new(
+                flush_prim(b).into(),
                 nulls,
             )),
-            Int64(v) => Arc::new(PrimitiveArray::<Int64Type>::new(
-                flush_vals(v).into(),
+            Int64(b) => Arc::new(PrimitiveArray::<Int64Type>::new(
+                flush_prim(b).into(),
                 nulls,
             )),
-            Float32(v) => Arc::new(PrimitiveArray::<Float32Type>::new(
-                flush_vals(v).into(),
+            Float32(b) => Arc::new(PrimitiveArray::<Float32Type>::new(
+                flush_prim(b).into(),
                 nulls,
             )),
-            Float64(v) => Arc::new(PrimitiveArray::<Float64Type>::new(
-                flush_vals(v).into(),
+            Float64(b) => Arc::new(PrimitiveArray::<Float64Type>::new(
+                flush_prim(b).into(),
                 nulls,
             )),
-            Date32(v) => Arc::new(PrimitiveArray::<Date32Type>::new(
-                flush_vals(v).into(),
+            Date32(b) => Arc::new(PrimitiveArray::<Date32Type>::new(
+                flush_prim(b).into(),
                 nulls,
             )),
-            TimeMillis(v) => Arc::new(PrimitiveArray::<Time32MillisecondType>::new(
-                flush_vals(v).into(),
+            TimeMillis(b) => Arc::new(PrimitiveArray::<Time32MillisecondType>::new(
+                flush_prim(b).into(),
                 nulls,
             )),
-            TimeMicros(v) => Arc::new(PrimitiveArray::<Time64MicrosecondType>::new(
-                flush_vals(v).into(),
+            TimeMicros(b) => Arc::new(PrimitiveArray::<Time64MicrosecondType>::new(
+                flush_prim(b).into(),
                 nulls,
             )),
-            TimestampMillis(utc, v) => Arc::new(
-                PrimitiveArray::<TimestampMillisecondType>::new(flush_vals(v).into(), nulls)
+            TimestampMillis(utc, b) => Arc::new(
+                PrimitiveArray::<TimestampMillisecondType>::new(flush_prim(b).into(), nulls)
                     .with_timezone_opt(utc.then(|| "+00:00")),
             ),
-            TimestampMicros(utc, v) => Arc::new(
-                PrimitiveArray::<TimestampMicrosecondType>::new(flush_vals(v).into(), nulls)
+            TimestampMicros(utc, b) => Arc::new(
+                PrimitiveArray::<TimestampMicrosecondType>::new(flush_prim(b).into(), nulls)
                     .with_timezone_opt(utc.then(|| "+00:00")),
             ),
-            Fixed(len, data) => Arc::new(FixedSizeBinaryArray::try_new(
-                *len,
-                flush_vals(data).into(),
-                nulls,
-            )?),
-            Uuid(data) => Arc::new(FixedSizeBinaryArray::try_new(
-                16,
-                flush_vals(data).into(),
-                nulls,
-            )?),
-            Decimal128(p, s, _, bldr) => {
-                let (_, vals, _) = bldr.finish().into_parts();
-                let arr = Decimal128Array::new(vals, nulls)
-                    .with_precision_and_scale(*p as u8, s.unwrap_or(0) as i8)?;
-                Arc::new(arr)
+            Fixed(len, b) => Arc::new(FixedSizeBinaryArray::try_new(*len, flush_bytes(b), nulls)?),
+            Uuid(b) => Arc::new(FixedSizeBinaryArray::try_new(16, flush_bytes(b), nulls)?),
+            Decimal128(p, s, _, builder) => {
+                let (_, vals, _) = builder.finish().into_parts();
+                Arc::new(
+                    Decimal128Array::new(vals, nulls)
+                        .with_precision_and_scale(*p as u8, s.unwrap_or(0) as i8)?,
+                )
             }
-            Decimal256(p, s, _, bldr) => {
-                let (_, vals, _) = bldr.finish().into_parts();
-                let arr = Decimal256Array::new(vals, nulls)
-                    .with_precision_and_scale(*p as u8, s.unwrap_or(0) as i8)?;
-                Arc::new(arr)
+            Decimal256(p, s, _, builder) => {
+                let (_, vals, _) = builder.finish().into_parts();
+                Arc::new(
+                    Decimal256Array::new(vals, nulls)
+                        .with_precision_and_scale(*p as u8, s.unwrap_or(0) as i8)?,
+                )
             }
-            Duration(bldr) => {
-                let (_, vals, _) = bldr.finish().into_parts();
+            Duration(builder) => {
+                let (_, vals, _) = builder.finish().into_parts();
                 Arc::new(IntervalMonthDayNanoArray::try_new(vals, nulls)?)
             }
             Enum(keys, symbols, _) => {
-                let dict_keys = PrimitiveArray::<Int32Type>::new(flush_vals(keys).into(), nulls);
+                let dict_keys = PrimitiveArray::<Int32Type>::new(flush_prim(keys).into(), nulls);
                 let dict_vals = Arc::new(StringArray::from(
                     symbols.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
                 ));
                 Arc::new(DictionaryArray::try_new(dict_keys, dict_vals)?)
             }
-            Array(field, off, vals) => {
-                let values = vals.flush(None)?;
+            Array(field, off, child) => {
+                let values = child.flush(None)?;
                 Arc::new(ListArray::new(
                     field.clone(),
                     flush_offsets(off),
@@ -634,11 +606,11 @@ impl Decoder {
                     nulls,
                 ))
             }
-            Map(field, koff, moff, kdata, val_dec) => {
-                let mo = flush_offsets(moff);
-                let ko = flush_offsets(koff);
-                let kd: Buffer = flush_vals(kdata).into();
-                let key_arr = StringArray::new(ko, kd, None);
+            Map(field, key_off, map_off, key_data, val_dec) => {
+                let map_offsets = flush_offsets(map_off);
+                let key_offsets = flush_offsets(key_off);
+                let key_buffer = flush_bytes(key_data);
+                let key_arr = StringArray::new(key_offsets, key_buffer, None);
                 let val_arr = val_dec.flush(None)?;
                 let entries = StructArray::new(
                     Fields::from(vec![
@@ -648,7 +620,13 @@ impl Decoder {
                     vec![Arc::new(key_arr), val_arr],
                     None,
                 );
-                Arc::new(MapArray::new(field.clone(), mo, entries, nulls, false))
+                Arc::new(MapArray::new(
+                    field.clone(),
+                    map_offsets,
+                    entries,
+                    nulls,
+                    false,
+                ))
             }
             Record {
                 arrow_fields,
@@ -666,21 +644,34 @@ impl Decoder {
     }
 }
 
-#[inline]
-fn flush_vals<T>(v: &mut Vec<T>) -> Vec<T> {
-    std::mem::take(v)
+fn flush_prim<T: arrow_buffer::ArrowNativeType>(b: &mut BufferBuilder<T>) -> Buffer {
+    let new = BufferBuilder::<T>::new(DEFAULT_CAPACITY);
+    let mut old = std::mem::replace(b, new);
+    old.finish()
 }
 
-#[inline]
+fn flush_bytes(b: &mut BufferBuilder<u8>) -> Buffer {
+    let new = BufferBuilder::<u8>::new(DEFAULT_CAPACITY);
+    let mut old = std::mem::replace(b, new);
+    old.finish()
+}
+
 fn flush_offsets(b: &mut OffsetBufferBuilder<i32>) -> OffsetBuffer<i32> {
-    std::mem::replace(b, OffsetBufferBuilder::new(DEFAULT_CAPACITY)).finish()
+    let new = OffsetBufferBuilder::<i32>::new(DEFAULT_CAPACITY);
+    let mut old = std::mem::replace(b, new);
+    old.finish()
 }
 
+/// Skips a single Avro bytes value from the cursor.
 fn skip_value(buf: &mut AvroCursor<'_>) -> Result<(), ArrowError> {
     let _ = buf.get_bytes()?;
     Ok(())
 }
 
+/// Reads a series of blocks of items.
+///
+/// Avro arrays and maps are encoded as a series of blocks. Each block starts with a count of
+/// items, followed by that many items. A block with a count of 0 marks the end of the array or map.
 fn read_items(
     buf: &mut AvroCursor,
     mut decode: impl FnMut(&mut AvroCursor) -> Result<(), ArrowError>,
@@ -692,7 +683,7 @@ fn read_items(
             Ordering::Equal => break,
             Ordering::Less => {
                 let n = (-cnt) as usize;
-                let _ = buf.get_long()?; // block byte size (discard)
+                let _block_bytes = buf.get_long()?;
                 for _ in 0..n {
                     decode(buf)?;
                 }
@@ -710,7 +701,9 @@ fn read_items(
     Ok(total)
 }
 
-/// Sign‑extend helper.
+/// Sign extends a byte slice to a fixed-size array of N bytes.
+/// This is done by filling the leading bytes with 0x00 for positive numbers
+/// or 0xFF for negative numbers.
 #[inline]
 fn sign_extend_to<const N: usize>(raw: &[u8]) -> Result<[u8; N], ArrowError> {
     if raw.len() > N {
