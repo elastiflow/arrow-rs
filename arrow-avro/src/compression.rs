@@ -41,7 +41,29 @@ pub enum CompressionCodec {
 }
 
 impl CompressionCodec {
-    pub(crate) fn decompress(&self, block: &[u8]) -> Result<Vec<u8>, ArrowError> {
+    /// Decompresses a block of bytes using the specified codec.
+    ///
+    /// Each variant of `CompressionCodec` corresponds to a compression algorithm defined
+    /// in the Avro specification. This method applies the appropriate decompression
+    /// algorithm to the input `block`.
+    ///
+    /// The availability of each compression codec is controlled by feature flags.
+    /// For example, to use `CompressionCodec::Deflate`, the `deflate` feature must be
+    /// enabled. If the corresponding feature is not enabled, this method will return
+    /// an `ArrowError::ParseError`.
+    ///
+    /// For `CompressionCodec::Snappy`, the input block is expected to end with a
+    /// 4-byte big-endian CRC32 checksum of the uncompressed data, which is
+    /// verified after decompression.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an `ArrowError` if:
+    /// * The feature for the specified codec is not enabled.
+    /// * The decompression fails for any reason (e.g., malformed data).
+    /// * For `Snappy`, if the CRC32 checksum of the decompressed data does not
+    ///   match the checksum in the block.
+    pub fn decompress(&self, block: &[u8]) -> Result<Vec<u8>, ArrowError> {
         match self {
             #[cfg(feature = "deflate")]
             CompressionCodec::Deflate => {

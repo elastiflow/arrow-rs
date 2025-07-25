@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::codec::{
-    AvroDataType, Codec, EnumMapping, Nullability, Promotion, ResolutionInfo, ResolvedRecord,
+    AvroDataType, AvroLiteral, Codec, EnumMapping, Nullability, Promotion, ResolutionInfo,
+    ResolvedRecord,
 };
 use crate::reader::cursor::AvroCursor;
 use arrow_array::builder::{
@@ -34,7 +35,7 @@ use std::sync::Arc;
 
 const DEFAULT_CAPACITY: usize = 1024;
 
-/// A builder for creating a [`RecordDecoder`].
+/// Builder for a [`RecordDecoder`]
 #[derive(Debug)]
 pub(crate) struct RecordDecoderBuilder<'a> {
     data_type: &'a AvroDataType,
@@ -42,7 +43,6 @@ pub(crate) struct RecordDecoderBuilder<'a> {
 }
 
 impl<'a> RecordDecoderBuilder<'a> {
-    /// Creates a new [`RecordDecoderBuilder`].
     pub(crate) fn new(data_type: &'a AvroDataType) -> Self {
         Self {
             data_type,
@@ -50,19 +50,18 @@ impl<'a> RecordDecoderBuilder<'a> {
         }
     }
 
-    /// Configures the decoder to use [`StringViewArray`] for string types.
     pub(crate) fn with_utf8_view(mut self, flag: bool) -> Self {
         self.use_utf8view = flag;
         self
     }
 
-    /// Builds the [`RecordDecoder`].
+    /// Builds the `RecordDecoder`.
     pub(crate) fn build(self) -> Result<RecordDecoder, ArrowError> {
         RecordDecoder::try_new_with_options(self.data_type, self.use_utf8view)
     }
 }
 
-/// Decodes Avro records into an Arrow [`RecordBatch`].
+/// Converts Avro records into Arrow [`RecordBatch`]es
 #[derive(Debug)]
 pub(crate) struct RecordDecoder {
     schema: SchemaRef,
@@ -99,14 +98,23 @@ impl RecordDecoder {
         }
     }
 
-    /// Returns the Arrow [`SchemaRef`] for the decoded records.
+    /// Create a new [`RecordDecoder`] from the provided [`AvroDataType`] with default options
+    #[inline]
+    pub(crate) fn try_new(data_type: &AvroDataType) -> Result<Self, ArrowError> {
+        Self::try_new_with_options(data_type, false)
+    }
+
+    /// Returns the decoder's `SchemaRef`
     #[inline]
     pub(crate) fn schema(&self) -> &SchemaRef {
         &self.schema
     }
 
-    /// Decodes a specified number of records from the buffer.
+    /// Decodes `count` records from the provided buffer.
     pub(crate) fn decode(&mut self, buf: &[u8], count: usize) -> Result<usize, ArrowError> {
+        for f in &mut self.fields {
+            f.reserve(count);
+        }
         let mut cursor = AvroCursor::new(buf);
         for _ in 0..count {
             for f in &mut self.fields {
@@ -127,7 +135,6 @@ impl RecordDecoder {
     }
 }
 
-/// Internal decoder for a single Avro data type.
 #[derive(Debug)]
 enum Decoder {
     Null(usize),
@@ -144,16 +151,14 @@ enum Decoder {
     Float32ToFloat64(BufferBuilder<f64>),
     BytesToString(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
     StringToBytes(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
+    Binary(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
+    String(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
+    StringView(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
     Date32(BufferBuilder<i32>),
     TimeMillis(BufferBuilder<i32>),
     TimeMicros(BufferBuilder<i64>),
     TimestampMillis(bool, BufferBuilder<i64>),
     TimestampMicros(bool, BufferBuilder<i64>),
-    Binary(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
-    /// String data encoded as UTF-8 bytes, mapped to Arrow's StringArray
-    String(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
-    /// String data encoded as UTF-8 bytes, but mapped to Arrow's StringViewArray
-    StringView(OffsetBufferBuilder<i32>, BufferBuilder<u8>),
     Fixed(i32, BufferBuilder<u8>),
     Decimal128(usize, Option<usize>, Option<usize>, Decimal128Builder),
     Decimal256(usize, Option<usize>, Option<usize>, Decimal256Builder),
@@ -171,14 +176,14 @@ enum Decoder {
     Record {
         arrow_fields: Fields,
         field_decoders: Vec<Decoder>,
+        field_defaults: Vec<Option<AvroLiteral>>,
         mapping: Option<Arc<[Option<usize>]>>,
-        defaults: Option<Arc<[usize]>>,
+        skip_decoders: Option<Vec<Option<Decoder>>>,
     },
     Nullable(Nullability, NullBufferBuilder, Box<Decoder>),
 }
 
 impl Decoder {
-    /// Tries to create a new `Decoder` for the given Avro data type, with an option for Utf8View.
     fn try_new_with_view(data_type: &AvroDataType, use_utf8view: bool) -> Result<Self, ArrowError> {
         use Decoder::*;
         let make_child = |dt: &AvroDataType| Decoder::try_new_with_view(dt, use_utf8view);
@@ -273,10 +278,10 @@ impl Decoder {
                         )
                     }
                     Codec::Enum(symbols) => {
-                        let mapping = match &data_type.resolution {
-                            Some(ResolutionInfo::EnumMapping(m)) => Some(m.clone()),
+                        let mapping = data_type.resolution.as_ref().and_then(|r| match r {
+                            ResolutionInfo::EnumMapping(m) => Some(m.clone()),
                             _ => None,
-                        };
+                        });
                         Enum(
                             BufferBuilder::new(DEFAULT_CAPACITY),
                             symbols.clone(),
@@ -285,54 +290,114 @@ impl Decoder {
                     }
                     Codec::Struct(fields) => {
                         let mut arrow_fields = Vec::with_capacity(fields.len());
-                        let mut decoders = Vec::with_capacity(fields.len());
+                        let mut field_decoders = Vec::with_capacity(fields.len());
+                        let mut field_defaults = Vec::with_capacity(fields.len());
                         for f in fields.iter() {
                             arrow_fields.push(f.field());
-                            decoders.push(make_child(f.data_type())?);
+                            field_decoders.push(make_child(f.data_type())?);
+                            field_defaults.push(f.data_type().resolution.as_ref().and_then(|r| {
+                                match r {
+                                    ResolutionInfo::DefaultValue(l) => Some(l.clone()),
+                                    _ => None,
+                                }
+                            }));
                         }
-                        let (map, defs) = match &data_type.resolution {
+                        let (mapping, skip_decoders) = match &data_type.resolution {
                             Some(ResolutionInfo::Record(ResolvedRecord {
                                 writer_to_reader,
-                                default_fields,
-                            })) => (Some(writer_to_reader.clone()), Some(default_fields.clone())),
+                                skip_fields,
+                                ..
+                            })) => {
+                                let skips = skip_fields
+                                    .iter()
+                                    .map(|opt| {
+                                        opt.as_ref()
+                                            .map(|dt| make_child(dt))
+                                            .transpose()
+                                            .unwrap_or(None)
+                                    })
+                                    .collect();
+                                (Some(writer_to_reader.clone()), Some(skips))
+                            }
                             _ => (None, None),
                         };
                         Record {
                             arrow_fields: arrow_fields.into(),
-                            field_decoders: decoders,
-                            mapping: map,
-                            defaults: defs,
+                            field_decoders,
+                            field_defaults,
+                            mapping,
+                            skip_decoders,
                         }
                     }
                     Codec::Union(child) => make_child(child)?,
-                    _ => unreachable!("primitive cases handled earlier"),
+                    _ => unreachable!("primitive already matched"),
                 },
             },
         };
-
         Ok(match data_type.nullability() {
-            Some(n) => {
-                Decoder::Nullable(n, NullBufferBuilder::new(DEFAULT_CAPACITY), Box::new(base))
-            }
+            Some(n) => Nullable(n, NullBufferBuilder::new(DEFAULT_CAPACITY), Box::new(base)),
             None => base,
         })
     }
 
-    /// Convenience used by tests/benches.
+    /// Creates a new [`Decoder`] for the given [`AvroDataType`]
     pub(crate) fn try_new(data_type: &AvroDataType) -> Result<Self, ArrowError> {
         Self::try_new_with_view(data_type, false)
     }
 
-    /// Decodes a single value from the buffer according to the decoder's type.
+    fn reserve(&mut self, count: usize) {
+        use Decoder::*;
+        match self {
+            Boolean(b) => b.reserve(count),
+            Int32(b) | Date32(b) | TimeMillis(b) => b.reserve(count),
+            Int64(b)
+            | Int32ToInt64(b)
+            | TimeMicros(b)
+            | TimestampMillis(_, b)
+            | TimestampMicros(_, b) => b.reserve(count),
+            Float32(b) | Int32ToFloat32(b) | Int64ToFloat32(b) => b.reserve(count),
+            Float64(b) | Int32ToFloat64(b) | Int64ToFloat64(b) | Float32ToFloat64(b) => {
+                b.reserve(count)
+            }
+            BytesToString(off, data)
+            | StringToBytes(off, data)
+            | Binary(off, data)
+            | String(off, data)
+            | StringView(off, data) => {
+                off.reserve(count);
+                data.reserve(count * 8);
+            }
+            Enum(keys, ..) => keys.reserve(count),
+            Array(_, off, child) => {
+                off.reserve(count);
+                child.reserve(count);
+            }
+            Map(_, key_off, map_off, key_data, val_dec) => {
+                key_off.reserve(count);
+                map_off.reserve(count);
+                key_data.reserve(count * 8);
+                val_dec.reserve(count);
+            }
+            Record { field_decoders, .. } => {
+                for d in field_decoders {
+                    d.reserve(count);
+                }
+            }
+            Nullable(_, _nb, inner) => inner.reserve(count),
+            _ => {}
+        }
+    }
+
+    /// Decode a single record from the cursor.
     fn decode(&mut self, buf: &mut AvroCursor<'_>) -> Result<(), ArrowError> {
         use Decoder::*;
         match self {
             Null(n) => *n += 1,
             Boolean(b) => b.append(buf.get_bool()?),
-            Int32(bldr) => bldr.append(buf.get_int()?),
-            Int64(bldr) => bldr.append(buf.get_long()?),
-            Float32(bldr) => bldr.append(buf.get_float()?),
-            Float64(bldr) => bldr.append(buf.get_double()?),
+            Int32(b) => b.append(buf.get_int()?),
+            Int64(b) => b.append(buf.get_long()?),
+            Float32(b) => b.append(buf.get_float()?),
+            Float64(b) => b.append(buf.get_double()?),
             Int32ToInt64(b) => b.append(buf.get_int()? as i64),
             Int32ToFloat32(b) => b.append(buf.get_int()? as f32),
             Int32ToFloat64(b) => b.append(buf.get_int()? as f64),
@@ -348,9 +413,9 @@ impl Decoder {
                 data.append_slice(bytes);
             }
             StringToBytes(off, data) => {
-                let s = buf.get_bytes()?;
-                off.push_length(s.len());
-                data.append_slice(s);
+                let bytes = buf.get_bytes()?;
+                off.push_length(bytes.len());
+                data.append_slice(bytes);
             }
             Uuid(data) => {
                 let txt = std::str::from_utf8(buf.get_bytes()?)
@@ -391,11 +456,11 @@ impl Decoder {
             }
             Enum(keys, _symbols, mapping) => {
                 let w = buf.get_int()?;
-                let final_idx = mapping
+                let idx = mapping
                     .as_ref()
                     .and_then(|m| m.mapping.get(w as usize).copied())
                     .unwrap_or(w);
-                keys.append(final_idx);
+                keys.append(idx);
             }
             Array(_, off, item_dec) => {
                 let n = read_items(buf, |c| item_dec.decode(c))?;
@@ -412,20 +477,36 @@ impl Decoder {
             }
             Record {
                 mapping,
-                defaults,
+                skip_decoders,
                 field_decoders,
+                field_defaults,
                 ..
             } => {
                 if let Some(map) = mapping {
+                    let mut present = vec![false; field_decoders.len()];
                     for (w_idx, rdr_idx) in map.iter().enumerate() {
                         match rdr_idx {
-                            Some(pos) => field_decoders[*pos].decode(buf)?,
-                            None => skip_value(buf)?,
+                            Some(pos) => {
+                                present[*pos] = true;
+                                field_decoders[*pos].decode(buf)?
+                            }
+                            None => {
+                                if let Some(Some(dec)) =
+                                    skip_decoders.as_mut().and_then(|v| v.get_mut(w_idx))
+                                {
+                                    dec.decode(buf)?
+                                } else {
+                                    skip_value(buf)?
+                                }
+                            }
                         }
                     }
-                    if let Some(def) = defaults {
-                        for &idx in def.iter() {
-                            field_decoders[idx].append_null(); // default value handling later
+                    // Append default literals for fields not seen
+                    for (idx, default) in field_defaults.iter().enumerate() {
+                        if !present[idx] {
+                            if let Some(lit) = default {
+                                field_decoders[idx].append_literal(lit);
+                            }
                         }
                     }
                 } else {
@@ -436,12 +517,12 @@ impl Decoder {
             }
             Nullable(order, nulls, inner) => {
                 let branch = buf.read_vlq()?;
-                let is_present = match order {
+                let present = match order {
                     Nullability::NullFirst => branch != 0,
                     Nullability::NullSecond => branch == 0,
                 };
-                nulls.append(is_present);
-                if is_present {
+                nulls.append(present);
+                if present {
                     inner.decode(buf)?;
                 } else {
                     inner.append_null();
@@ -450,8 +531,7 @@ impl Decoder {
         }
         Ok(())
     }
-
-    /// Appends a null value to the decoder's buffer.
+    /// Appends a null value to the decoder.
     fn append_null(&mut self) {
         use Decoder::*;
         match self {
@@ -459,10 +539,10 @@ impl Decoder {
             Boolean(b) => b.append(false),
             Int32(b) | Date32(b) | TimeMillis(b) => b.append(0),
             Int64(b)
+            | Int32ToInt64(b)
             | TimeMicros(b)
             | TimestampMillis(_, b)
-            | TimestampMicros(_, b)
-            | Int32ToInt64(b) => b.append(0),
+            | TimestampMicros(_, b) => b.append(0),
             Float32(b) | Int32ToFloat32(b) | Int64ToFloat32(b) => b.append(0.0),
             Float64(b) | Int32ToFloat64(b) | Int64ToFloat64(b) | Float32ToFloat64(b) => {
                 b.append(0.0)
@@ -474,18 +554,14 @@ impl Decoder {
             | StringToBytes(off, _) => off.push_length(0),
             Uuid(b) => b.append_slice(&[0u8; 16]),
             Fixed(len, b) => b.append_slice(&vec![0u8; *len as usize]),
-            Decimal128(_, _, _, bldr) => bldr.append_null(),
-            Decimal256(_, _, _, bldr) => bldr.append_null(),
+            Decimal128(.., bldr) => bldr.append_null(),
+            Decimal256(.., bldr) => bldr.append_null(),
             Duration(bldr) => bldr.append_null(),
             Enum(keys, _, mapping) => {
-                let dflt = mapping.as_ref().map(|m| m.default_index).unwrap_or(0);
-                keys.append(dflt);
+                keys.append(mapping.as_ref().map(|m| m.default_index).unwrap_or(0));
             }
-            Array(_, off, child) => {
-                off.push_length(0);
-                child.append_null();
-            }
-            Map(_, _koff, moff, _data, _val) => moff.push_length(0),
+            Array(_, off, _) => off.push_length(0),
+            Map(_, _, moff, _, _) => moff.push_length(0),
             Record { field_decoders, .. } => {
                 for f in field_decoders {
                     f.append_null();
@@ -498,35 +574,89 @@ impl Decoder {
         }
     }
 
-    /// Flushes the buffered data into an [`ArrayRef`].
+    /// Appends a literal value to the decoder.
+    fn append_literal(&mut self, lit: &AvroLiteral) {
+        use AvroLiteral::*;
+        match lit {
+            Null | Unsupported => self.append_null(),
+            Boolean(bv) => match self {
+                Decoder::Boolean(buf) => buf.append(*bv),
+                _ => self.append_null(),
+            },
+            Int(i) => match self {
+                Decoder::Int32(b) => b.append(*i),
+                Decoder::Int32ToInt64(b) => b.append(*i as i64),
+                Decoder::Int32ToFloat32(b) => b.append(*i as f32),
+                Decoder::Int32ToFloat64(b) => b.append(*i as f64),
+                _ => self.append_null(),
+            },
+            Long(l) => match self {
+                Decoder::Int64(b) => b.append(*l),
+                Decoder::Int64ToFloat32(b) => b.append(*l as f32),
+                Decoder::Int64ToFloat64(b) => b.append(*l as f64),
+                _ => self.append_null(),
+            },
+            Float(fv) => match self {
+                Decoder::Float32(b) => b.append(*fv),
+                Decoder::Float32ToFloat64(b) => b.append(*fv as f64),
+                _ => self.append_null(),
+            },
+            Double(dv) => match self {
+                Decoder::Float64(b) => b.append(*dv),
+                _ => self.append_null(),
+            },
+            Bytes(bytes) => match self {
+                Decoder::Binary(off, data) | Decoder::StringToBytes(off, data) => {
+                    off.push_length(bytes.len());
+                    data.append_slice(bytes);
+                }
+                _ => self.append_null(),
+            },
+            String(s) => match self {
+                Decoder::String(off, data)
+                | Decoder::StringView(off, data)
+                | Decoder::BytesToString(off, data) => {
+                    off.push_length(s.len());
+                    data.append_slice(s.as_bytes());
+                }
+                _ => self.append_null(),
+            },
+            Enum(sym) => {
+                if let Decoder::Enum(keys, symbols, _) = self {
+                    let idx = symbols.iter().position(|x| x == sym).unwrap_or_default() as i32;
+                    keys.append(idx);
+                } else {
+                    self.append_null()
+                }
+            }
+        }
+    }
+
+    /// Flushes the decoded data into an [`ArrayRef`].
     fn flush(&mut self, nulls: Option<NullBuffer>) -> Result<ArrayRef, ArrowError> {
         use Decoder::*;
         Ok(match self {
-            Int32ToInt64(b) => Arc::new(PrimitiveArray::<Int64Type>::new(
-                flush_prim(b).into(),
+            Int32ToInt64(b) => Arc::new(PrimitiveArray::<Int64Type>::new(b.finish().into(), nulls)),
+            Int32ToFloat32(b) | Int64ToFloat32(b) => {
+                Arc::new(PrimitiveArray::<Float32Type>::new(b.finish().into(), nulls))
+            }
+            Int32ToFloat64(b) | Int64ToFloat64(b) | Float32ToFloat64(b) => {
+                Arc::new(PrimitiveArray::<Float64Type>::new(b.finish().into(), nulls))
+            }
+            BytesToString(off, data) | String(off, data) => Arc::new(StringArray::new(
+                flush_offsets(off),
+                flush_bytes(data),
                 nulls,
             )),
-            Int32ToFloat32(b) | Int64ToFloat32(b) => Arc::new(PrimitiveArray::<Float32Type>::new(
-                flush_prim(b).into(),
+            StringToBytes(off, data) | Binary(off, data) => Arc::new(BinaryArray::new(
+                flush_offsets(off),
+                flush_bytes(data),
                 nulls,
             )),
-            Int32ToFloat64(b) | Int64ToFloat64(b) | Float32ToFloat64(b) => Arc::new(
-                PrimitiveArray::<Float64Type>::new(flush_prim(b).into(), nulls),
-            ),
-            BytesToString(off, data) | String(off, data) => {
-                let o = flush_offsets(off);
-                let d = flush_bytes(data);
-                Arc::new(StringArray::new(o, d, nulls))
-            }
-            StringToBytes(off, data) | Binary(off, data) => {
-                let o = flush_offsets(off);
-                let d = flush_bytes(data);
-                Arc::new(BinaryArray::new(o, d, nulls))
-            }
             StringView(off, data) => {
-                let o = flush_offsets(off);
-                let d = flush_bytes(data);
-                let base = StringArray::new(o.clone(), d.clone(), None);
+                let offsets = flush_offsets(off);
+                let bytes = flush_bytes(data);
+                let base = StringArray::new(offsets.clone(), bytes.clone(), None);
                 let vals: Vec<&str> = (0..base.len())
                     .map(|i| if base.is_valid(i) { base.value(i) } else { "" })
                     .collect();
@@ -534,44 +664,29 @@ impl Decoder {
             }
             Null(n) => Arc::new(NullArray::new(*n)),
             Boolean(b) => Arc::new(BooleanArray::new(b.finish(), nulls)),
-            Int32(b) => Arc::new(PrimitiveArray::<Int32Type>::new(
-                flush_prim(b).into(),
-                nulls,
-            )),
-            Int64(b) => Arc::new(PrimitiveArray::<Int64Type>::new(
-                flush_prim(b).into(),
-                nulls,
-            )),
-            Float32(b) => Arc::new(PrimitiveArray::<Float32Type>::new(
-                flush_prim(b).into(),
-                nulls,
-            )),
-            Float64(b) => Arc::new(PrimitiveArray::<Float64Type>::new(
-                flush_prim(b).into(),
-                nulls,
-            )),
-            Date32(b) => Arc::new(PrimitiveArray::<Date32Type>::new(
-                flush_prim(b).into(),
-                nulls,
-            )),
+            Int32(b) => Arc::new(PrimitiveArray::<Int32Type>::new(b.finish().into(), nulls)),
+            Int64(b) => Arc::new(PrimitiveArray::<Int64Type>::new(b.finish().into(), nulls)),
+            Float32(b) => Arc::new(PrimitiveArray::<Float32Type>::new(b.finish().into(), nulls)),
+            Float64(b) => Arc::new(PrimitiveArray::<Float64Type>::new(b.finish().into(), nulls)),
+            Date32(b) => Arc::new(PrimitiveArray::<Date32Type>::new(b.finish().into(), nulls)),
             TimeMillis(b) => Arc::new(PrimitiveArray::<Time32MillisecondType>::new(
-                flush_prim(b).into(),
+                b.finish().into(),
                 nulls,
             )),
             TimeMicros(b) => Arc::new(PrimitiveArray::<Time64MicrosecondType>::new(
-                flush_prim(b).into(),
+                b.finish().into(),
                 nulls,
             )),
             TimestampMillis(utc, b) => Arc::new(
-                PrimitiveArray::<TimestampMillisecondType>::new(flush_prim(b).into(), nulls)
+                PrimitiveArray::<TimestampMillisecondType>::new(b.finish().into(), nulls)
                     .with_timezone_opt(utc.then(|| "+00:00")),
             ),
             TimestampMicros(utc, b) => Arc::new(
-                PrimitiveArray::<TimestampMicrosecondType>::new(flush_prim(b).into(), nulls)
+                PrimitiveArray::<TimestampMicrosecondType>::new(b.finish().into(), nulls)
                     .with_timezone_opt(utc.then(|| "+00:00")),
             ),
-            Fixed(len, b) => Arc::new(FixedSizeBinaryArray::try_new(*len, flush_bytes(b), nulls)?),
-            Uuid(b) => Arc::new(FixedSizeBinaryArray::try_new(16, flush_bytes(b), nulls)?),
+            Fixed(len, b) => Arc::new(FixedSizeBinaryArray::try_new(*len, b.finish(), nulls)?),
+            Uuid(b) => Arc::new(FixedSizeBinaryArray::try_new(16, b.finish(), nulls)?),
             Decimal128(p, s, _, builder) => {
                 let (_, vals, _) = builder.finish().into_parts();
                 Arc::new(
@@ -591,9 +706,9 @@ impl Decoder {
                 Arc::new(IntervalMonthDayNanoArray::try_new(vals, nulls)?)
             }
             Enum(keys, symbols, _) => {
-                let dict_keys = PrimitiveArray::<Int32Type>::new(flush_prim(keys).into(), nulls);
-                let dict_vals = Arc::new(StringArray::from(
-                    symbols.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                let dict_keys = PrimitiveArray::<Int32Type>::new(keys.finish().into(), nulls);
+                let dict_vals = Arc::new(StringArray::from_iter_values(
+                    symbols.iter().map(|s| s.as_str()),
                 ));
                 Arc::new(DictionaryArray::try_new(dict_keys, dict_vals)?)
             }
@@ -643,35 +758,12 @@ impl Decoder {
         })
     }
 }
-
-fn flush_prim<T: arrow_buffer::ArrowNativeType>(b: &mut BufferBuilder<T>) -> Buffer {
-    let new = BufferBuilder::<T>::new(DEFAULT_CAPACITY);
-    let mut old = std::mem::replace(b, new);
-    old.finish()
-}
-
-fn flush_bytes(b: &mut BufferBuilder<u8>) -> Buffer {
-    let new = BufferBuilder::<u8>::new(DEFAULT_CAPACITY);
-    let mut old = std::mem::replace(b, new);
-    old.finish()
-}
-
-fn flush_offsets(b: &mut OffsetBufferBuilder<i32>) -> OffsetBuffer<i32> {
-    let new = OffsetBufferBuilder::<i32>::new(DEFAULT_CAPACITY);
-    let mut old = std::mem::replace(b, new);
-    old.finish()
-}
-
-/// Skips a single Avro bytes value from the cursor.
+/// Skips a value by reading and discarding a byte slice.
 fn skip_value(buf: &mut AvroCursor<'_>) -> Result<(), ArrowError> {
     let _ = buf.get_bytes()?;
     Ok(())
 }
-
-/// Reads a series of blocks of items.
-///
-/// Avro arrays and maps are encoded as a series of blocks. Each block starts with a count of
-/// items, followed by that many items. A block with a count of 0 marks the end of the array or map.
+/// Reads blocks of items from the cursor.
 fn read_items(
     buf: &mut AvroCursor,
     mut decode: impl FnMut(&mut AvroCursor) -> Result<(), ArrowError>,
@@ -701,9 +793,19 @@ fn read_items(
     Ok(total)
 }
 
-/// Sign extends a byte slice to a fixed-size array of N bytes.
-/// This is done by filling the leading bytes with 0x00 for positive numbers
-/// or 0xFF for negative numbers.
+/// Swap-and-finish for variable-width data buffers
+fn flush_bytes(b: &mut BufferBuilder<u8>) -> Buffer {
+    let mut old = std::mem::replace(b, BufferBuilder::<u8>::new(DEFAULT_CAPACITY));
+    old.finish()
+}
+
+/// Swap-and-finish for offset buffers
+fn flush_offsets(b: &mut OffsetBufferBuilder<i32>) -> OffsetBuffer<i32> {
+    let mut old = std::mem::replace(b, OffsetBufferBuilder::<i32>::new(DEFAULT_CAPACITY));
+    old.finish()
+}
+
+/// Sign-extend an integer to `N` bytes
 #[inline]
 fn sign_extend_to<const N: usize>(raw: &[u8]) -> Result<[u8; N], ArrowError> {
     if raw.len() > N {
@@ -726,11 +828,13 @@ fn sign_extend_to<const N: usize>(raw: &[u8]) -> Result<[u8; N], ArrowError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::AvroField;
     use crate::schema::{ComplexType, Enum, Field, PrimitiveType, Record, Schema, TypeName};
     use arrow_array::{
         cast::AsArray, Array, Decimal128Array, DictionaryArray, FixedSizeBinaryArray,
         IntervalMonthDayNanoArray, ListArray, MapArray, StringArray, StructArray,
     };
+    use serde_json::json;
 
     fn encode_avro_int(value: i32) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -1272,12 +1376,9 @@ mod tests {
             }],
             attributes: Default::default(),
         }));
-        let field = crate::codec::AvroField::resolve_from_writer_and_reader(
-            &writer_schema,
-            &reader_schema,
-            false,
-        )
-        .expect("resolution failed");
+        let field =
+            AvroField::resolve_from_writer_and_reader(&writer_schema, &reader_schema, false, false)
+                .expect("resolution failed");
         let mut decoder = Decoder::try_new(field.data_type()).unwrap();
         let data = encode_avro_int(42);
         decoder.decode(&mut AvroCursor::new(&data)).unwrap();
@@ -1307,12 +1408,9 @@ mod tests {
             default: None,
             attributes: Default::default(),
         }));
-        let field = crate::codec::AvroField::resolve_from_writer_and_reader(
-            &writer_enum,
-            &reader_enum,
-            false,
-        )
-        .expect("enum resolution failed");
+        let field =
+            AvroField::resolve_from_writer_and_reader(&writer_enum, &reader_enum, false, false)
+                .expect("enum resolution failed");
         let mut decoder = Decoder::try_new(field.data_type()).unwrap();
         let mut buf = Vec::new();
         buf.extend(encode_avro_int(0));
@@ -1348,12 +1446,9 @@ mod tests {
             Schema::TypeName(TypeName::Primitive(PrimitiveType::String)),
             Schema::TypeName(TypeName::Primitive(PrimitiveType::Null)),
         ]);
-        let field = crate::codec::AvroField::resolve_from_writer_and_reader(
-            &writer_union,
-            &reader_union,
-            false,
-        )
-        .expect("union resolution failed");
+        let field =
+            AvroField::resolve_from_writer_and_reader(&writer_union, &reader_union, false, false)
+                .expect("union resolution failed");
         let mut decoder = Decoder::try_new(field.data_type()).unwrap();
         let mut buf = Vec::new();
         buf.extend(encode_avro_int(1));
@@ -1367,5 +1462,172 @@ mod tests {
         assert_eq!(sa.len(), 2);
         assert_eq!(sa.value(0), "hello");
         assert!(sa.is_null(1));
+    }
+
+    #[test]
+    fn test_schema_resolution_default_value_int() {
+        let writer_schema = Schema::Complex(ComplexType::Record(Record {
+            name: "R",
+            namespace: None,
+            doc: None,
+            aliases: vec![],
+            fields: vec![Field {
+                name: "x",
+                doc: None,
+                r#type: Schema::TypeName(TypeName::Primitive(PrimitiveType::Int)),
+                default: None,
+            }],
+            attributes: Default::default(),
+        }));
+        let reader_schema = Schema::Complex(ComplexType::Record(Record {
+            name: "R",
+            namespace: None,
+            doc: None,
+            aliases: vec![],
+            fields: vec![
+                Field {
+                    name: "x",
+                    doc: None,
+                    r#type: Schema::TypeName(TypeName::Primitive(PrimitiveType::Int)),
+                    default: None,
+                },
+                Field {
+                    name: "y",
+                    doc: None,
+                    r#type: Schema::TypeName(TypeName::Primitive(PrimitiveType::Int)),
+                    default: Some(json!(9)),
+                },
+            ],
+            attributes: Default::default(),
+        }));
+
+        let field =
+            AvroField::resolve_from_writer_and_reader(&writer_schema, &reader_schema, false, false)
+                .expect("resolution failed");
+        let mut decoder = Decoder::try_new(field.data_type()).unwrap();
+        let data = encode_avro_int(5);
+        decoder.decode(&mut AvroCursor::new(&data)).unwrap();
+        let array = decoder.flush(None).unwrap();
+        let struct_arr = array.as_any().downcast_ref::<StructArray>().unwrap();
+        let x_vals = struct_arr
+            .column_by_name("x")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let y_vals = struct_arr
+            .column_by_name("y")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        assert_eq!(x_vals.value(0), 5);
+        assert_eq!(y_vals.value(0), 9);
+    }
+
+    /// Reader adds `msg: string` with the default "hello"
+    #[test]
+    fn test_schema_resolution_default_value_string() {
+        let writer_schema = Schema::Complex(ComplexType::Record(Record {
+            name: "S",
+            namespace: None,
+            doc: None,
+            aliases: vec![],
+            fields: vec![Field {
+                name: "id",
+                doc: None,
+                r#type: Schema::TypeName(TypeName::Primitive(PrimitiveType::Long)),
+                default: None,
+            }],
+            attributes: Default::default(),
+        }));
+        let reader_schema = Schema::Complex(ComplexType::Record(Record {
+            name: "S",
+            namespace: None,
+            doc: None,
+            aliases: vec![],
+            fields: vec![
+                Field {
+                    name: "id",
+                    doc: None,
+                    r#type: Schema::TypeName(TypeName::Primitive(PrimitiveType::Long)),
+                    default: None,
+                },
+                Field {
+                    name: "msg",
+                    doc: None,
+                    r#type: Schema::TypeName(TypeName::Primitive(PrimitiveType::String)),
+                    default: Some(json!("hello")),
+                },
+            ],
+            attributes: Default::default(),
+        }));
+        let field =
+            AvroField::resolve_from_writer_and_reader(&writer_schema, &reader_schema, false, false)
+                .unwrap();
+        let mut decoder = Decoder::try_new(field.data_type()).unwrap();
+        let data = encode_avro_long(123);
+        decoder.decode(&mut AvroCursor::new(&data)).unwrap();
+        let array = decoder.flush(None).unwrap();
+        let struct_arr = array.as_any().downcast_ref::<StructArray>().unwrap();
+        let id_vals = struct_arr
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        let msg_vals = struct_arr
+            .column_by_name("msg")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(id_vals.value(0), 123);
+        assert_eq!(msg_vals.value(0), "hello");
+    }
+
+    /// Writer has an extra `y` field; reader ignores it but must still decode
+    #[test]
+    fn test_schema_resolution_skip_writer_only() {
+        let writer_schema = Schema::Complex(ComplexType::Record(Record {
+            name: "T",
+            namespace: None,
+            doc: None,
+            aliases: vec![],
+            fields: vec![
+                Field {
+                    name: "x",
+                    doc: None,
+                    r#type: Schema::TypeName(TypeName::Primitive(PrimitiveType::Int)),
+                    default: None,
+                },
+                Field {
+                    name: "y",
+                    doc: None,
+                    r#type: Schema::TypeName(TypeName::Primitive(PrimitiveType::Int)),
+                    default: None,
+                },
+            ],
+            attributes: Default::default(),
+        }));
+        let reader_schema = Schema::Complex(ComplexType::Record(Record {
+            name: "T",
+            namespace: None,
+            doc: None,
+            aliases: vec![],
+            fields: vec![Field {
+                name: "x",
+                doc: None,
+                r#type: Schema::TypeName(TypeName::Primitive(PrimitiveType::Int)),
+                default: None,
+            }],
+            attributes: Default::default(),
+        }));
+        let field =
+            AvroField::resolve_from_writer_and_reader(&writer_schema, &reader_schema, false, false)
+                .unwrap();
+        let mut decoder = Decoder::try_new(field.data_type()).unwrap();
+        let mut data = encode_avro_int(1);
+        data.extend(encode_avro_int(2));
+        decoder.decode(&mut AvroCursor::new(&data)).unwrap();
+        let array = decoder.flush(None).unwrap();
+        let struct_arr = array.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(struct_arr.num_columns(), 1);
+        let x_vals = struct_arr.column(0).as_primitive::<Int32Type>();
+        assert_eq!(x_vals.value(0), 1);
     }
 }
