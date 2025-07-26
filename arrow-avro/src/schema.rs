@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use serde_json::Value;
 
 /// The metadata key used for storing the JSON encoded [`Schema`]
 pub const SCHEMA_METADATA_KEY: &str = "avro.schema";
@@ -181,8 +182,8 @@ pub struct Field<'a> {
     #[serde(borrow)]
     pub r#type: Schema<'a>,
     /// Optional default value for this field
-    #[serde(borrow, default)]
-    pub default: Option<&'a str>,
+    #[serde(default)]
+    pub default: Option<Value>,
 }
 
 /// An enumeration
