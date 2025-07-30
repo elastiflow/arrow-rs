@@ -49,6 +49,7 @@ pub mod compression;
 /// This module contains the necessary types and functions to convert between
 /// Avro data types and Arrow data types.
 pub mod codec;
+pub mod writer;
 
 /// Extension trait for AvroField to add Utf8View support
 ///
