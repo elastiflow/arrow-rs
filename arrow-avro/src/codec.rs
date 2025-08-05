@@ -129,7 +129,7 @@ pub struct AvroDataType {
     nullability: Option<Nullability>,
     metadata: HashMap<String, String>,
     codec: Codec,
-    resolution: Option<ResolutionInfo>
+    pub(crate) resolution: Option<ResolutionInfo>
 }
 
 impl AvroDataType {
@@ -854,80 +854,37 @@ impl<'a> Maker<'a> {
 
     fn resolve_records(
         &mut self,
-        w: &Record<'a>,
-        r: &Record<'a>,
+        writer_record: &Record<'a>,
+        reader_record: &Record<'a>,
         namespace: Option<&'a str>,
     ) -> Result<AvroDataType, ArrowError> {
-        let names_match = w.name == r.name
-            || r.aliases.iter().any(|&a| a == w.name)
-            || w.aliases.iter().any(|&a| a == r.name);
+        let names_match = writer_record.name == reader_record.name
+            || reader_record.aliases.iter().any(|&a| a == writer_record.name)
+            || writer_record.aliases.iter().any(|&a| a == reader_record.name);
         if !names_match {
             return Err(ArrowError::ParseError(format!(
                 "Record name mismatch writer={}, reader={}",
-                w.name, r.name
+                writer_record.name, reader_record.name
             )));
         }
-        // RECURSIVE CHECK IF NEEDED
-        // if let prev = self.resolver.resolve(w.name, Option::from(r.name))? {
-        //    return Ok(prev);
-        //}
-        let ns = r.namespace.or(namespace);
-        let mut w_index_map = HashMap::<&str, usize>::with_capacity(w.fields.len());
-        for (idx, wf) in w.fields.iter().enumerate() {
-            w_index_map.insert(wf.name, idx);
+        let mut writer_index_map = HashMap::<&str, usize>::with_capacity(writer_record.fields.len());
+        for (idx, wf) in writer_record.fields.iter().enumerate() {
+            writer_index_map.insert(wf.name, idx);
         }
-        let mut reader_fields = Vec::with_capacity(r.fields.len());
-        let mut w_to_r = vec![None; w.fields.len()];
-        let mut default_indices = Vec::new();
-        for (r_idx, rf) in r.fields.iter().enumerate() {
-            if let Some(&w_idx) = w_index_map.get(rf.name) {
-                let wf = &w.fields[w_idx];
-                let child = self.make_data_type(&wf.r#type, Some(&rf.r#type), ns)?;
-                reader_fields.push(AvroField {
-                    name: rf.name.to_string(),
-                    data_type: child,
-                });
-                w_to_r[w_idx] = Some(r_idx);
-            } else if let Some(def_val) = rf.default.as_ref() {
-                let lit = parse_default_literal(def_val, &rf.r#type)?;
-                let mut child = self.parse_type(&rf.r#type, ns)?;
-                child.resolution = Some(ResolutionInfo::DefaultValue(lit));
-                reader_fields.push(AvroField {
-                    name: rf.name.to_string(),
-                    data_type: child,
-                });
-                default_indices.push(r_idx);
-            } else {
-                return Err(ArrowError::ParseError(format!(
-                    "Field '{0}' missing in writer and no default",
-                    rf.name
-                )));
-            }
-        }
-        let mut skip_fields = vec![None; w.fields.len()];
-        for (w_idx, wf) in w.fields.iter().enumerate() {
-            if w_to_r[w_idx].is_none() {
-                skip_fields[w_idx] = Some(self.parse_type(&wf.r#type, ns)?);
-            }
-        }
-        let mut md = r.attributes.field_metadata();
-        if !default_indices.is_empty() {
-            let defaults_json = serde_json::to_string(&default_indices)
-                .map_err(|e| ArrowError::JsonError(e.to_string()))?;
-            md.insert("avro.resolution.defaults".into(), defaults_json);
-        }
+        let mut reader_fields = Vec::with_capacity(reader_record.fields.len());
+        let mut writer_schema_to_reader_schema = vec![None; writer_record.fields.len()];
         let resolved = AvroDataType::new_with_resolution(
             Codec::Struct(Arc::from(reader_fields)),
-            md,
+            HashMap::new(),
             None,
             Some(ResolutionInfo::Record(ResolvedRecord {
-                writer_to_reader: Arc::from(w_to_r),
-                default_fields: Arc::from(default_indices),
-                skip_fields: Arc::from(skip_fields),
+                writer_to_reader: Arc::from(writer_schema_to_reader_schema),
+                default_fields: Arc::from([]),
+                skip_fields: Arc::from([None]),
             })),
         );
         self.resolver
-            .register(w.name, Some(r.name), resolved.clone());
+            .register(writer_record.name, Some(reader_record.name), resolved.clone());
         Ok(resolved)
     }
 }
