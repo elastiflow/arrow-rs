@@ -36,7 +36,7 @@ pub mod reader;
 // Avro schema parsing and representation
 //
 // Provides types for parsing and representing Avro schema definitions.
-mod schema;
+pub mod schema;
 
 /// Compression codec implementations for Avro
 ///

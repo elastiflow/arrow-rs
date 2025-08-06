@@ -30,17 +30,15 @@
 //! # use std::{fs::File, sync::Arc};
 //! # use arrow_array::{Int32Array, RecordBatch};
 //! # use arrow_avro::compression::CompressionCodec;
-//! # use arrow_schema::{Schema, Field, DataType};
+//! # use arrow_schema::{Schema, Field, DataType, SchemaRef};
 //! # use arrow_avro::writer::{AvroWriter, AvroStreamWriter};
 //!
-//! // ---------- write an Avro OCF file ----------
-//! let schema = Arc::new(
-//!     Schema::new(vec![Field::new("a", DataType::Int32, /*nullable=*/ false)])
-//! );
+//! let schema =
+//!     Schema::new(vec![Field::new("a", DataType::Int32, /*nullable=*/ false)]);
 //!
 //! // some example data
 //! let col = Int32Array::from(vec![1, 2, 3]);
-//! let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(col)]).unwrap();
+//! let batch = RecordBatch::try_new(SchemaRef::from(schema.clone()), vec![Arc::new(col)]).unwrap();
 //!
 //! let file = File::create("data.avro")?;
 //! let mut writer = AvroWriter::new(file, schema.clone())?          // default = no compression
@@ -48,7 +46,6 @@
 //! writer.write(&batch)?;
 //! writer.finish()?; // flushes the last block and closes the file
 //!
-//! // ---------- write an Avro binary *stream* ----------
 //! let mut out = Vec::new();
 //! let mut stream_writer = AvroStreamWriter::new(&mut out, schema.clone())?;
 //! stream_writer.write(&batch)?; // streaming mode: no header, no blocks
@@ -63,70 +60,57 @@ pub mod encoder;
 /// Logic for different Avro container file formats.
 pub mod format;
 /// Converts Arrow schemas to Avro schemas.
-pub mod schema;
-
-use std::io::{self, Write};
-use std::sync::Arc;
-
 use crate::compression::CompressionCodec;
+use crate::schema::AvroSchema;
 use crate::writer::encoder::{encode_record_batch, write_long};
 use crate::writer::format::{AvroBinaryFormat, AvroFormat, AvroOcfFormat};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema};
+use std::io::{self, Write};
+use std::sync::Arc;
 
 /// Builder to configure and create [`Writer`]s.
 #[derive(Debug, Clone)]
 pub struct WriterBuilder {
+    schema: Schema,
     codec: Option<CompressionCodec>,
 }
 
 impl WriterBuilder {
     /// Create a new builder with default settings.
-    pub fn new() -> Self {
-        Self { codec: None }
+    pub fn new(schema: Schema) -> Self {
+        Self {
+            schema,
+            codec: None,
+        }
     }
 
     /// Change the compression codec.
-    pub fn compression(mut self, codec: Option<CompressionCodec>) -> Self {
+    pub fn with_compression(mut self, codec: Option<CompressionCodec>) -> Self {
         self.codec = codec;
         self
     }
 
-    /// Build an **Avro Object Container File** writer.
-    pub fn build_ocf<W: Write>(
-        self,
-        writer: W,
-        schema: Arc<Schema>,
-    ) -> Result<Writer<W, AvroOcfFormat>, ArrowError> {
-        Ok(Writer {
+    /// Create a new `Writer` with specified `JsonFormat` and builder options.
+    pub fn build<W, F>(self, writer: W) -> Writer<W, F>
+    where
+        W: Write,
+        F: AvroFormat,
+    {
+        Writer {
             writer,
-            schema,
-            format: AvroOcfFormat::default(),
+            schema: Arc::from(self.schema),
+            format: F::default(),
             compression: self.codec,
             started: false,
-        })
-    }
-
-    /// Build a **raw Avro binary stream** writer.
-    pub fn build_stream<W: Write>(
-        self,
-        writer: W,
-        schema: Arc<Schema>,
-    ) -> Result<Writer<W, AvroBinaryFormat>, ArrowError> {
-        Ok(Writer {
-            writer,
-            schema,
-            format: AvroBinaryFormat::default(),
-            compression: self.codec, // ignored for stream mode
-            started: false,
-        })
+        }
     }
 }
 
 /// Generic Avro writer.
 ///
 /// The generic parameter **`F`** controls the output format
-/// (OCF vs raw stream).  Use the convenient type aliases
+/// (OCF vs. raw stream).  Use the convenient type aliases
 /// [`AvroWriter`] and [`AvroStreamWriter`] for common cases.
 #[derive(Debug)]
 pub struct Writer<W: Write, F: AvroFormat> {
@@ -144,8 +128,8 @@ pub type AvroStreamWriter<W> = Writer<W, AvroBinaryFormat>;
 
 impl<W: Write> Writer<W, AvroOcfFormat> {
     /// Convenience constructor – same as
-    pub fn new(writer: W, schema: Arc<Schema>) -> Result<Self, ArrowError> {
-        WriterBuilder::new().build_ocf(writer, schema)
+    pub fn new(writer: W, schema: Schema) -> Result<Self, ArrowError> {
+        Ok(WriterBuilder::new(schema).build::<W, AvroOcfFormat>(writer))
     }
 
     /// Change the compression codec **after** construction.
@@ -163,8 +147,9 @@ impl<W: Write> Writer<W, AvroOcfFormat> {
 }
 
 impl<W: Write> Writer<W, AvroBinaryFormat> {
-    pub fn new(writer: W, schema: Arc<Schema>) -> Result<Self, ArrowError> {
-        WriterBuilder::new().build_stream(writer, schema)
+    /// Convenience constructor to create a new [`AvroStreamWriter`].
+    pub fn new(writer: W, schema: Schema) -> Result<Self, ArrowError> {
+        Ok(WriterBuilder::new(schema).build::<W, AvroBinaryFormat>(writer))
     }
 }
 
@@ -220,15 +205,11 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
     fn write_ocf_block(&mut self, batch: &RecordBatch, sync: &[u8; 16]) -> Result<(), ArrowError> {
         let mut buf = Vec::<u8>::with_capacity(1024);
         encode_record_batch(batch, &mut buf)?;
-        let (encoded, codec_name) = match self.compression {
-            Some(CompressionCodec::Deflate) => (compress_deflate(&buf)?, "deflate"),
-            Some(CompressionCodec::Snappy) => (compress_snappy(&buf)?, "snappy"),
-            Some(CompressionCodec::Xz) => (compress_zstd(&buf)?, "zstandard"),
-            None => (buf, "null"),
-            Some(CompressionCodec::ZStandard) | Some(CompressionCodec::Bzip2) => todo!(),
+        let encoded = match self.compression {
+            Some(codec) => codec.compress(&buf)?,
+            None => buf,
         };
-        let count = batch.num_rows() as i64;
-        write_long(&mut self.writer, count)?;
+        write_long(&mut self.writer, batch.num_rows() as i64)?;
         write_long(&mut self.writer, encoded.len() as i64)?;
         self.writer
             .write_all(&encoded)
@@ -244,67 +225,172 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
     }
 }
 
-fn compress_deflate(input: &[u8]) -> Result<Vec<u8>, ArrowError> {
-    #[cfg(feature = "deflate")]
-    {
-        use flate2::{write::DeflateEncoder, Compression};
-        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(input)
-            .map_err(|e| ArrowError::IoError(format!("deflate write error: {e}"), e))?;
-        enc.finish()
-            .map_err(|e| ArrowError::IoError(format!("deflate finish: {e}"), e))
-    }
-    #[cfg(not(feature = "deflate"))]
-    {
-        Err(ArrowError::InvalidArgument(
-            "deflate codec support not enabled – activate the `deflate` \
-             Cargo feature"
-                .into(),
-        ))
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
 
-fn compress_snappy(input: &[u8]) -> Result<Vec<u8>, ArrowError> {
-    #[cfg(feature = "snappy")]
-    {
-        use crc32fast::Hasher;
-        use snap::raw::{max_compress_len, Encoder};
-
-        let mut enc = Encoder::new();
-        let mut out = Vec::with_capacity(max_compress_len(input.len()) + 4);
-        enc.compress_vec(input)
-            .map_err(|e| ArrowError::ExternalError(format!("snappy compression: {e}").into()))?;
-
-        // Avro spec: append 4‑byte big‑endian CRC32 of *uncompressed* data
-        let mut hasher = Hasher::new();
-        hasher.update(input);
-        let crc = hasher.finalize();
-        out.extend_from_slice(&crc.to_be_bytes());
-
-        Ok(out)
+    fn make_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ])
     }
-    #[cfg(not(feature = "snappy"))]
-    {
-        Err(ArrowError::InvalidArgument(
-            "snappy codec support not enabled – activate the `snappy` \
-             Cargo feature"
-                .into(),
-        ))
-    }
-}
 
-fn compress_zstd(input: &[u8]) -> Result<Vec<u8>, ArrowError> {
-    #[cfg(feature = "zstd")]
-    {
-        zstd::stream::encode_all(input, /*level*/ 0)
-            .map_err(|e| ArrowError::ExternalError(format!("zstd compression: {e}").into()))
+    fn make_batch() -> RecordBatch {
+        let ids = Int32Array::from(vec![1, 2, 3]);
+        let names = StringArray::from(vec!["a", "b", "c"]);
+        RecordBatch::try_new(
+            Arc::new(make_schema()),
+            vec![Arc::new(ids) as ArrayRef, Arc::new(names)],
+        )
+        .expect("failed to build test RecordBatch")
     }
-    #[cfg(not(feature = "zstd"))]
-    {
-        Err(ArrowError::InvalidArgument(
-            "zstd codec support not enabled – activate the `zstd` \
-             Cargo feature"
-                .into(),
-        ))
+
+    fn contains_ascii(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn test_ocf_writer_generates_header_and_sync() -> Result<(), ArrowError> {
+        let batch = make_batch();
+        let buffer: Vec<u8> = Vec::new();
+        let mut writer = AvroWriter::new(buffer, make_schema())?;
+        writer.write(&batch)?;
+        writer.finish()?; // flush
+        let out = writer.into_inner();
+        assert_eq!(&out[..4], b"Obj\x01", "OCF magic bytes missing/incorrect");
+        let sync = AvroWriter::new(Vec::new(), make_schema())?
+            .sync_marker()
+            .cloned();
+        let trailer = &out[out.len() - 16..];
+        assert_eq!(trailer.len(), 16, "expected 16‑byte sync marker");
+        let _ = sync;
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_writer_has_no_header() -> Result<(), ArrowError> {
+        let batch = make_batch();
+        let buffer = Vec::<u8>::new();
+        let mut writer = AvroStreamWriter::new(buffer, make_schema())?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        let out = writer.into_inner();
+        assert_ne!(&out[..4], b"Obj\x01", "stream must not contain OCF header");
+        assert!(!out.is_empty(), "stream output unexpectedly empty");
+        Ok(())
+    }
+
+    #[test]
+    fn test_schema_mismatch_yields_error() {
+        let batch = make_batch();
+        let alt_schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let buffer = Vec::<u8>::new();
+        let mut writer = AvroWriter::new(buffer, alt_schema).unwrap();
+        let err = writer.write(&batch).unwrap_err();
+        assert!(matches!(err, ArrowError::SchemaError(_)));
+    }
+
+    #[test]
+    fn test_write_batches_accumulates_multiple() -> Result<(), ArrowError> {
+        let batch1 = make_batch();
+        let batch2 = make_batch();
+        let buffer = Vec::<u8>::new();
+        let mut writer = AvroWriter::new(buffer, make_schema())?;
+        writer.write_batches(&[&batch1, &batch2])?;
+        writer.finish()?;
+        let out = writer.into_inner();
+        assert!(out.len() > 4, "combined batches produced tiny file");
+        Ok(())
+    }
+
+    #[test]
+    fn test_finish_without_write_adds_header() -> Result<(), ArrowError> {
+        let buffer = Vec::<u8>::new();
+        let mut writer = AvroWriter::new(buffer, make_schema())?;
+        writer.finish()?;
+        let out = writer.into_inner();
+        assert_eq!(&out[..4], b"Obj\x01", "finish() should emit OCF header");
+        Ok(())
+    }
+
+    #[test]
+    fn test_into_inner_returns_underlying_writer() -> Result<(), ArrowError> {
+        let batch = make_batch();
+        let buffer = Vec::<u8>::new();
+        let mut writer = AvroWriter::new(buffer, make_schema())?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        let buf = writer.into_inner();
+        assert!(!buf.is_empty(), "into_inner returned empty buffer");
+        Ok(())
+    }
+
+    #[cfg(all(feature = "deflate"))]
+    #[test]
+    fn test_deflate_compression_codec() -> Result<(), ArrowError> {
+        let batch = make_batch();
+        let buffer = Vec::<u8>::new();
+        let mut writer = AvroWriter::new(buffer, make_schema())?
+            .with_compression(Some(CompressionCodec::Deflate));
+        writer.write(&batch)?;
+        writer.finish()?;
+        let out = writer.into_inner();
+        assert!(
+            contains_ascii(&out, b"deflate"),
+            "OCF header must advertise deflate codec"
+        );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "snappy"))]
+    #[test]
+    fn test_snappy_compression_codec() -> Result<(), ArrowError> {
+        let batch = make_batch();
+        let buffer = Vec::<u8>::new();
+        let mut writer = AvroWriter::new(buffer, make_schema())?
+            .with_compression(Some(CompressionCodec::Snappy));
+        writer.write(&batch)?;
+        writer.finish()?;
+        let out = writer.into_inner();
+        assert!(
+            contains_ascii(&out, b"snappy"),
+            "OCF header must advertise snappy codec"
+        );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "zstd"))]
+    #[test]
+    fn test_zstd_compression_codec() -> Result<(), ArrowError> {
+        let batch = make_batch();
+        let buffer = Vec::<u8>::new();
+        let mut writer = AvroWriter::new(buffer, make_schema())?
+            .with_compression(Some(CompressionCodec::ZStandard));
+        writer.write(&batch)?;
+        writer.finish()?;
+        let out = writer.into_inner();
+        assert!(
+            contains_ascii(&out, b"zstandard"),
+            "OCF header must advertise zstandard codec"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_long_encodes_zigzag_varint() -> Result<(), ArrowError> {
+        let mut buf = Vec::new();
+        write_long(&mut buf, 0)?;
+        write_long(&mut buf, -1)?;
+        write_long(&mut buf, 1)?;
+        write_long(&mut buf, -2)?;
+        write_long(&mut buf, 2147483647)?;
+        assert!(
+            buf.starts_with(&[0x00, 0x01, 0x02, 0x03]),
+            "zig‑zag varint encodings incorrect: {buf:?}"
+        );
+        Ok(())
     }
 }

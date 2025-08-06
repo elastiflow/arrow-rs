@@ -18,12 +18,11 @@
 use std::fmt::Debug;
 use std::io::Write;
 
+use crate::schema::AvroSchema;
+use crate::writer::encoder::write_long;
+use crate::writer::CompressionCodec;
 use arrow_schema::{ArrowError, Schema};
 use rand::Rng;
-
-use crate::writer::encoder::write_long;
-use crate::writer::schema::to_avro_schema_json;
-use crate::writer::CompressionCodec;
 
 /// Format abstraction implemented by each container‐level writer.
 ///
@@ -70,20 +69,21 @@ impl AvroFormat for AvroOcfFormat {
         compression: Option<CompressionCodec>,
     ) -> Result<(), ArrowError> {
         rand::rng().fill(&mut self.sync_marker);
-        let schema_json = to_avro_schema_json(schema, compression)?;
+        let avro_schema = AvroSchema::try_from(schema)?;
         writer
             .write_all(b"Obj\x01")
             .map_err(|e| ArrowError::IoError(format!("write magic: {e}"), e))?;
         let codec_str = match compression {
             Some(CompressionCodec::Deflate) => "deflate",
             Some(CompressionCodec::Snappy) => "snappy",
+            Some(CompressionCodec::ZStandard) => "zstandard",
+            Some(CompressionCodec::Bzip2) => "bzip2",
             Some(CompressionCodec::Xz) => "xz",
-            None => "",
-            Some(CompressionCodec::ZStandard) | Some(CompressionCodec::Bzip2) => todo!(),
+            None => "null",
         };
         write_long(writer, 2)?;
         write_string(writer, "avro.schema")?;
-        write_bytes(writer, schema_json.as_bytes())?;
+        write_bytes(writer, avro_schema.json_string.as_bytes())?;
         write_string(writer, "avro.codec")?;
         write_bytes(writer, codec_str.as_bytes())?;
         write_long(writer, 0)?;
