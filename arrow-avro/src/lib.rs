@@ -50,6 +50,11 @@ pub mod compression;
 /// Avro data types and Arrow data types.
 pub mod codec;
 
+/// Core functionality for writing Arrow arrays into Avro data.
+///
+/// Implements the primary reader interface and record decoding logic.
+pub mod writer;
+
 /// Extension trait for AvroField to add Utf8View support
 ///
 /// This trait adds methods for working with Utf8View support to the AvroField struct.
