@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use crate::compression::CompressionCodec;
 use crate::schema::AvroSchema;
 use crate::writer::encoder::{write_long, EncoderOptions};
@@ -93,12 +94,10 @@ impl AvroFormat for AvroOcfFormat {
         compression: Option<CompressionCodec>,
     ) -> Result<(), ArrowError> {
         // Generate a fresh 16‑byte sync marker
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         rng.fill_bytes(&mut self.sync_marker);
-
         // Build the Avro schema JSON from the Arrow schema
         let avro_schema = AvroSchema::try_from(schema)?;
-
         // Optionally rewrite union ordering for nullable fields to match encoding behavior.
         // When `impala_mode` is true: ensure ["<type>", "null"] ordering everywhere.
         // Otherwise we leave the JSON as produced (typically ["null", "<type>"]).
@@ -110,12 +109,10 @@ impl AvroFormat for AvroOcfFormat {
         } else {
             avro_schema.json_string
         };
-
         // 1) Magic: "Obj\x01"
         writer
             .write_all(b"Obj\x01")
             .map_err(|e| ArrowError::IoError(format!("write OCF magic: {e}"), e))?;
-
         // 2) Metadata map (encoded as Avro map: one positive-length block then 0)
         // Keys are strings; values are bytes. We write exactly two entries:
         // "avro.schema" -> <schema json utf-8>
@@ -129,7 +126,6 @@ impl AvroFormat for AvroOcfFormat {
             Some(CompressionCodec::Xz) => "xz",
             None => "null",
         };
-
         // Map block count = 2
         write_long(writer, 2)?;
         write_string(writer, "avro.schema")?;
@@ -138,7 +134,6 @@ impl AvroFormat for AvroOcfFormat {
         write_bytes(writer, codec_str.as_bytes())?;
         // Map terminator
         write_long(writer, 0)?;
-
         // 3) Sync marker (16 bytes)
         writer
             .write_all(&self.sync_marker)

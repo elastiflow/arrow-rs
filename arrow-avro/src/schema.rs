@@ -46,6 +46,9 @@ pub const AVRO_NAMESPACE_METADATA_KEY: &str = "avro.namespace";
 /// Metadata key used to store the documentation for a type in an Avro schema.
 pub const AVRO_DOC_METADATA_KEY: &str = "avro.doc";
 
+/// Controls nullable union ordering. Accepts "first" or "second".
+pub const AVRO_NULL_ORDER_METADATA_KEY: &str = "avro.null.order";
+
 /// Compare two Avro schemas for equality (identical schemas).
 /// Returns true if the schemas have the same parsing canonical form (i.e., logically identical).
 pub fn compare_schemas(writer: &Schema, reader: &Schema) -> Result<bool, ArrowError> {
@@ -310,10 +313,13 @@ impl TryFrom<&ArrowSchema> for AvroSchema {
             return Ok(AvroSchema::new(json.clone()));
         }
         let mut name_gen = NameGenerator::default();
+        let encode_opts = SchemaEncodeOptions {
+            null_second: infer_null_second(&schema.metadata),
+        };
         let fields_json = schema
             .fields()
             .iter()
-            .map(|f| arrow_field_to_avro(f, &mut name_gen))
+            .map(|f| arrow_field_to_avro(f, &mut name_gen, &encode_opts))
             .collect::<Result<Vec<_>, _>>()?;
         // Assemble top‑level record
         let record_name = schema
@@ -790,12 +796,35 @@ fn merge_extras(schema: Value, mut extras: JsonMap<String, Value>) -> Value {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct SchemaEncodeOptions {
+    null_second: bool,
+}
+
+fn parse_null_second_flag<S: AsRef<str>>(v: S) -> bool {
+    let v = v.as_ref().to_ascii_lowercase();
+    matches!(
+        v.as_str(),
+        "second" | "value_first" | "impala" | "true" | "1"
+    )
+}
+
+fn infer_null_second(meta: &HashMap<String, String>) -> bool {
+    if let Some(v) = meta.get(AVRO_NULL_ORDER_METADATA_KEY) {
+        if parse_null_second_flag(v) {
+            return true;
+        }
+    }
+    false
+}
+
 // Convert an Arrow `DataType` into an Avro schema `Value`.
 fn datatype_to_avro(
     dt: &DataType,
     field_name: &str,
     metadata: &HashMap<String, String>,
     name_gen: &mut NameGenerator,
+    encode_opts: &SchemaEncodeOptions,
 ) -> Result<(Value, JsonMap<String, Value>), ArrowError> {
     let mut extras = JsonMap::new();
     let val = match dt {
@@ -909,8 +938,13 @@ fn datatype_to_avro(
             if matches!(dt, DataType::LargeList(_)) {
                 extras.insert("arrowLargeList".into(), Value::Bool(true));
             }
-            let (items, ie) =
-                datatype_to_avro(child.data_type(), child.name(), child.metadata(), name_gen)?;
+            let (items, ie) = datatype_to_avro(
+                child.data_type(),
+                child.name(),
+                child.metadata(),
+                name_gen,
+                encode_opts,
+            )?;
             json!({
                 "type": "array",
                 "items": merge_extras(items, ie)
@@ -918,8 +952,13 @@ fn datatype_to_avro(
         }
         DataType::FixedSizeList(child, len) => {
             extras.insert("arrowFixedSize".into(), json!(len));
-            let (items, ie) =
-                datatype_to_avro(child.data_type(), child.name(), child.metadata(), name_gen)?;
+            let (items, ie) = datatype_to_avro(
+                child.data_type(),
+                child.name(),
+                child.metadata(),
+                name_gen,
+                encode_opts,
+            )?;
             json!({
                 "type": "array",
                 "items": merge_extras(items, ie)
@@ -939,6 +978,7 @@ fn datatype_to_avro(
                 value_field.name(),
                 value_field.metadata(),
                 name_gen,
+                encode_opts,
             )?;
             json!({
                 "type": "map",
@@ -948,7 +988,7 @@ fn datatype_to_avro(
         DataType::Struct(fields) => {
             let avro_fields = fields
                 .iter()
-                .map(|field| arrow_field_to_avro(field, name_gen))
+                .map(|field| arrow_field_to_avro(field, name_gen, encode_opts))
                 .collect::<Result<Vec<_>, _>>()?;
             json!({
                 "type": "record",
@@ -966,7 +1006,8 @@ fn datatype_to_avro(
                     "symbols": symbols
                 })
             } else {
-                let (inner, ie) = datatype_to_avro(value.as_ref(), field_name, metadata, name_gen)?;
+                let (inner, ie) =
+                    datatype_to_avro(value.as_ref(), field_name, metadata, name_gen, encode_opts)?;
                 merge_extras(inner, ie)
             }
         }
@@ -976,6 +1017,7 @@ fn datatype_to_avro(
                 values.name(),
                 values.metadata(),
                 name_gen,
+                encode_opts,
             )?;
             merge_extras(inner, ie)
         }
@@ -996,11 +1038,23 @@ fn datatype_to_avro(
 fn arrow_field_to_avro(
     field: &ArrowField,
     name_gen: &mut NameGenerator,
+    encode_opts: &SchemaEncodeOptions,
 ) -> Result<Value, ArrowError> {
     // Sanitize field name to ensure Avro validity but store the original in metadata
     let avro_name = sanitise_avro_name(field.name());
-    let (schema, extras) =
-        datatype_to_avro(field.data_type(), &avro_name, field.metadata(), name_gen)?;
+    let (schema, extras) = datatype_to_avro(
+        field.data_type(),
+        &avro_name,
+        field.metadata(),
+        name_gen,
+        encode_opts,
+    )?;
+    let field_null_second = infer_null_second(field.metadata());
+    let use_null_second = if field_null_second {
+        true
+    } else {
+        encode_opts.null_second
+    };
     // If nullable, wrap `[ "null", <type> ]`, NOTE: second order nullability to be added in a follow-up
     let mut schema = if field.is_nullable() {
         Value::Array(vec![
