@@ -198,8 +198,8 @@ pub struct Field<'a> {
     #[serde(borrow)]
     pub r#type: Schema<'a>,
     /// Optional default value for this field
-    #[serde(borrow, default)]
-    pub default: Option<&'a str>,
+    #[serde(default)]
+    pub default: Option<Value>,
 }
 
 /// An enumeration
