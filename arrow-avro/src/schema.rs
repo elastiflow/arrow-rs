@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
 use arrow_schema::{
     ArrowError, DataType, Field as ArrowField, IntervalUnit, Schema as ArrowSchema, TimeUnit,
 };
@@ -909,20 +908,35 @@ fn datatype_to_avro(
             if matches!(dt, DataType::LargeList(_)) {
                 extras.insert("arrowLargeList".into(), Value::Bool(true));
             }
-            let (items, ie) =
+            // Build Avro items schema; if the item Field is nullable, wrap it
+            // in a union with "null" to reflect second-order nullability.
+            let (items_inner, ie) =
                 datatype_to_avro(child.data_type(), child.name(), child.metadata(), name_gen)?;
+            let items_with_meta = merge_extras(items_inner, ie);
+            let items_schema = if child.is_nullable() {
+                Value::Array(vec![Value::String("null".into()), items_with_meta])
+            } else {
+                items_with_meta
+            };
             json!({
                 "type": "array",
-                "items": merge_extras(items, ie)
+                "items": items_schema
             })
         }
         DataType::FixedSizeList(child, len) => {
             extras.insert("arrowFixedSize".into(), json!(len));
-            let (items, ie) =
+            // Same nullability semantics as List: union-wrap nullable items.
+            let (items_inner, ie) =
                 datatype_to_avro(child.data_type(), child.name(), child.metadata(), name_gen)?;
+            let items_with_meta = merge_extras(items_inner, ie);
+            let items_schema = if child.is_nullable() {
+                Value::Array(vec![Value::String("null".into()), items_with_meta])
+            } else {
+                items_with_meta
+            };
             json!({
                 "type": "array",
-                "items": merge_extras(items, ie)
+                "items": items_schema
             })
         }
         DataType::Map(entries, _) => {
@@ -940,9 +954,15 @@ fn datatype_to_avro(
                 value_field.metadata(),
                 name_gen,
             )?;
+            let values_with_meta = merge_extras(val_schema, value_entry);
+            let values_schema = if value_field.is_nullable() {
+                Value::Array(vec![Value::String("null".into()), values_with_meta])
+            } else {
+                values_with_meta
+            };
             json!({
                 "type": "map",
-                "values": merge_extras(val_schema, value_entry)
+                "values": values_schema
             })
         }
         DataType::Struct(fields) => {
@@ -1001,7 +1021,8 @@ fn arrow_field_to_avro(
     let avro_name = sanitise_avro_name(field.name());
     let (schema, extras) =
         datatype_to_avro(field.data_type(), &avro_name, field.metadata(), name_gen)?;
-    // If nullable, wrap `[ "null", <type> ]`, NOTE: second order nullability to be added in a follow-up
+    // If nullable, wrap `[ "null", <type> ]`; second‑order nullability is handled
+    // inside `datatype_to_avro` for list/map child fields.
     let mut schema = if field.is_nullable() {
         Value::Array(vec![
             Value::String("null".into()),
