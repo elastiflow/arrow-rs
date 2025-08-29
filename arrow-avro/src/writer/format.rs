@@ -43,7 +43,7 @@ pub trait AvroFormat: Debug + Default {
     /// little‑endian schema fingerprint) to be written **before each record**,
     /// or `None` if the format does not use single‑object encoding.
     ///
-    /// Default implementation returns `None`. `AvroBinaryFormat` overrides this
+    /// The default implementation returns `None`. `AvroBinaryFormat` overrides this
     /// to return `Some(&[u8; 10])`.
     #[inline]
     fn single_object_prefix(&self) -> Option<&[u8; 10]> {

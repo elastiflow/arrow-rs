@@ -8,7 +8,6 @@ use arrow_array::{
     PrimitiveArray, RecordBatch, StructArray,
 };
 use arrow_buffer::NullBuffer;
-use arrow_schema::DataType::{Duration as ADuration, Interval};
 use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, TimeUnit};
 use std::io::Write;
 use uuid::Uuid;
@@ -72,19 +71,111 @@ fn write_bool<W: Write + ?Sized>(writer: &mut W, v: bool) -> Result<(), ArrowErr
 ///
 /// Spec says to write an **int** value for union position.
 /// See: https://avro.apache.org/docs/1.11.1/specification/#unions
+///
+/// Micro-optimization: for optional fields our union index is always either
+/// 0 or 1, whose ZigZag+varint encodings are single bytes: `0x00` and `0x02`
+/// respectively. We therefore write those bytes directly
 #[inline]
 fn write_optional_branch<W: Write + ?Sized>(
     writer: &mut W,
     is_null: bool,
     impala_mode: bool,
 ) -> Result<(), ArrowError> {
-    let branch = if impala_mode == is_null { 1 } else { 0 };
-    write_int(writer, branch)
+    // branch = 0 or 1
+    //   default (null-first): is_null ? 0 : 1
+    //   impala (null-second): is_null ? 1 : 0
+    // ZigZag(int) one-byte encodings:
+    //   0 -> 0x00,  1 -> 0x02
+    let branch_is_one = impala_mode == is_null;
+    let byte = if branch_is_one { 0x02 } else { 0x00 };
+    writer
+        .write_all(&[byte])
+        .map_err(|e| ArrowError::IoError(format!("write union branch: {e}"), e))
 }
 
 /// Encode a `RecordBatch` in Avro binary format using **default options**.
 pub fn encode_record_batch<W: Write>(batch: &RecordBatch, out: &mut W) -> Result<(), ArrowError> {
     encode_record_batch_with_options(batch, out, &EncoderOptions::default())
+}
+
+/// Internal representation of a prepared column encoder for a record batch.
+/// This lets us cache per-column properties (nullability, presence of any
+/// nulls, and the encoder itself) once, and reuse them across all rows.
+struct ColumnEncoder<'a> {
+    is_nullable: bool,
+    has_nulls: bool,
+    enc: NullableEncoder<'a>,
+}
+
+/// Build encoders for all columns in `batch` once, honoring each `Field`'s
+/// metadata to select the appropriate logical encoding (e.g. UUID vs fixed).
+#[inline]
+fn prepare_encoders_for_batch(
+    batch: &'_ RecordBatch,
+) -> Result<Vec<ColumnEncoder<'_>>, ArrowError> {
+    let schema = batch.schema();
+    let fields = schema.fields();
+
+    let cols = fields
+        .iter()
+        .zip(batch.columns())
+        .map(|(field_ref, array)| {
+            let field: &Field = field_ref.as_ref();
+            let enc = make_encoder(array.as_ref(), field)?;
+            Ok::<_, ArrowError>(ColumnEncoder {
+                is_nullable: field.is_nullable(),
+                has_nulls: enc.has_nulls(),
+                enc,
+            })
+        })
+        .collect::<Result<Vec<_>, ArrowError>>()?;
+
+    Ok(cols)
+}
+
+/// Encode `rows` rows by iterating columns and writing values for each row.
+/// A `per_row_prefix` callback can inject data *before* each record (used by
+/// the Avro single-object encoding to write the 10-byte prefix).
+#[inline]
+fn encode_rows_with_prefix<W: Write>(
+    rows: usize,
+    cols: &mut [ColumnEncoder<'_>],
+    out: &mut W,
+    opts: &EncoderOptions,
+    mut per_row_prefix: impl FnMut(&mut W, usize) -> Result<(), ArrowError>,
+) -> Result<(), ArrowError> {
+    // Precompute the byte to write for the "value" branch when a nullable
+    // column has *no* nulls (0x00 for Impala [index 0], 0x02 otherwise).
+    let value_branch_byte: u8 = if opts.impala_mode { 0x00 } else { 0x02 };
+
+    for row in 0..rows {
+        // Optional pre-record bytes (e.g., single-object prefix)
+        per_row_prefix(out, row)?;
+
+        for ColumnEncoder {
+            is_nullable,
+            has_nulls,
+            enc,
+        } in cols.iter_mut()
+        {
+            if *is_nullable {
+                if *has_nulls {
+                    let is_null = enc.is_null(row);
+                    write_optional_branch(out, is_null, opts.impala_mode)?;
+                    if is_null {
+                        continue;
+                    }
+                } else {
+                    // Nullable field with no nulls in the column: always the "value" branch.
+                    out.write_all(&[value_branch_byte]).map_err(|e| {
+                        ArrowError::IoError(format!("write union value branch: {e}"), e)
+                    })?;
+                }
+            }
+            enc.encode(row, out)?;
+        }
+    }
+    Ok(())
 }
 
 /// Encode a `RecordBatch` with explicit `EncoderOptions`.
@@ -93,37 +184,8 @@ pub fn encode_record_batch_with_options<W: Write>(
     out: &mut W,
     opts: &EncoderOptions,
 ) -> Result<(), ArrowError> {
-    let schema = batch.schema();
-    let fields = schema.fields();
-    // Build per-column encoders once.
-    let mut encoders = fields
-        .iter()
-        .zip(batch.columns())
-        .map(|(field_ref, array)| {
-            let field: &Field = field_ref.as_ref();
-            let enc = make_encoder(array.as_ref(), field)?;
-            Ok::<_, ArrowError>((field.is_nullable(), enc))
-        })
-        .collect::<Result<Vec<_>, ArrowError>>()?;
-    // Precompute the "value" branch for nullable fields (0 if Impala-mode, else 1)
-    let value_branch: i32 = if opts.impala_mode { 0 } else { 1 };
-    (0..batch.num_rows()).try_for_each(|row| {
-        encoders.iter_mut().try_for_each(|(is_nullable, enc)| {
-            if *is_nullable {
-                if enc.has_nulls() {
-                    let is_null = enc.is_null(row);
-                    write_optional_branch(out, is_null, opts.impala_mode)?;
-                    if is_null {
-                        return Ok(());
-                    }
-                } else {
-                    // Column is nullable but has no nulls; skip per-row null checks
-                    write_int(out, value_branch)?;
-                }
-            }
-            enc.encode(row, out)
-        })
-    })
+    let mut cols = prepare_encoders_for_batch(batch)?;
+    encode_rows_with_prefix(batch.num_rows(), &mut cols, out, opts, |_w, _row| Ok(()))
 }
 
 /// Encode a `RecordBatch` as a stream of Avro **single-object encodings**,
@@ -139,46 +201,21 @@ pub fn encode_record_batch_single_object_with_options<W: Write>(
     prefix: &[u8; 10],
     opts: &EncoderOptions,
 ) -> Result<(), ArrowError> {
-    let schema = batch.schema();
-    let fields = schema.fields();
-    // Build per-column encoders once.
-    let mut encoders = fields
-        .iter()
-        .zip(batch.columns())
-        .map(|(field_ref, array)| {
-            let field: &Field = field_ref.as_ref();
-            let enc = make_encoder(array.as_ref(), field)?;
-            Ok::<_, ArrowError>((field.is_nullable(), enc))
-        })
-        .collect::<Result<Vec<_>, ArrowError>>()?;
-
-    // Precompute the "value" branch for nullable fields (0 if Impala-mode, else 1)
-    let value_branch: i32 = if opts.impala_mode { 0 } else { 1 };
-
-    (0..batch.num_rows()).try_for_each(|row| {
-        // Write the single-object 10-byte header for this record:
-        //   0..2  : 0xC3, 0x01
-        //   2..10 : little-endian CRC-64-AVRO schema fingerprint
-        out.write_all(prefix).map_err(|e| {
-            ArrowError::IoError(format!("write single-object prefix: {e}"), e)
-        })?;
-
-        encoders.iter_mut().try_for_each(|(is_nullable, enc)| {
-            if *is_nullable {
-                if enc.has_nulls() {
-                    let is_null = enc.is_null(row);
-                    write_optional_branch(out, is_null, opts.impala_mode)?;
-                    if is_null {
-                        return Ok(());
-                    }
-                } else {
-                    // Column is nullable but has no nulls; skip per-row null checks
-                    write_int(out, value_branch)?;
-                }
-            }
-            enc.encode(row, out)
-        })
-    })
+    let mut cols = prepare_encoders_for_batch(batch)?;
+    encode_rows_with_prefix(
+        batch.num_rows(),
+        &mut cols,
+        out,
+        opts,
+        |w, _row| {
+            // Write the single-object 10-byte header for this record:
+            //   0..2  : 0xC3, 0x01
+            //   2..10 : little-endian CRC-64-AVRO schema fingerprint
+            w.write_all(prefix).map_err(|e| {
+                ArrowError::IoError(format!("write single-object prefix: {e}"), e)
+            })
+        },
+    )
 }
 
 /// Same as [`encode_record_batch_single_object_with_options`] with default encoder options.
@@ -313,7 +350,7 @@ pub fn make_encoder<'a>(
                 NullableEncoder::new(Encoder::Fixed(FixedEncoder(arr)), nulls, has_nulls)
             }
         }
-        Interval(IntervalUnit::MonthDayNano) => {
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
             let arr = array.as_primitive::<IntervalMonthDayNanoType>();
             NullableEncoder::new(
                 Encoder::IntervalMonthDayNano(IntervalMonthDayNanoEncoder(arr)),
@@ -321,12 +358,12 @@ pub fn make_encoder<'a>(
                 has_nulls,
             )
         }
-        Interval(unit) => {
+        DataType::Interval(unit) => {
             return Err(ArrowError::NotYetImplemented(format!(
                 "Avro writer: Interval({unit:?}) is not supported; cast to Interval(MonthDayNano) to write Avro 'duration'"
             )));
         }
-        ADuration(_) => {
+        DataType::Duration(_) => {
             return Err(ArrowError::NotYetImplemented(
                 "Avro writer: Arrow Duration(TimeUnit) has no standard Avro mapping; cast to Interval(MonthDayNano) to use Avro 'duration'".into(),
             ));
