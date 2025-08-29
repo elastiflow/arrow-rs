@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::compression::{CompressionCodec, CODEC_METADATA_KEY};
-use crate::schema::{AvroSchema, SCHEMA_METADATA_KEY};
+use crate::schema::{AvroSchema, Fingerprint, SCHEMA_METADATA_KEY, SINGLE_OBJECT_MAGIC};
 use crate::writer::encoder::{write_long, EncoderOptions};
 use arrow_schema::{ArrowError, Schema};
 use rand::RngCore;
@@ -38,6 +38,17 @@ pub trait AvroFormat: Debug + Default {
 
     /// Return the 16‑byte sync marker (OCF) or `None` (binary stream).
     fn sync_marker(&self) -> Option<&[u8; 16]>;
+
+    /// Return the 10‑byte **Avro single‑object** prefix (`C3 01` magic + 8‑byte
+    /// little‑endian schema fingerprint) to be written **before each record**,
+    /// or `None` if the format does not use single‑object encoding.
+    ///
+    /// Default implementation returns `None`. `AvroBinaryFormat` overrides this
+    /// to return `Some(&[u8; 10])`.
+    #[inline]
+    fn single_object_prefix(&self) -> Option<&[u8; 10]> {
+        None
+    }
 }
 
 /// Avro Object Container File (OCF) format writer.
@@ -104,24 +115,86 @@ impl AvroFormat for AvroOcfFormat {
     }
 }
 
-/// Raw Avro binary streaming format (no header or footer).
+/// Raw Avro binary streaming format using **Single-Object Encoding** per record.
+///
+/// Each record written by the stream writer is framed as:
+///   * 2-byte magic: `0xC3, 0x01` (Avro single-object version 1)
+///   * 8-byte little-endian CRC-64-AVRO fingerprint of the Avro schema
+///   * Avro-encoded record bytes
+///
+/// See: <https://avro.apache.org/docs/1.11.1/specification/#single-object-encoding>
 #[derive(Debug, Default)]
-pub struct AvroBinaryFormat;
+pub struct AvroBinaryFormat {
+    /// Pre-built 10-byte single-object prefix written before each record.
+    /// [0..2) = magic, [2..10) = schema fingerprint (little endian)
+    prefix: [u8; 10],
+    /// Encoder behavior knobs (currently unused by the format layer, but kept
+    /// for symmetry with OCF and potential future use).
+    encoder_options: EncoderOptions,
+}
+
+impl AvroBinaryFormat {
+    /// Optional helper to attach encoder options (i.e., Impala null-second) to the format.
+    #[allow(dead_code)]
+    pub fn with_encoder_options(mut self, opts: EncoderOptions) -> Self {
+        self.encoder_options = opts;
+        self
+    }
+
+    /// Returns the 10-byte prefix (`C3 01` + fingerprint) to be written before each record.
+    #[inline]
+    pub fn prefix(&self) -> &[u8; 10] {
+        &self.prefix
+    }
+
+    /// Returns the 8-byte little-endian schema fingerprint portion of the prefix.
+    #[allow(dead_code)]
+    #[inline]
+    pub fn schema_fingerprint(&self) -> [u8; 8] {
+        let mut fp = [0u8; 8];
+        fp.copy_from_slice(&self.prefix[2..10]);
+        fp
+    }
+
+    /// Access the encoder options used by this format.
+    #[allow(dead_code)]
+    #[inline]
+    pub fn encoder_options(&self) -> &EncoderOptions {
+        &self.encoder_options
+    }
+}
 
 impl AvroFormat for AvroBinaryFormat {
     fn start_stream<W: Write>(
         &mut self,
         _writer: &mut W,
-        _schema: &Schema,
-        _compression: Option<CompressionCodec>,
+        schema: &Schema,
+        compression: Option<CompressionCodec>,
     ) -> Result<(), ArrowError> {
-        Err(ArrowError::NotYetImplemented(
-            "avro binary format not yet implemented".to_string(),
-        ))
+        // Avro single-object encoding does **not** support per-record compression.
+        if compression.is_some() {
+            return Err(ArrowError::InvalidArgumentError(
+                "Compression not supported for Avro binary streaming (single-object encoding)".to_string(),
+            ));
+        }
+        // Compute and stash the schema fingerprint (CRC-64-AVRO) once.
+        let avro_schema = AvroSchema::try_from(schema)?;
+        let fp = match avro_schema.fingerprint()? {
+            Fingerprint::Rabin(v) => v.to_le_bytes(),
+        };
+        // Build the 10-byte prefix: magic (2) + fingerprint (8)
+        self.prefix[..2].copy_from_slice(&SINGLE_OBJECT_MAGIC);
+        self.prefix[2..].copy_from_slice(&fp);
+        Ok(())
     }
 
     fn sync_marker(&self) -> Option<&[u8; 16]> {
         None
+    }
+
+    #[inline]
+    fn single_object_prefix(&self) -> Option<&[u8; 10]> {
+        Some(&self.prefix)
     }
 }
 

@@ -88,7 +88,7 @@ fn write_bool<W: Write + ?Sized>(writer: &mut W, v: bool) -> Result<(), ArrowErr
 /// - Null-second (Impala): value => 0, null => 1
 ///
 /// Spec says to write an **int** value for union position.
-/// See: https://avro.apache.org/docs/1.11.0/spec.html#Unions
+/// See: https://avro.apache.org/docs/1.11.1/specification/#unions
 #[inline]
 fn write_optional_branch<W: Write + ?Sized>(
     writer: &mut W,
@@ -112,7 +112,6 @@ pub fn encode_record_batch_with_options<W: Write>(
 ) -> Result<(), ArrowError> {
     let schema = batch.schema();
     let fields = schema.fields();
-
     // Build per-column encoders once.
     let mut encoders = fields
         .iter()
@@ -123,10 +122,8 @@ pub fn encode_record_batch_with_options<W: Write>(
             Ok::<_, ArrowError>((field.is_nullable(), enc))
         })
         .collect::<Result<Vec<_>, ArrowError>>()?;
-
     // Precompute the "value" branch for nullable fields (0 if Impala-mode, else 1)
     let value_branch: i32 = if opts.impala_mode { 0 } else { 1 };
-
     (0..batch.num_rows()).try_for_each(|row| {
         encoders.iter_mut().try_for_each(|(is_nullable, enc)| {
             if *is_nullable {
@@ -144,6 +141,70 @@ pub fn encode_record_batch_with_options<W: Write>(
             enc.encode(row, out)
         })
     })
+}
+
+/// Encode a `RecordBatch` as a stream of Avro **single-object encodings**,
+/// writing the provided 10-byte `prefix` (magic + 8-byte fingerprint)
+/// **before each record**.
+///
+/// This uses the same binary value encoding as [`encode_record_batch_with_options`],
+/// but interposes the per-record single-object header defined by the Avro spec:
+/// <https://avro.apache.org/docs/1.11.1/specification/#single-object-encoding>
+pub fn encode_record_batch_single_object_with_options<W: Write>(
+    batch: &RecordBatch,
+    out: &mut W,
+    prefix: &[u8; 10],
+    opts: &EncoderOptions,
+) -> Result<(), ArrowError> {
+    let schema = batch.schema();
+    let fields = schema.fields();
+    // Build per-column encoders once.
+    let mut encoders = fields
+        .iter()
+        .zip(batch.columns())
+        .map(|(field_ref, array)| {
+            let field: &Field = field_ref.as_ref();
+            let enc = make_encoder(array.as_ref(), field)?;
+            Ok::<_, ArrowError>((field.is_nullable(), enc))
+        })
+        .collect::<Result<Vec<_>, ArrowError>>()?;
+
+    // Precompute the "value" branch for nullable fields (0 if Impala-mode, else 1)
+    let value_branch: i32 = if opts.impala_mode { 0 } else { 1 };
+
+    (0..batch.num_rows()).try_for_each(|row| {
+        // Write the single-object 10-byte header for this record:
+        //   0..2  : 0xC3, 0x01
+        //   2..10 : little-endian CRC-64-AVRO schema fingerprint
+        out.write_all(prefix).map_err(|e| {
+            ArrowError::IoError(format!("write single-object prefix: {e}"), e)
+        })?;
+
+        encoders.iter_mut().try_for_each(|(is_nullable, enc)| {
+            if *is_nullable {
+                if enc.has_nulls() {
+                    let is_null = enc.is_null(row);
+                    write_optional_branch(out, is_null, opts.impala_mode)?;
+                    if is_null {
+                        return Ok(());
+                    }
+                } else {
+                    // Column is nullable but has no nulls; skip per-row null checks
+                    write_int(out, value_branch)?;
+                }
+            }
+            enc.encode(row, out)
+        })
+    })
+}
+
+/// Same as [`encode_record_batch_single_object_with_options`] with default encoder options.
+pub fn encode_record_batch_single_object<W: Write>(
+    batch: &RecordBatch,
+    out: &mut W,
+    prefix: &[u8; 10],
+) -> Result<(), ArrowError> {
+    encode_record_batch_single_object_with_options(batch, out, prefix, &EncoderOptions::default())
 }
 
 /// An encoder + a null buffer for nullable fields.
@@ -196,7 +257,6 @@ pub fn make_encoder<'a>(
 ) -> Result<NullableEncoder<'a>, ArrowError> {
     let nulls = array.nulls().cloned();
     let has_nulls = array.null_count() > 0;
-
     let enc = match array.data_type() {
         DataType::Boolean => {
             let arr = array.as_boolean();
@@ -234,7 +294,6 @@ pub fn make_encoder<'a>(
             let arr = array.as_binary::<i64>();
             NullableEncoder::new(Encoder::LargeBinary(BinaryEncoder(arr)), nulls, has_nulls)
         }
-        // ---- FixedSizeBinary & UUID logical type -------------------------------------------
         DataType::FixedSizeBinary(len) => {
             // Decide between Avro `fixed` (raw bytes) and `uuid` logical string
             // based on Field metadata, mirroring schema generation rules.
@@ -251,7 +310,6 @@ pub fn make_encoder<'a>(
                 || (*len == 16
                 && md.get("ARROW:extension:name")
                 .is_some_and(|v| v == "uuid"));
-
             if is_uuid {
                 if *len != 16 {
                     return Err(ArrowError::InvalidArgumentError(
@@ -263,7 +321,6 @@ pub fn make_encoder<'a>(
                 NullableEncoder::new(Encoder::Fixed(FixedEncoder(arr)), nulls, has_nulls)
             }
         }
-        // ---- Interval / Duration (Avro `duration`) -----------------------------------------
         Interval(IntervalUnit::MonthDayNano) => {
             let arr = array.as_primitive::<IntervalMonthDayNanoType>();
             NullableEncoder::new(
@@ -282,7 +339,6 @@ pub fn make_encoder<'a>(
                 "Avro writer: Arrow Duration(TimeUnit) has no standard Avro mapping; cast to Interval(MonthDayNano) to use Avro 'duration'".into(),
             ));
         }
-        // ---- Lists / Structs ---------------------------------------------------------------
         DataType::List(_) => {
             let arr = array
                 .as_any()
@@ -307,12 +363,10 @@ pub fn make_encoder<'a>(
             let enc = StructEncoder::try_new(arr)?;
             NullableEncoder::new(Encoder::Struct(Box::new(enc)), nulls, has_nulls)
         }
-        // ---- Timestamps --------------------------------------------------------------------
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
             let arr = array.as_primitive::<TimestampMicrosecondType>();
             NullableEncoder::new(Encoder::Timestamp(LongEncoder(arr)), nulls, has_nulls)
         }
-        // ---- Fallback ----------------------------------------------------------------------
         other => {
             return Err(ArrowError::NotYetImplemented(format!(
                 "Unsupported data type for Avro encoding in slim build: {other:?}"
@@ -339,8 +393,6 @@ enum Encoder<'a> {
     IntervalMonthDayNano(IntervalMonthDayNanoEncoder<'a>),
     Utf8(Utf8Encoder<'a>),
     Utf8Large(Utf8LargeEncoder<'a>),
-
-    // Box only the recursive variants to keep the enum sized
     Struct(Box<StructEncoder<'a>>),
     List(Box<ListEncoder32<'a>>),
     LargeList(Box<ListEncoder64<'a>>),
@@ -436,8 +488,6 @@ impl UuidEncoder<'_> {
         }
         let u = Uuid::from_slice(v)
             .map_err(|e| ArrowError::InvalidArgumentError(format!("Invalid UUID bytes: {e}")))?;
-        // Format UUID into a fixed-size stack buffer to avoid allocation.
-        // Hyphenated form is 36 bytes.
         let mut tmp = [0u8; uuid::fmt::Hyphenated::LENGTH];
         let s = u.hyphenated().encode_lower(&mut tmp);
         write_len_prefixed(out, s.as_bytes())
@@ -454,7 +504,6 @@ impl IntervalMonthDayNanoEncoder<'_> {
     fn encode<W: Write + ?Sized>(&mut self, idx: usize, out: &mut W) -> Result<(), ArrowError> {
         let native = self.0.value(idx);
         let (months, days, nanos) = IntervalMonthDayNanoType::to_parts(native);
-
         // Validation per Avro 'duration' constraints: unsigned components, ms granularity
         if months < 0 || days < 0 || nanos < 0 {
             return Err(ArrowError::InvalidArgumentError(
@@ -467,14 +516,12 @@ impl IntervalMonthDayNanoEncoder<'_> {
                     .into(),
             ));
         }
-
         let millis = nanos / 1_000_000;
         if millis > u32::MAX as i64 {
             return Err(ArrowError::InvalidArgumentError(
                 "Avro 'duration' milliseconds exceed u32::MAX".into(),
             ));
         }
-
         let mut buf = [0u8; 12];
         buf[0..4].copy_from_slice(&(months as u32).to_le_bytes());
         buf[4..8].copy_from_slice(&(days as u32).to_le_bytes());
@@ -622,7 +669,6 @@ struct ListEncoder<'a, O: arrow_array::OffsetSizeTrait> {
     values_offset: usize,
 }
 
-// Keep your public surface the same via type aliases:
 type ListEncoder32<'a> = ListEncoder<'a, i32>;
 type ListEncoder64<'a> = ListEncoder<'a, i64>;
 
@@ -639,7 +685,6 @@ impl<'a, O: arrow_array::OffsetSizeTrait> ListEncoder<'a, O> {
                 ))
             }
         };
-
         // Build the encoder for the child values() array using the child field metadata
         let values_enc = make_encoder(list.values().as_ref(), child_field)?;
         Ok(Self {

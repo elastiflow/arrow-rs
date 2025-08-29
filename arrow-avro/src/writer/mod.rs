@@ -24,15 +24,17 @@
 //!     blocks, and sync markers.
 //! *   Use **`AvroStreamWriter`** (raw binary stream) when you already know the
 //!     schema out‑of‑band (i.e., via a schema registry) and need a stream
-//!     of Avro‑encoded records with minimal framing.
+//!     of Avro‑encoded records with minimal framing (Avro Single‑Object encoding
+//!     header per record).
 
 /// Encodes `RecordBatch` into the Avro binary format.
 pub mod encoder;
 /// Logic for different Avro container file formats.
 pub mod format;
-
 use crate::compression::CompressionCodec;
-use crate::writer::encoder::{encode_record_batch, write_long};
+use crate::writer::encoder::{
+    encode_record_batch, encode_record_batch_single_object, write_long,
+};
 use crate::writer::format::{AvroBinaryFormat, AvroFormat, AvroOcfFormat};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema};
@@ -182,7 +184,13 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
     }
 
     fn write_stream(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
-        encode_record_batch(batch, &mut self.writer)
+        if let Some(prefix) = self.format.single_object_prefix() {
+            // Avro Single-Object encoding per record: magic + fingerprint + record
+            encode_record_batch_single_object(batch, &mut self.writer, prefix)
+        } else {
+            // Raw Avro binary (no header/prefix)
+            encode_record_batch(batch, &mut self.writer)
+        }
     }
 }
 
@@ -191,6 +199,7 @@ mod tests {
     use super::*;
     use crate::compression::CompressionCodec;
     use crate::reader::ReaderBuilder;
+    use crate::schema::{AvroSchema, SchemaStore};
     use crate::test_util::arrow_test_data;
     use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, IntervalUnit, Schema};
@@ -213,7 +222,7 @@ mod tests {
             Arc::new(make_schema()),
             vec![Arc::new(ids) as ArrayRef, Arc::new(names) as ArrayRef],
         )
-        .expect("failed to build test RecordBatch")
+            .expect("failed to build test RecordBatch")
     }
 
     #[test]
@@ -468,6 +477,48 @@ mod tests {
         let round_trip =
             arrow::compute::concat_batches(&rt_schema, &rt_batches).expect("concat round_trip");
         assert_eq!(round_trip, input);
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_writer_single_object_roundtrip_with_decoder() -> Result<(), ArrowError> {
+        // Prepare a simple schema and a small batch
+        let schema = make_schema();
+        let batch = make_batch();
+        // Write using the streaming writer (Avro Single-Object per record)
+        let buf = Vec::<u8>::new();
+        let mut writer = AvroStreamWriter::new(buf, schema.clone())?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        let out = writer.into_inner();
+        assert!(
+            out.len() > 10,
+            "streaming output should contain at least one single-object record"
+        );
+        // Build a SchemaStore and register the writer Avro schema to obtain the fingerprint
+        let avro_schema = AvroSchema::try_from(&schema)?;
+        let mut store = SchemaStore::new();
+        let fp = store.register(avro_schema.clone()).expect("register schema");
+        // Decode the streaming bytes with the low-level Decoder
+        let mut decoder = ReaderBuilder::new()
+            .with_batch_size(1024)
+            .with_writer_schema_store(store)
+            .with_active_fingerprint(fp)
+            .with_reader_schema(avro_schema)
+            .build_decoder()?;
+        let consumed = decoder.decode(&out)?;
+        assert_eq!(
+            consumed,
+            out.len(),
+            "decoder should consume entire single-object stream"
+        );
+        let decoded = decoder
+            .flush()?
+            .expect("decoder should yield a RecordBatch after flush");
+        assert_eq!(
+            decoded, batch,
+            "decoded RecordBatch should match the original input batch"
+        );
         Ok(())
     }
 }
