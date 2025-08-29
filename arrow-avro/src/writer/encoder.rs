@@ -1,28 +1,11 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
-
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     ArrowPrimitiveType, Float32Type, Float64Type, Int32Type, Int64Type, IntervalMonthDayNanoType,
     TimestampMicrosecondType,
 };
 use arrow_array::{
-    Array, FixedSizeBinaryArray, GenericBinaryArray, LargeListArray, LargeStringArray, ListArray,
-    PrimitiveArray, RecordBatch, StringArray, StructArray,
+    Array, FixedSizeBinaryArray, GenericBinaryArray, GenericStringArray, LargeListArray, ListArray,
+    PrimitiveArray, RecordBatch, StructArray,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType::{Duration as ADuration, Interval};
@@ -264,11 +247,20 @@ pub fn make_encoder<'a>(
         }
         DataType::Utf8 => {
             let arr = array.as_string::<i32>();
-            NullableEncoder::new(Encoder::Utf8(Utf8Encoder(arr)), nulls, has_nulls)
+            // NOTE: can't call alias as constructor; construct underlying type directly.
+            NullableEncoder::new(
+                Encoder::Utf8(Utf8GenericEncoder::<i32>(arr)),
+                nulls,
+                has_nulls,
+            )
         }
         DataType::LargeUtf8 => {
             let arr = array.as_string::<i64>();
-            NullableEncoder::new(Encoder::Utf8Large(Utf8LargeEncoder(arr)), nulls, has_nulls)
+            NullableEncoder::new(
+                Encoder::Utf8Large(Utf8GenericEncoder::<i64>(arr)),
+                nulls,
+                has_nulls,
+            )
         }
         DataType::Int32 => {
             let arr = array.as_primitive::<Int32Type>();
@@ -391,6 +383,7 @@ enum Encoder<'a> {
     Uuid(UuidEncoder<'a>),
     /// Avro `duration` logical type (Arrow Interval(MonthDayNano)) encoder
     IntervalMonthDayNano(IntervalMonthDayNanoEncoder<'a>),
+    /// Avro `string` encoder variants (Utf8/LargeUtf8)
     Utf8(Utf8Encoder<'a>),
     Utf8Large(Utf8LargeEncoder<'a>),
     Struct(Box<StructEncoder<'a>>),
@@ -552,10 +545,12 @@ impl F64Encoder<'_> {
     }
 }
 
-/// Avro `string` encoder for Arrow `Utf8` (StringArray).
-/// Spec: a string is encoded as a long followed by that many bytes of UTF‑8 data.
-struct Utf8Encoder<'a>(&'a StringArray);
-impl Utf8Encoder<'_> {
+/// Avro `string` encoder generic over Arrow `GenericStringArray<O>`.
+/// `StringArray` is `GenericStringArray<i32>` and `LargeStringArray` is
+/// `GenericStringArray<i64>`, so this covers both without duplication.
+struct Utf8GenericEncoder<'a, O: arrow_array::OffsetSizeTrait>(&'a GenericStringArray<O>);
+
+impl<'a, O: arrow_array::OffsetSizeTrait> Utf8GenericEncoder<'a, O> {
     #[inline]
     fn encode<W: Write + ?Sized>(&mut self, idx: usize, out: &mut W) -> Result<(), ArrowError> {
         let s = self.0.value(idx); // &str
@@ -563,15 +558,9 @@ impl Utf8Encoder<'_> {
     }
 }
 
-/// Avro `string` encoder for Arrow `LargeUtf8` (LargeStringArray).
-struct Utf8LargeEncoder<'a>(&'a LargeStringArray);
-impl Utf8LargeEncoder<'_> {
-    #[inline]
-    fn encode<W: Write + ?Sized>(&mut self, idx: usize, out: &mut W) -> Result<(), ArrowError> {
-        let s = self.0.value(idx); // &str
-        write_len_prefixed(out, s.as_bytes())
-    }
-}
+// Preserve the existing variant names via type aliases (no behavior change).
+type Utf8Encoder<'a> = Utf8GenericEncoder<'a, i32>;
+type Utf8LargeEncoder<'a> = Utf8GenericEncoder<'a, i64>;
 
 /// Avro `record` encoder for Arrow `StructArray`
 /// For each field in schema order:
