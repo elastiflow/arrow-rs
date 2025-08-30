@@ -24,6 +24,9 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use strum_macros::AsRefStr;
 
+// NEW: Use codec Nullability to control union order in schema generation
+use crate::codec::Nullability;
+
 /// The metadata key used for storing the JSON encoded [`Schema`]
 pub const SCHEMA_METADATA_KEY: &str = "avro.schema";
 
@@ -300,6 +303,21 @@ pub struct AvroSchema {
     pub json_string: String,
 }
 
+/// Options controlling how to **generate Avro JSON from an Arrow schema**.
+///
+/// If you already have an Avro JSON (e.g. in [`SCHEMA_METADATA_KEY`]),
+/// prefer using that directly; these options are only consulted when *creating*
+/// a new Avro schema JSON from Arrow.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SchemaGenOptions {
+    /// If `Some`, controls the order of the two‑branch optional unions
+    /// used to represent Arrow nullability at **all** nullable sites:
+    /// top‑level fields, struct fields, list items and map values.
+    ///
+    /// If `None`, the default is [`Nullability::NullFirst`] (i.e. `["null",T]`).
+    pub null_union_order: Option<Nullability>,
+}
+
 impl TryFrom<&ArrowSchema> for AvroSchema {
     type Error = ArrowError;
 
@@ -368,6 +386,64 @@ impl AvroSchema {
     /// Returns the Rabin fingerprint of the schema.
     pub fn fingerprint(&self) -> Result<Fingerprint, ArrowError> {
         generate_fingerprint_rabin(&self.schema()?)
+    }
+
+    /// Build Avro JSON from an Arrow [`ArrowSchema`], applying the given options.
+    ///
+    /// If the input Arrow schema already contains Avro JSON in
+    /// [`SCHEMA_METADATA_KEY`], that JSON is returned verbatim to preserve
+    /// exact header↔encoding alignment; otherwise, a new JSON is generated
+    /// honoring `opts.null_union_order` at **all nullable sites**.
+    pub fn from_arrow_with_options(
+        schema: &ArrowSchema,
+        opts: SchemaGenOptions,
+    ) -> Result<AvroSchema, ArrowError> {
+        if let Some(json) = schema.metadata.get(SCHEMA_METADATA_KEY) {
+            return Ok(AvroSchema::new(json.clone()));
+        }
+
+        let mut name_gen = NameGenerator::default();
+        let fields_json = schema
+            .fields()
+            .iter()
+            .map(|f| arrow_field_to_avro_with_opts(f, &mut name_gen, opts))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let record_name = schema
+            .metadata
+            .get(AVRO_NAME_METADATA_KEY)
+            .map_or("topLevelRecord", |s| s.as_str());
+        let mut record = JsonMap::with_capacity(schema.metadata.len() + 4);
+        record.insert("type".into(), Value::String("record".into()));
+        record.insert(
+            "name".into(),
+            Value::String(sanitise_avro_name(record_name)),
+        );
+        if let Some(ns) = schema.metadata.get(AVRO_NAMESPACE_METADATA_KEY) {
+            record.insert("namespace".into(), Value::String(ns.clone()));
+        }
+        if let Some(doc) = schema.metadata.get(AVRO_DOC_METADATA_KEY) {
+            record.insert("doc".into(), Value::String(doc.clone()));
+        }
+        record.insert("fields".into(), Value::Array(fields_json));
+
+        // Copy through non-internal metadata (same behavior as `TryFrom`)
+        let schema_prefix = format!("{SCHEMA_METADATA_KEY}.");
+        for (meta_key, meta_val) in &schema.metadata {
+            if meta_key.starts_with("avro.")
+                || meta_key.starts_with(schema_prefix.as_str())
+                || is_internal_arrow_key(meta_key)
+            {
+                continue;
+            }
+            let json_val =
+                serde_json::from_str(meta_val).unwrap_or_else(|_| Value::String(meta_val.clone()));
+            record.insert(meta_key.clone(), json_val);
+        }
+
+        let json_string = serde_json::to_string(&Value::Object(record))
+            .map_err(|e| ArrowError::SchemaError(format!("Serialising Avro JSON failed: {e}")))?;
+        Ok(AvroSchema::new(json_string))
     }
 }
 
@@ -789,6 +865,16 @@ fn merge_extras(schema: Value, mut extras: JsonMap<String, Value>) -> Value {
     }
 }
 
+/// Helper to wrap a schema `Value` into a 2‑branch union in the specified order.
+fn wrap_nullable(inner: Value, order: Nullability) -> Value {
+    match order {
+        Nullability::NullFirst => Value::Array(vec![Value::String("null".into()), inner]),
+        Nullability::NullSecond => Value::Array(vec![inner, Value::String("null".into())]),
+    }
+}
+
+// === Avro JSON generation (DEFAULT path: NullFirst) ===
+
 // Convert an Arrow `DataType` into an Avro schema `Value`.
 fn datatype_to_avro(
     dt: &DataType,
@@ -796,6 +882,46 @@ fn datatype_to_avro(
     metadata: &HashMap<String, String>,
     name_gen: &mut NameGenerator,
 ) -> Result<(Value, JsonMap<String, Value>), ArrowError> {
+    // Delegate to `_with_opts` using the default NullFirst policy
+    datatype_to_avro_with_opts(
+        dt,
+        field_name,
+        metadata,
+        name_gen,
+        SchemaGenOptions {
+            null_union_order: Some(Nullability::NullFirst),
+        },
+    )
+}
+
+fn arrow_field_to_avro(
+    field: &ArrowField,
+    name_gen: &mut NameGenerator,
+) -> Result<Value, ArrowError> {
+    // Delegate to `_with_opts` using the default NullFirst policy
+    arrow_field_to_avro_with_opts(
+        field,
+        name_gen,
+        SchemaGenOptions {
+            null_union_order: Some(Nullability::NullFirst),
+        },
+    )
+}
+
+// === Avro JSON generation (CONFIGURABLE path) ===
+
+/// Convert an Arrow `DataType` into an Avro schema `Value`, honoring `opts`.
+fn datatype_to_avro_with_opts(
+    dt: &DataType,
+    field_name: &str,
+    metadata: &HashMap<String, String>,
+    name_gen: &mut NameGenerator,
+    opts: SchemaGenOptions,
+) -> Result<(Value, JsonMap<String, Value>), ArrowError> {
+    let order = opts
+        .null_union_order
+        .unwrap_or(Nullability::NullFirst /* default */);
+
     let mut extras = JsonMap::new();
     let val = match dt {
         DataType::Null => Value::String("null".into()),
@@ -813,9 +939,9 @@ fn datatype_to_avro(
                 .get("logicalType")
                 .is_some_and(|value| value == "uuid")
                 || (*len == 16
-                    && metadata
-                        .get("ARROW:extension:name")
-                        .is_some_and(|value| value == "uuid"));
+                && metadata
+                .get("ARROW:extension:name")
+                .is_some_and(|value| value == "uuid"));
             if is_uuid {
                 json!({ "type": "string", "logicalType": "uuid" })
             } else {
@@ -908,13 +1034,11 @@ fn datatype_to_avro(
             if matches!(dt, DataType::LargeList(_)) {
                 extras.insert("arrowLargeList".into(), Value::Bool(true));
             }
-            // Build Avro items schema; if the item Field is nullable, wrap it
-            // in a union with "null" to reflect second-order nullability.
             let (items_inner, ie) =
-                datatype_to_avro(child.data_type(), child.name(), child.metadata(), name_gen)?;
+                datatype_to_avro_with_opts(child.data_type(), child.name(), child.metadata(), name_gen, opts)?;
             let items_with_meta = merge_extras(items_inner, ie);
             let items_schema = if child.is_nullable() {
-                Value::Array(vec![Value::String("null".into()), items_with_meta])
+                wrap_nullable(items_with_meta, order)
             } else {
                 items_with_meta
             };
@@ -925,12 +1049,11 @@ fn datatype_to_avro(
         }
         DataType::FixedSizeList(child, len) => {
             extras.insert("arrowFixedSize".into(), json!(len));
-            // Same nullability semantics as List: union-wrap nullable items.
             let (items_inner, ie) =
-                datatype_to_avro(child.data_type(), child.name(), child.metadata(), name_gen)?;
+                datatype_to_avro_with_opts(child.data_type(), child.name(), child.metadata(), name_gen, opts)?;
             let items_with_meta = merge_extras(items_inner, ie);
             let items_schema = if child.is_nullable() {
-                Value::Array(vec![Value::String("null".into()), items_with_meta])
+                wrap_nullable(items_with_meta, order)
             } else {
                 items_with_meta
             };
@@ -948,15 +1071,16 @@ fn datatype_to_avro(
                     ))
                 }
             };
-            let (val_schema, value_entry) = datatype_to_avro(
+            let (val_schema, value_entry) = datatype_to_avro_with_opts(
                 value_field.data_type(),
                 value_field.name(),
                 value_field.metadata(),
                 name_gen,
+                opts,
             )?;
             let values_with_meta = merge_extras(val_schema, value_entry);
             let values_schema = if value_field.is_nullable() {
-                Value::Array(vec![Value::String("null".into()), values_with_meta])
+                wrap_nullable(values_with_meta, order)
             } else {
                 values_with_meta
             };
@@ -968,7 +1092,7 @@ fn datatype_to_avro(
         DataType::Struct(fields) => {
             let avro_fields = fields
                 .iter()
-                .map(|field| arrow_field_to_avro(field, name_gen))
+                .map(|field| arrow_field_to_avro_with_opts(field, name_gen, opts))
                 .collect::<Result<Vec<_>, _>>()?;
             json!({
                 "type": "record",
@@ -986,16 +1110,18 @@ fn datatype_to_avro(
                     "symbols": symbols
                 })
             } else {
-                let (inner, ie) = datatype_to_avro(value.as_ref(), field_name, metadata, name_gen)?;
+                let (inner, ie) =
+                    datatype_to_avro_with_opts(value.as_ref(), field_name, metadata, name_gen, opts)?;
                 merge_extras(inner, ie)
             }
         }
         DataType::RunEndEncoded(_, values) => {
-            let (inner, ie) = datatype_to_avro(
+            let (inner, ie) = datatype_to_avro_with_opts(
                 values.data_type(),
                 values.name(),
                 values.metadata(),
                 name_gen,
+                opts,
             )?;
             merge_extras(inner, ie)
         }
@@ -1013,28 +1139,32 @@ fn datatype_to_avro(
     Ok((val, extras))
 }
 
-fn arrow_field_to_avro(
+fn arrow_field_to_avro_with_opts(
     field: &ArrowField,
     name_gen: &mut NameGenerator,
+    opts: SchemaGenOptions,
 ) -> Result<Value, ArrowError> {
+    let order = opts
+        .null_union_order
+        .unwrap_or(Nullability::NullFirst /* default */);
+
     // Sanitize field name to ensure Avro validity but store the original in metadata
     let avro_name = sanitise_avro_name(field.name());
     let (schema, extras) =
-        datatype_to_avro(field.data_type(), &avro_name, field.metadata(), name_gen)?;
-    // If nullable, wrap `[ "null", <type> ]`; second‑order nullability is handled
-    // inside `datatype_to_avro` for list/map child fields.
-    let mut schema = if field.is_nullable() {
-        Value::Array(vec![
-            Value::String("null".into()),
-            merge_extras(schema, extras),
-        ])
+        datatype_to_avro_with_opts(field.data_type(), &avro_name, field.metadata(), name_gen, opts)?;
+    let merged = merge_extras(schema, extras);
+
+    // If nullable, wrap union using requested order
+    let schema_value = if field.is_nullable() {
+        wrap_nullable(merged, order)
     } else {
-        merge_extras(schema, extras)
+        merged
     };
+
     // Build the field map
     let mut map = JsonMap::with_capacity(field.metadata().len() + 3);
     map.insert("name".into(), Value::String(avro_name));
-    map.insert("type".into(), schema);
+    map.insert("type".into(), schema_value);
     // Transfer selected metadata
     for (meta_key, meta_val) in field.metadata() {
         if is_internal_arrow_key(meta_key) {
@@ -1131,7 +1261,7 @@ mod tests {
                    "logicalType":"timestamp-micros"
                 }"#,
         )
-        .unwrap();
+            .unwrap();
 
         let timestamp = Type {
             r#type: TypeName::Primitive(PrimitiveType::Long),
@@ -1154,7 +1284,7 @@ mod tests {
                    "scale":2
                 }"#,
         )
-        .unwrap();
+            .unwrap();
 
         let decimal = ComplexType::Fixed(Fixed {
             name: "fixed",
@@ -1194,7 +1324,7 @@ mod tests {
                ]
             }"#,
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             schema,
@@ -1227,7 +1357,7 @@ mod tests {
                   ]
                 }"#,
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             schema,
@@ -1286,7 +1416,7 @@ mod tests {
                ]
             }"#,
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             schema,
@@ -1347,7 +1477,7 @@ mod tests {
                   ]
             }"#,
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             schema,
@@ -1531,7 +1661,7 @@ mod tests {
                 r#type: Schema::Type(Type {
                     r#type: TypeName::Primitive(PrimitiveType::Bytes),
                     attributes: Attributes {
-                        logical_type: Some("decimal"),
+                        logical_type: None,
                         additional: HashMap::from([("precision", json!(4))]),
                     },
                 }),

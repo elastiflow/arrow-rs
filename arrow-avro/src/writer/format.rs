@@ -55,20 +55,25 @@ pub trait AvroFormat: Debug + Default {
 #[derive(Debug, Default)]
 pub struct AvroOcfFormat {
     sync_marker: [u8; 16],
-    /// Optional encoder behavior hints to keep file header schema ordering
-    /// consistent with value encoding (e.g. Impala null-second).
+    /// Legacy encoder behavior knob retained for API compatibility.
+    /// **Deprecated**: encoding is now schema‑driven; this is ignored.
+    #[allow(dead_code)]
     encoder_options: EncoderOptions,
 }
 
 impl AvroOcfFormat {
-    /// Optional helper to attach encoder options (i.e., Impala null-second) to the format.
+    /// **Deprecated**: No‑op. Encoding is driven by the Avro schema written into the header,
+    /// not by encoder options.
+    #[deprecated(
+        note = "No-op: encoding is schema-driven; use schema JSON/metadata to control union order"
+    )]
     #[allow(dead_code)]
     pub fn with_encoder_options(mut self, opts: EncoderOptions) -> Self {
-        self.encoder_options = opts;
+        let _ = opts; // ignore
         self
     }
 
-    /// Access the options used by this format.
+    /// Accessor retained for compatibility. Returns the stored (unused) options.
     #[allow(dead_code)]
     pub fn encoder_options(&self) -> &EncoderOptions {
         &self.encoder_options
@@ -84,10 +89,18 @@ impl AvroFormat for AvroOcfFormat {
     ) -> Result<(), ArrowError> {
         let mut rng = rand::rng();
         rng.fill_bytes(&mut self.sync_marker);
+
+        // Choose the Avro schema JSON that the file will advertise.
+        // If `schema.metadata[SCHEMA_METADATA_KEY]` exists, AvroSchema::try_from
+        // uses it verbatim; otherwise it is generated from the Arrow schema.
         let avro_schema = AvroSchema::try_from(schema)?;
+
+        // Magic
         writer
             .write_all(b"Obj\x01")
             .map_err(|e| ArrowError::IoError(format!("write OCF magic: {e}"), e))?;
+
+        // File metadata map: { "avro.schema": <json>, "avro.codec": <codec> }
         let codec_str = match compression {
             Some(CompressionCodec::Deflate) => "deflate",
             Some(CompressionCodec::Snappy) => "snappy",
@@ -96,12 +109,19 @@ impl AvroFormat for AvroOcfFormat {
             Some(CompressionCodec::Xz) => "xz",
             None => "null",
         };
-        write_long(writer, 2)?;
+
+        // Map block: count=2, then key/value pairs, then terminating count=0
+        write_long(writer, 2)?; // two entries
+
         write_string(writer, SCHEMA_METADATA_KEY)?;
         write_bytes(writer, avro_schema.json_string.as_bytes())?;
+
         write_string(writer, CODEC_METADATA_KEY)?;
         write_bytes(writer, codec_str.as_bytes())?;
+
+        // end of map
         write_long(writer, 0)?;
+
         // Sync marker (16 bytes)
         writer
             .write_all(&self.sync_marker)
@@ -128,13 +148,13 @@ pub struct AvroBinaryFormat {
     /// Pre-built 10-byte single-object prefix written before each record.
     /// [0..2) = magic, [2..10) = schema fingerprint (little endian)
     prefix: [u8; 10],
-    /// Encoder behavior knobs (currently unused by the format layer, but kept
-    /// for symmetry with OCF and potential future use).
+    /// Legacy encoder behavior knob (currently unused by the format layer).
+    #[allow(dead_code)]
     encoder_options: EncoderOptions,
 }
 
 impl AvroBinaryFormat {
-    /// Optional helper to attach encoder options (i.e., Impala null-second) to the format.
+    /// Optional helper retained for compatibility (currently a no-op for the format layer).
     #[allow(dead_code)]
     pub fn with_encoder_options(mut self, opts: EncoderOptions) -> Self {
         self.encoder_options = opts;
@@ -156,7 +176,7 @@ impl AvroBinaryFormat {
         fp
     }
 
-    /// Access the encoder options used by this format.
+    /// Access the encoder options used by this format (unused; compatibility only).
     #[allow(dead_code)]
     #[inline]
     pub fn encoder_options(&self) -> &EncoderOptions {
@@ -174,17 +194,21 @@ impl AvroFormat for AvroBinaryFormat {
         // Avro single-object encoding does **not** support per-record compression.
         if compression.is_some() {
             return Err(ArrowError::InvalidArgumentError(
-                "Compression not supported for Avro binary streaming (single-object encoding)".to_string(),
+                "Compression not supported for Avro binary streaming (single-object encoding)"
+                    .to_string(),
             ));
         }
+
         // Compute and stash the schema fingerprint (CRC-64-AVRO) once.
         let avro_schema = AvroSchema::try_from(schema)?;
         let fp = match avro_schema.fingerprint()? {
             Fingerprint::Rabin(v) => v.to_le_bytes(),
         };
+
         // Build the 10-byte prefix: magic (2) + fingerprint (8)
         self.prefix[..2].copy_from_slice(&SINGLE_OBJECT_MAGIC);
         self.prefix[2..].copy_from_slice(&fp);
+
         Ok(())
     }
 

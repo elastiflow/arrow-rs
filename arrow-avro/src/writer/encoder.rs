@@ -8,19 +8,17 @@ use arrow_array::{
     PrimitiveArray, RecordBatch, StructArray,
 };
 use arrow_buffer::NullBuffer;
-use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, TimeUnit};
+use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, Schema as ArrowSchema, TimeUnit};
 use std::io::Write;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, Default)]
-/// Behavior knobs for the Avro encoder.
-///
-/// When `impala_mode` is `true`, optional/nullable values are encoded
-/// as Avro unions with **null second** (`[T, "null"]`). When `false`
-/// (default), we use **null first** (`["null", T]`).
-pub struct EncoderOptions {
-    pub(crate) impala_mode: bool,
-}
+// === New, plan‑driven encoding imports ===
+use crate::codec::{
+    AvroDataType, AvroField as CodecAvroField, AvroFieldBuilder, Codec as AvroCodec, Nullability,
+};
+use crate::schema::{
+    AvroSchema as AvroJson, Schema as AvroJsonAst, SchemaGenOptions, SCHEMA_METADATA_KEY,
+};
 
 /// Encode a single Avro-`long` using ZigZag + variable length, buffered.
 ///
@@ -63,110 +61,387 @@ fn write_bool<W: Write + ?Sized>(writer: &mut W, v: bool) -> Result<(), ArrowErr
         .map_err(|e| ArrowError::IoError(format!("write bool: {e}"), e))
 }
 
-/// Write the union branch index for an optional field.
+/// Write the union branch index for an optional site with the specified `order`.
 ///
-/// Branch index is 0-based per Avro unions:
-/// - Null-first (default): null => 0, value => 1
-/// - Null-second (Impala): value => 0, null => 1
-///
-/// Spec says to write an **int** value for union position.
-/// See: https://avro.apache.org/docs/1.11.1/specification/#unions
-///
-/// Micro-optimization: for optional fields our union index is always either
-/// 0 or 1, whose ZigZag+varint encodings are single bytes: `0x00` and `0x02`
-/// respectively. We therefore write those bytes directly
+/// Branch index is 0‑based per Avro unions. We special-case 0 or 1 which
+/// are single-byte varints: `0x00` (index 0) and `0x02` (index 1).
 #[inline]
-fn write_optional_branch<W: Write + ?Sized>(
+fn write_optional_index<W: Write + ?Sized>(
     writer: &mut W,
     is_null: bool,
-    impala_mode: bool,
+    order: Nullability,
 ) -> Result<(), ArrowError> {
-    // branch = 0 or 1
-    //   default (null-first): is_null ? 0 : 1
-    //   impala (null-second): is_null ? 1 : 0
-    // ZigZag(int) one-byte encodings:
-    //   0 -> 0x00,  1 -> 0x02
-    let branch_is_one = impala_mode == is_null;
-    let byte = if branch_is_one { 0x02 } else { 0x00 };
+    // For NullFirst: null => 0x00, value => 0x02
+    // For NullSecond: value => 0x00, null => 0x02
+    let byte = match order {
+        Nullability::NullFirst => {
+            if is_null {
+                0x00
+            } else {
+                0x02
+            }
+        }
+        Nullability::NullSecond => {
+            if is_null {
+                0x02
+            } else {
+                0x00
+            }
+        }
+    };
     writer
         .write_all(&[byte])
         .map_err(|e| ArrowError::IoError(format!("write union branch: {e}"), e))
 }
 
-/// Encode a `RecordBatch` in Avro binary format using **default options**.
-pub fn encode_record_batch<W: Write>(batch: &RecordBatch, out: &mut W) -> Result<(), ArrowError> {
-    encode_record_batch_with_options(batch, out, &EncoderOptions::default())
+// ================================================================================================
+// Plan: schema‑driven write plan derived from the actual Avro schema (Option A with Codec)
+// ================================================================================================
+
+/// Per‑site encoder plan for a field. This mirrors Avro structure so nested
+/// optional branch order can be honored exactly as declared by the schema.
+#[derive(Debug, Clone)]
+enum FieldPlan {
+    /// Non-nested scalar/logical type
+    Scalar,
+    /// Record/Struct with Avro‑ordered children
+    Struct { children: Vec<StructChildPlan> },
+    /// Array with item‑site nullability and nested plan
+    List {
+        items_nullability: Option<Nullability>,
+        item_plan: Box<FieldPlan>,
+    },
+    /// (Reserved) Avro map with value‑site nullability and nested plan
+    Map {
+        values_nullability: Option<Nullability>,
+        value_plan: Box<FieldPlan>,
+    },
 }
 
+#[derive(Debug, Clone)]
+struct StructChildPlan {
+    /// Child field name (Avro)
+    name: String,
+    /// Index of the child within the Arrow struct's Fields
+    arrow_index: usize,
+    /// Nullability/order for this child (None if not optional)
+    nullability: Option<Nullability>,
+    /// Nested plan for this child
+    plan: FieldPlan,
+}
+
+#[derive(Debug, Clone)]
+struct ColumnPlan {
+    /// Index of the top‑level Arrow column that corresponds to this Avro field
+    arrow_index: usize,
+    /// Nullability/order for this column (None if not optional)
+    nullability: Option<Nullability>,
+    /// Nested plan for the field
+    plan: FieldPlan,
+}
+
+#[derive(Debug, Clone)]
+pub struct WritePlan {
+    columns: Vec<ColumnPlan>,
+}
+
+fn find_struct_child_index(fields: &arrow_schema::Fields, name: &str) -> Option<usize> {
+    fields.iter().position(|f| f.name() == name)
+}
+
+fn build_field_plan(avro_dt: &AvroDataType, arrow_field: &Field) -> Result<FieldPlan, ArrowError> {
+    match avro_dt.codec() {
+        AvroCodec::Struct(avro_children) => {
+            let fields = match arrow_field.data_type() {
+                DataType::Struct(fs) => fs,
+                other => {
+                    return Err(ArrowError::SchemaError(format!(
+                        "Avro struct maps to Arrow Struct, found: {other:?}"
+                    )))
+                }
+            };
+            let mut kids = Vec::with_capacity(avro_children.len());
+            for avro_child in avro_children.iter() {
+                let name = avro_child.name().to_string();
+                let idx = find_struct_child_index(fields, &name).ok_or_else(|| {
+                    ArrowError::SchemaError(format!(
+                        "Struct field '{name}' not present in Arrow field '{}'",
+                        arrow_field.name()
+                    ))
+                })?;
+                let arrow_child = fields[idx].as_ref();
+                let child_plan = build_field_plan(avro_child.data_type(), arrow_child)?;
+                kids.push(StructChildPlan {
+                    name,
+                    arrow_index: idx,
+                    nullability: avro_child.data_type().nullability(),
+                    plan: child_plan,
+                });
+            }
+            Ok(FieldPlan::Struct { children: kids })
+        }
+        AvroCodec::List(items_dt) => {
+            // Map Avro array -> Arrow List/LargeList. IMPORTANT:
+            // Recurse on the **item field** of the Arrow list, not the list field itself.
+            match arrow_field.data_type() {
+                DataType::List(child) => {
+                    let child_field: &Field = child.as_ref();
+                    let item_plan = build_field_plan(items_dt.as_ref(), child_field)?;
+                    Ok(FieldPlan::List {
+                        items_nullability: items_dt.nullability(),
+                        item_plan: Box::new(item_plan),
+                    })
+                }
+                DataType::LargeList(child) => {
+                    let child_field: &Field = child.as_ref();
+                    let item_plan = build_field_plan(items_dt.as_ref(), child_field)?;
+                    Ok(FieldPlan::List {
+                        items_nullability: items_dt.nullability(),
+                        item_plan: Box::new(item_plan),
+                    })
+                }
+                other => Err(ArrowError::SchemaError(format!(
+                    "Avro array maps to Arrow List/LargeList, found: {other:?}"
+                ))),
+            }
+        }
+        AvroCodec::Map(values_dt) => {
+            // Writer does not currently implement Map encoding; keep plan for future
+            Ok(FieldPlan::Map {
+                values_nullability: values_dt.nullability(),
+                value_plan: Box::new(FieldPlan::Scalar),
+            })
+        }
+        _ => Ok(FieldPlan::Scalar),
+    }
+}
+
+/// Build a [`WritePlan`] by walking the Avro **record** root in Avro order, and
+/// resolving each field to an Arrow index by name.
+pub fn build_write_plan_from_avro_root(
+    root: &CodecAvroField,
+    arrow_schema: &ArrowSchema,
+) -> Result<WritePlan, ArrowError> {
+    let avro_root_dt = root.data_type();
+    let avro_children = match avro_root_dt.codec() {
+        AvroCodec::Struct(children) => children,
+        _ => {
+            return Err(ArrowError::SchemaError(
+                "Top-level Avro schema must be a record/struct".into(),
+            ))
+        }
+    };
+
+    let mut columns = Vec::with_capacity(avro_children.len());
+    for avro_child in avro_children.iter() {
+        let name = avro_child.name();
+        let arrow_index = arrow_schema
+            .index_of(name)
+            .map_err(|e| ArrowError::SchemaError(format!("Schema mismatch for field '{name}': {e}")))?;
+        // In this Arrow version, `Schema::field` returns `&Field` directly.
+        let arrow_field = arrow_schema.field(arrow_index);
+        let plan = build_field_plan(avro_child.data_type(), arrow_field)?;
+        columns.push(ColumnPlan {
+            arrow_index,
+            nullability: avro_child.data_type().nullability(),
+            plan,
+        });
+    }
+    Ok(WritePlan { columns })
+}
+
+// ================================================================================================
+// Public entry points
+// ================================================================================================
+
+/// Derive the write plan for `batch` from its advertised Avro schema in
+/// `SCHEMA_METADATA_KEY`, or generate Avro JSON from Arrow if missing.
+///
+/// If `order_override` is `Some`, it is only used when synthesizing Avro JSON
+/// from Arrow (i.e., metadata is absent); otherwise the **actual** Avro JSON
+/// controls all union orders.
+fn derive_plan_for_batch(
+    batch: &RecordBatch,
+    order_override: Option<Nullability>,
+) -> Result<WritePlan, ArrowError> {
+    // 1) Choose the exact Avro JSON we will advertise
+    let avro_json = if let Some(json) = batch.schema().metadata.get(SCHEMA_METADATA_KEY) {
+        AvroJson::new(json.clone())
+    } else {
+        let opts = SchemaGenOptions {
+            null_union_order: order_override,
+        };
+        AvroJson::from_arrow_with_options(batch.schema().as_ref(), opts)?
+    };
+
+    // 2) Parse into AST -> Codec tree
+    let avro_ast: AvroJsonAst<'_> = avro_json.schema()?;
+    let root = AvroFieldBuilder::new(&avro_ast).build()?;
+
+    // 3) Build the concrete write plan
+    build_write_plan_from_avro_root(&root, batch.schema().as_ref())
+}
+
+/// Encode a `RecordBatch` in Avro binary format using the **schema‑driven plan**.
+pub fn encode_record_batch<W: Write>(batch: &RecordBatch, out: &mut W) -> Result<(), ArrowError> {
+    let plan = derive_plan_for_batch(batch, None)?;
+    encode_record_batch_with_plan(batch, out, &plan)
+}
+
+/// **Deprecated:** legacy options. Kept for compatibility. These no longer
+/// directly drive the encoder; instead they are used only to synthesize a
+/// temporary Avro schema when none is present in metadata.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EncoderOptions {
+    /// If `true`, nullable unions are generated as `[T,"null"]` when *creating*
+    /// a temporary Avro JSON from Arrow (NullSecond). If `false`, `["null",T]`.
+    pub(crate) impala_mode: bool,
+}
+
+/// Deprecated: encodes with options by synthesizing an Avro JSON (if needed)
+/// matching `opts`, and then following the resulting schema exactly.
+pub fn encode_record_batch_with_options<W: Write>(
+    batch: &RecordBatch,
+    out: &mut W,
+    opts: &EncoderOptions,
+) -> Result<(), ArrowError> {
+    let override_order = if opts.impala_mode {
+        Some(Nullability::NullSecond)
+    } else {
+        Some(Nullability::NullFirst)
+    };
+    let plan = derive_plan_for_batch(batch, override_order)?;
+    encode_record_batch_with_plan(batch, out, &plan)
+}
+
+/// Encode a `RecordBatch` as a stream of Avro **single-object encodings**,
+/// writing the provided 10-byte `prefix` (magic + 8-byte fingerprint)
+/// **before each record** using a **schema‑driven plan**.
+pub fn encode_record_batch_single_object<W: Write>(
+    batch: &RecordBatch,
+    out: &mut W,
+    prefix: &[u8; 10],
+) -> Result<(), ArrowError> {
+    let plan = derive_plan_for_batch(batch, None)?;
+    encode_record_batch_single_object_with_plan(batch, out, prefix, &plan)
+}
+
+/// Deprecated: single‑object with legacy options (see note on `encode_record_batch_with_options`)
+pub fn encode_record_batch_single_object_with_options<W: Write>(
+    batch: &RecordBatch,
+    out: &mut W,
+    prefix: &[u8; 10],
+    opts: &EncoderOptions,
+) -> Result<(), ArrowError> {
+    let override_order = if opts.impala_mode {
+        Some(Nullability::NullSecond)
+    } else {
+        Some(Nullability::NullFirst)
+    };
+    let plan = derive_plan_for_batch(batch, override_order)?;
+    encode_record_batch_single_object_with_plan(batch, out, prefix, &plan)
+}
+
+/// Encode a `RecordBatch` using a precomputed [`WritePlan`].
+pub fn encode_record_batch_with_plan<W: Write>(
+    batch: &RecordBatch,
+    out: &mut W,
+    plan: &WritePlan,
+) -> Result<(), ArrowError> {
+    let mut cols = prepare_encoders_for_batch_with_plan(batch, plan)?;
+    encode_rows_with_prefix_plan(batch.num_rows(), &mut cols, out, |_w, _row| Ok(()))
+}
+
+/// Encode a `RecordBatch` with a plan, adding a single‑object `prefix` before each row.
+pub fn encode_record_batch_single_object_with_plan<W: Write>(
+    batch: &RecordBatch,
+    out: &mut W,
+    prefix: &[u8; 10],
+    plan: &WritePlan,
+) -> Result<(), ArrowError> {
+    let mut cols = prepare_encoders_for_batch_with_plan(batch, plan)?;
+    encode_rows_with_prefix_plan(batch.num_rows(), &mut cols, out, |w, _row| {
+        w.write_all(prefix)
+            .map_err(|e| ArrowError::IoError(format!("write single-object prefix: {e}"), e))
+    })
+}
+
+// ================================================================================================
+// Encoder preparation and row loop (plan‑aware)
+// ================================================================================================
+
 /// Internal representation of a prepared column encoder for a record batch.
-/// This lets us cache per-column properties (nullability, presence of any
-/// nulls, and the encoder itself) once, and reuse them across all rows.
+/// This caches per-column properties and the encoder itself.
+///
+/// `nullability` encodes whether the column is optional and, if so, the
+/// **branch order** to use for union indices (NullFirst/NullSecond).
 struct ColumnEncoder<'a> {
-    is_nullable: bool,
+    nullability: Option<Nullability>,
     has_nulls: bool,
     enc: NullableEncoder<'a>,
 }
 
-/// Build encoders for all columns in `batch` once, honoring each `Field`'s
-/// metadata to select the appropriate logical encoding (e.g. UUID vs fixed).
 #[inline]
-fn prepare_encoders_for_batch(
-    batch: &'_ RecordBatch,
-) -> Result<Vec<ColumnEncoder<'_>>, ArrowError> {
-    let schema = batch.schema();
-    let fields = schema.fields();
+fn prepare_encoders_for_batch_with_plan<'a>(
+    batch: &'a RecordBatch,
+    plan: &WritePlan,
+) -> Result<Vec<ColumnEncoder<'a>>, ArrowError> {
+    // bind schema to extend lifetime of `fields()` borrow
+    let schema_binding = batch.schema();
+    let fields = schema_binding.fields();
+    let arrays = batch.columns();
 
-    let cols = fields
-        .iter()
-        .zip(batch.columns())
-        .map(|(field_ref, array)| {
-            let field: &Field = field_ref.as_ref();
-            let enc = make_encoder(array.as_ref(), field)?;
-            Ok::<_, ArrowError>(ColumnEncoder {
-                is_nullable: field.is_nullable(),
-                has_nulls: enc.has_nulls(),
-                enc,
-            })
-        })
-        .collect::<Result<Vec<_>, ArrowError>>()?;
+    let mut out = Vec::with_capacity(plan.columns.len());
+    for col_plan in plan.columns.iter() {
+        let arrow_index = col_plan.arrow_index;
+        let array = arrays
+            .get(arrow_index)
+            .ok_or_else(|| ArrowError::SchemaError(format!("Column index {arrow_index} out of range")))?;
+        let field = fields[arrow_index].as_ref();
+        let enc = make_encoder_with_plan(array.as_ref(), field, &col_plan.plan)?;
+        let has_nulls = enc.has_nulls();
 
-    Ok(cols)
+        out.push(ColumnEncoder {
+            nullability: col_plan.nullability,
+            has_nulls,
+            enc,
+        });
+    }
+    Ok(out)
 }
 
 /// Encode `rows` rows by iterating columns and writing values for each row.
 /// A `per_row_prefix` callback can inject data *before* each record (used by
 /// the Avro single-object encoding to write the 10-byte prefix).
 #[inline]
-fn encode_rows_with_prefix<W: Write>(
+fn encode_rows_with_prefix_plan<W: Write>(
     rows: usize,
     cols: &mut [ColumnEncoder<'_>],
     out: &mut W,
-    opts: &EncoderOptions,
     mut per_row_prefix: impl FnMut(&mut W, usize) -> Result<(), ArrowError>,
 ) -> Result<(), ArrowError> {
-    // Precompute the byte to write for the "value" branch when a nullable
-    // column has *no* nulls (0x00 for Impala [index 0], 0x02 otherwise).
-    let value_branch_byte: u8 = if opts.impala_mode { 0x00 } else { 0x02 };
-
     for row in 0..rows {
-        // Optional pre-record bytes (e.g., single-object prefix)
         per_row_prefix(out, row)?;
 
         for ColumnEncoder {
-            is_nullable,
+            nullability,
             has_nulls,
             enc,
         } in cols.iter_mut()
         {
-            if *is_nullable {
+            if let Some(order) = nullability {
                 if *has_nulls {
                     let is_null = enc.is_null(row);
-                    write_optional_branch(out, is_null, opts.impala_mode)?;
+                    write_optional_index(out, is_null, *order)?;
                     if is_null {
                         continue;
                     }
                 } else {
-                    // Nullable field with no nulls in the column: always the "value" branch.
+                    // Nullable field with no nulls in the column: always write the "value" branch
+                    let value_branch_byte = match order {
+                        Nullability::NullFirst => 0x02,  // index 1
+                        Nullability::NullSecond => 0x00, // index 0
+                    };
                     out.write_all(&[value_branch_byte]).map_err(|e| {
                         ArrowError::IoError(format!("write union value branch: {e}"), e)
                     })?;
@@ -178,54 +453,9 @@ fn encode_rows_with_prefix<W: Write>(
     Ok(())
 }
 
-/// Encode a `RecordBatch` with explicit `EncoderOptions`.
-pub fn encode_record_batch_with_options<W: Write>(
-    batch: &RecordBatch,
-    out: &mut W,
-    opts: &EncoderOptions,
-) -> Result<(), ArrowError> {
-    let mut cols = prepare_encoders_for_batch(batch)?;
-    encode_rows_with_prefix(batch.num_rows(), &mut cols, out, opts, |_w, _row| Ok(()))
-}
-
-/// Encode a `RecordBatch` as a stream of Avro **single-object encodings**,
-/// writing the provided 10-byte `prefix` (magic + 8-byte fingerprint)
-/// **before each record**.
-///
-/// This uses the same binary value encoding as [`encode_record_batch_with_options`],
-/// but interposes the per-record single-object header defined by the Avro spec:
-/// <https://avro.apache.org/docs/1.11.1/specification/#single-object-encoding>
-pub fn encode_record_batch_single_object_with_options<W: Write>(
-    batch: &RecordBatch,
-    out: &mut W,
-    prefix: &[u8; 10],
-    opts: &EncoderOptions,
-) -> Result<(), ArrowError> {
-    let mut cols = prepare_encoders_for_batch(batch)?;
-    encode_rows_with_prefix(
-        batch.num_rows(),
-        &mut cols,
-        out,
-        opts,
-        |w, _row| {
-            // Write the single-object 10-byte header for this record:
-            //   0..2  : 0xC3, 0x01
-            //   2..10 : little-endian CRC-64-AVRO schema fingerprint
-            w.write_all(prefix).map_err(|e| {
-                ArrowError::IoError(format!("write single-object prefix: {e}"), e)
-            })
-        },
-    )
-}
-
-/// Same as [`encode_record_batch_single_object_with_options`] with default encoder options.
-pub fn encode_record_batch_single_object<W: Write>(
-    batch: &RecordBatch,
-    out: &mut W,
-    prefix: &[u8; 10],
-) -> Result<(), ArrowError> {
-    encode_record_batch_single_object_with_options(batch, out, prefix, &EncoderOptions::default())
-}
+// ================================================================================================
+// Value encoders
+// ================================================================================================
 
 /// An encoder + a null buffer for nullable fields.
 ///
@@ -271,10 +501,7 @@ impl<'a> NullableEncoder<'a> {
 /// logical type / extension metadata so that the binary encoding matches the
 /// emitted Avro schema (e.g., `fixed` vs `string`+`logicalType=uuid`,
 /// and `fixed(12)`+`logicalType=duration` for MonthDayNano).
-pub fn make_encoder<'a>(
-    array: &'a dyn Array,
-    field: &Field,
-) -> Result<NullableEncoder<'a>, ArrowError> {
+fn make_encoder<'a>(array: &'a dyn Array, field: &Field) -> Result<NullableEncoder<'a>, ArrowError> {
     let nulls = array.nulls().cloned();
     let has_nulls = array.null_count() > 0;
     let enc = match array.data_type() {
@@ -284,20 +511,11 @@ pub fn make_encoder<'a>(
         }
         DataType::Utf8 => {
             let arr = array.as_string::<i32>();
-            // NOTE: can't call alias as constructor; construct underlying type directly.
-            NullableEncoder::new(
-                Encoder::Utf8(Utf8GenericEncoder::<i32>(arr)),
-                nulls,
-                has_nulls,
-            )
+            NullableEncoder::new(Encoder::Utf8(Utf8GenericEncoder::<i32>(arr)), nulls, has_nulls)
         }
         DataType::LargeUtf8 => {
             let arr = array.as_string::<i64>();
-            NullableEncoder::new(
-                Encoder::Utf8Large(Utf8GenericEncoder::<i64>(arr)),
-                nulls,
-                has_nulls,
-            )
+            NullableEncoder::new(Encoder::Utf8Large(Utf8GenericEncoder::<i64>(arr)), nulls, has_nulls)
         }
         DataType::Int32 => {
             let arr = array.as_primitive::<Int32Type>();
@@ -373,7 +591,7 @@ pub fn make_encoder<'a>(
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| ArrowError::SchemaError("Expected ListArray".into()))?;
-            let enc = ListEncoder32::try_new(arr)?;
+            let enc = ListEncoder32::try_new_default(arr)?;
             NullableEncoder::new(Encoder::List(Box::new(enc)), nulls, has_nulls)
         }
         DataType::LargeList(_) => {
@@ -381,7 +599,7 @@ pub fn make_encoder<'a>(
                 .as_any()
                 .downcast_ref::<LargeListArray>()
                 .ok_or_else(|| ArrowError::SchemaError("Expected LargeListArray".into()))?;
-            let enc = ListEncoder64::try_new(arr)?;
+            let enc = ListEncoder64::try_new_default(arr)?;
             NullableEncoder::new(Encoder::LargeList(Box::new(enc)), nulls, has_nulls)
         }
         DataType::Struct(_) => {
@@ -389,7 +607,7 @@ pub fn make_encoder<'a>(
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| ArrowError::SchemaError("Expected StructArray".into()))?;
-            let enc = StructEncoder::try_new(arr)?;
+            let enc = StructEncoder::try_new_default(arr)?;
             NullableEncoder::new(Encoder::Struct(Box::new(enc)), nulls, has_nulls)
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
@@ -401,6 +619,47 @@ pub fn make_encoder<'a>(
                 "Unsupported data type for Avro encoding in slim build: {other:?}"
             )))
         }
+    };
+    Ok(enc)
+}
+
+/// Plan-aware variant of `make_encoder` that configures nested union orders
+/// exactly as specified by `plan`.
+fn make_encoder_with_plan<'a>(
+    array: &'a dyn Array,
+    field: &Field,
+    plan: &FieldPlan,
+) -> Result<NullableEncoder<'a>, ArrowError> {
+    let nulls = array.nulls().cloned();
+    let has_nulls = array.null_count() > 0;
+
+    let enc = match (array.data_type(), plan) {
+        (DataType::Struct(_), FieldPlan::Struct { children }) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| ArrowError::SchemaError("Expected StructArray".into()))?;
+            let enc = StructEncoder::try_new_with_plan(arr, children)?;
+            NullableEncoder::new(Encoder::Struct(Box::new(enc)), nulls, has_nulls)
+        }
+        (DataType::List(_), FieldPlan::List { items_nullability, item_plan }) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| ArrowError::SchemaError("Expected ListArray".into()))?;
+            let enc = ListEncoder32::try_new_with_plan(arr, *items_nullability, item_plan)?;
+            NullableEncoder::new(Encoder::List(Box::new(enc)), nulls, has_nulls)
+        }
+        (DataType::LargeList(_), FieldPlan::List { items_nullability, item_plan }) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| ArrowError::SchemaError("Expected LargeListArray".into()))?;
+            let enc = ListEncoder64::try_new_with_plan(arr, *items_nullability, item_plan)?;
+            NullableEncoder::new(Encoder::LargeList(Box::new(enc)), nulls, has_nulls)
+        }
+        // Fallback to default scalar encoders for non-nested
+        _ => make_encoder(array, field)?,
     };
     Ok(enc)
 }
@@ -492,7 +751,6 @@ impl<'a, O: arrow_array::OffsetSizeTrait> BinaryEncoder<'a, O> {
 
 /// Avro `fixed` encoder for Arrow `FixedSizeBinaryArray`.
 /// Spec: a fixed is encoded as exactly `size` bytes, with no length prefix.
-/// See: https://avro.apache.org/docs/1.11.0/spec.html#Fixed
 struct FixedEncoder<'a>(&'a FixedSizeBinaryArray);
 impl FixedEncoder<'_> {
     #[inline]
@@ -505,7 +763,6 @@ impl FixedEncoder<'_> {
 
 /// Avro UUID logical type encoder: Arrow FixedSizeBinary(16) → Avro string (UUID).
 /// Spec: uuid is a logical type over string (RFC‑4122). We output hyphenated form.
-/// See: https://avro.apache.org/docs/1.11.0/spec.html#UUID
 struct UuidEncoder<'a>(&'a FixedSizeBinaryArray);
 impl UuidEncoder<'_> {
     #[inline]
@@ -527,14 +784,12 @@ impl UuidEncoder<'_> {
 /// Avro `duration` encoder for Arrow `Interval(IntervalUnit::MonthDayNano)`.
 /// Spec: `duration` annotates Avro fixed(12) with three **little‑endian u32**:
 /// months, days, milliseconds (no negatives).
-/// See: https://avro.apache.org/docs/1.11.0/spec.html#Duration
 struct IntervalMonthDayNanoEncoder<'a>(&'a PrimitiveArray<IntervalMonthDayNanoType>);
 impl IntervalMonthDayNanoEncoder<'_> {
     #[inline]
     fn encode<W: Write + ?Sized>(&mut self, idx: usize, out: &mut W) -> Result<(), ArrowError> {
         let native = self.0.value(idx);
         let (months, days, nanos) = IntervalMonthDayNanoType::to_parts(native);
-        // Validation per Avro 'duration' constraints: unsigned components, ms granularity
         if months < 0 || days < 0 || nanos < 0 {
             return Err(ArrowError::InvalidArgumentError(
                 "Avro 'duration' cannot encode negative months/days/nanoseconds".into(),
@@ -555,7 +810,7 @@ impl IntervalMonthDayNanoEncoder<'_> {
         let mut buf = [0u8; 12];
         buf[0..4].copy_from_slice(&(months as u32).to_le_bytes());
         buf[4..8].copy_from_slice(&(days as u32).to_le_bytes());
-        buf[8..12].copy_from_slice(&((millis as u32).to_le_bytes()));
+        buf[8..12].copy_from_slice(&(millis as u32).to_le_bytes());
         out.write_all(&buf)
             .map_err(|e| ArrowError::IoError(format!("write duration: {e}"), e))
     }
@@ -583,8 +838,6 @@ impl F64Encoder<'_> {
 }
 
 /// Avro `string` encoder generic over Arrow `GenericStringArray<O>`.
-/// `StringArray` is `GenericStringArray<i32>` and `LargeStringArray` is
-/// `GenericStringArray<i64>`, so this covers both without duplication.
 struct Utf8GenericEncoder<'a, O: arrow_array::OffsetSizeTrait>(&'a GenericStringArray<O>);
 
 impl<'a, O: arrow_array::OffsetSizeTrait> Utf8GenericEncoder<'a, O> {
@@ -600,15 +853,17 @@ type Utf8Encoder<'a> = Utf8GenericEncoder<'a, i32>;
 type Utf8LargeEncoder<'a> = Utf8GenericEncoder<'a, i64>;
 
 /// Avro `record` encoder for Arrow `StructArray`
-/// For each field in schema order:
-/// - If the field is nullable: write union branch (null-first: null=0, value=1) and skip if null
-/// - Then encode the field's value using its child encoder
+///
+/// The children are stored in **Avro order**, and each child carries its
+/// own per‑site `Nullability`, so union indices are written exactly as the
+/// Avro header declares.
 struct StructEncoder<'a> {
-    fields: Vec<(bool, NullableEncoder<'a>)>,
+    children: Vec<(Option<Nullability>, NullableEncoder<'a>)>,
 }
 
 impl<'a> StructEncoder<'a> {
-    fn try_new(array: &'a StructArray) -> Result<Self, ArrowError> {
+    /// Legacy constructor: preserves previous behavior (NullFirst for nested).
+    fn try_new_default(array: &'a StructArray) -> Result<Self, ArrowError> {
         let fields = match array.data_type() {
             DataType::Struct(fs) => fs,
             _ => return Err(ArrowError::SchemaError("Expected Struct".into())),
@@ -617,18 +872,40 @@ impl<'a> StructEncoder<'a> {
         for (f_ref, col) in fields.iter().zip(array.columns().iter()) {
             let f: &Field = f_ref.as_ref();
             let child = make_encoder(col.as_ref(), f)?;
-            encs.push((f.is_nullable(), child));
+            encs.push((f.is_nullable().then_some(Nullability::NullFirst), child));
         }
-        Ok(Self { fields: encs })
+        Ok(Self { children: encs })
+    }
+
+    /// Plan‑aware constructor: uses Avro order and per‑child `Nullability`.
+    fn try_new_with_plan(
+        array: &'a StructArray,
+        plan_children: &[StructChildPlan],
+    ) -> Result<Self, ArrowError> {
+        let fields = match array.data_type() {
+            DataType::Struct(fs) => fs,
+            _ => return Err(ArrowError::SchemaError("Expected Struct".into())),
+        };
+        let mut encs = Vec::with_capacity(plan_children.len());
+        for child_plan in plan_children {
+            let idx = child_plan.arrow_index;
+            let col = array
+                .columns()
+                .get(idx)
+                .ok_or_else(|| ArrowError::SchemaError(format!("Struct child index {idx} out of range")))?;
+            let field = fields[idx].as_ref();
+            let child = make_encoder_with_plan(col.as_ref(), field, &child_plan.plan)?;
+            encs.push((child_plan.nullability, child));
+        }
+        Ok(Self { children: encs })
     }
 
     #[inline]
     fn encode<W: Write + ?Sized>(&mut self, idx: usize, out: &mut W) -> Result<(), ArrowError> {
-        for (is_nullable, enc) in self.fields.iter_mut() {
-            if *is_nullable {
+        for (nullable, enc) in self.children.iter_mut() {
+            if let Some(order) = nullable {
                 let is_null = enc.is_null(idx);
-                // Struct field unions use null-first encoding (existing behavior).
-                write_optional_branch(out, is_null, false)?;
+                write_optional_index(out, is_null, *order)?;
                 if is_null {
                     continue;
                 }
@@ -640,20 +917,13 @@ impl<'a> StructEncoder<'a> {
 }
 
 /// Shared, allocation-free encode path for Arrow `ListArray` and `LargeListArray`.
-///
-/// Encodes a single list element given its `[start, end)` bounds in the (possibly sliced)
-/// child `values()` array. Handles nullable list **items** by writing the union branch
-/// per item when `items_nullable` is true.
-///
-/// This function purposely does **not** depend on the actual list type, keeping
-/// the `ListEncoder32::encode` and `ListEncoder64::encode` bodies trivial.
 #[inline]
 fn encode_list_range<W: Write + ?Sized>(
     out: &mut W,
     start: usize,
     end: usize,
     values_offset: usize,
-    items_nullable: bool,
+    items_nullability: Option<Nullability>,
     values_encoder: &mut NullableEncoder<'_>,
 ) -> Result<(), ArrowError> {
     let len = end.saturating_sub(start);
@@ -666,17 +936,14 @@ fn encode_list_range<W: Write + ?Sized>(
     write_long(out, len as i64)?;
     // Iterate `[start, end)` translating to local indices into `values()`.
     for j in start..end {
-        // Safety: Arrow guarantees `values_offset <= j` for slices; keep a debug check and
-        // use saturating_sub in release to avoid UB if invariants are violated upstream.
         debug_assert!(
             j >= values_offset,
             "List values offset invariant violated: j < values_offset"
         );
         let j_local = j.saturating_sub(values_offset);
-        if items_nullable {
+        if let Some(order) = items_nullability {
             let is_null = values_encoder.is_null(j_local);
-            // For list items we always use null-first unions (consistent with existing behavior).
-            write_optional_branch(out, is_null, false)?;
+            write_optional_index(out, is_null, order)?;
             if is_null {
                 continue;
             }
@@ -691,7 +958,7 @@ fn encode_list_range<W: Write + ?Sized>(
 struct ListEncoder<'a, O: arrow_array::OffsetSizeTrait> {
     list: &'a arrow_array::array::GenericListArray<O>,
     values: NullableEncoder<'a>,
-    items_nullable: bool,
+    items_nullability: Option<Nullability>,
     values_offset: usize,
 }
 
@@ -699,9 +966,8 @@ type ListEncoder32<'a> = ListEncoder<'a, i32>;
 type ListEncoder64<'a> = ListEncoder<'a, i64>;
 
 impl<'a, O: arrow_array::OffsetSizeTrait> ListEncoder<'a, O> {
-    fn try_new(list: &'a arrow_array::array::GenericListArray<O>) -> Result<Self, ArrowError> {
-        // Item nullability is defined on the list's item Field and we also need the child Field
-        // itself to select the appropriate encoder (e.g., UUID vs fixed).
+    /// Legacy constructor: preserves previous behavior (NullFirst for items).
+    fn try_new_default(list: &'a arrow_array::array::GenericListArray<O>) -> Result<Self, ArrowError> {
         let (child_field, items_nullable) = match list.data_type() {
             DataType::List(field) => (field.as_ref(), field.is_nullable()),
             DataType::LargeList(field) => (field.as_ref(), field.is_nullable()),
@@ -711,13 +977,37 @@ impl<'a, O: arrow_array::OffsetSizeTrait> ListEncoder<'a, O> {
                 ))
             }
         };
-        // Build the encoder for the child values() array using the child field metadata
         let values_enc = make_encoder(list.values().as_ref(), child_field)?;
         Ok(Self {
             list,
             values: values_enc,
-            items_nullable,
-            values_offset: list.values().offset(), // cache once
+            items_nullability: items_nullable.then_some(Nullability::NullFirst),
+            values_offset: list.values().offset(),
+        })
+    }
+
+    /// Plan‑aware constructor: uses per‑item `Nullability` and nested plan.
+    fn try_new_with_plan(
+        list: &'a arrow_array::array::GenericListArray<O>,
+        items_nullability: Option<Nullability>,
+        item_plan: &FieldPlan,
+    ) -> Result<Self, ArrowError> {
+        let child_field = match list.data_type() {
+            DataType::List(field) => field.as_ref(),
+            DataType::LargeList(field) => field.as_ref(),
+            _ => {
+                return Err(ArrowError::SchemaError(
+                    "Expected List or LargeList for ListEncoder".into(),
+                ))
+            }
+        };
+        let values_enc =
+            make_encoder_with_plan(list.values().as_ref(), child_field, item_plan)?;
+        Ok(Self {
+            list,
+            values: values_enc,
+            items_nullability,
+            values_offset: list.values().offset(),
         })
     }
 
@@ -738,7 +1028,7 @@ impl<'a, O: arrow_array::OffsetSizeTrait> ListEncoder<'a, O> {
             start,
             end,
             self.values_offset,
-            self.items_nullable,
+            self.items_nullability,
             &mut self.values,
         )
     }

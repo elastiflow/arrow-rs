@@ -31,21 +31,36 @@
 pub mod encoder;
 /// Logic for different Avro container file formats.
 pub mod format;
+
 use crate::compression::CompressionCodec;
+use crate::schema::{AvroSchema, SchemaGenOptions, SCHEMA_METADATA_KEY};
 use crate::writer::encoder::{
-    encode_record_batch, encode_record_batch_single_object, write_long,
+    build_write_plan_from_avro_root, encode_record_batch_single_object_with_plan,
+    encode_record_batch_with_plan, write_long, WritePlan,
 };
 use crate::writer::format::{AvroBinaryFormat, AvroFormat, AvroOcfFormat};
+
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema};
 use std::io::{self, Write};
 use std::sync::Arc;
+
+// Plan construction: parse the Avro JSON we are going to advertise and build a
+// schema‑driven, per‑site union ordering for the encoder.
+use crate::codec::AvroFieldBuilder;
 
 /// Builder to configure and create a `Writer`.
 #[derive(Debug, Clone)]
 pub struct WriterBuilder {
     schema: Schema,
     codec: Option<CompressionCodec>,
+    /// If set, this exact Avro JSON will be embedded in the header and used
+    /// to drive union ordering for the encoder.
+    avro_json_override: Option<String>,
+    /// Options that influence **generation** of Avro JSON from an Arrow schema
+    /// (only used if `avro_json_override` is `None` and the Arrow schema metadata
+    /// does not already contain `avro.schema`).
+    schema_gen_options: Option<SchemaGenOptions>,
 }
 
 impl WriterBuilder {
@@ -54,12 +69,29 @@ impl WriterBuilder {
         Self {
             schema,
             codec: None,
+            avro_json_override: None,
+            schema_gen_options: None,
         }
     }
 
     /// Change the compression codec.
     pub fn with_compression(mut self, codec: Option<CompressionCodec>) -> Self {
         self.codec = codec;
+        self
+    }
+
+    /// Provide an explicit Avro **JSON schema** to embed in the header and to
+    /// drive the encoder's union ordering. This takes precedence over any
+    /// `avro.schema` present in the Arrow schema metadata.
+    pub fn with_avro_json_schema(mut self, json: String) -> Self {
+        self.avro_json_override = Some(json);
+        self
+    }
+
+    /// Provide options to control **generation** of Avro JSON from the Arrow
+    /// schema when no explicit `avro.schema` is provided.
+    pub fn with_schema_gen_options(mut self, opts: SchemaGenOptions) -> Self {
+        self.schema_gen_options = Some(opts);
         self
     }
 
@@ -75,6 +107,9 @@ impl WriterBuilder {
             format: F::default(),
             compression: self.codec,
             started: false,
+            avro_json_override: self.avro_json_override,
+            schema_gen_options: self.schema_gen_options,
+            plan: None,
         }
     }
 }
@@ -87,6 +122,12 @@ pub struct Writer<W: Write, F: AvroFormat> {
     format: F,
     compression: Option<CompressionCodec>,
     started: bool,
+    /// Builder‑provided schema JSON override (if any).
+    avro_json_override: Option<String>,
+    /// Options controlling Arrow→Avro JSON generation if needed.
+    schema_gen_options: Option<SchemaGenOptions>,
+    /// Prepared, schema‑driven write plan computed on first `write(...)`.
+    plan: Option<WritePlan>,
 }
 
 /// Alias for an Avro **Object Container File** writer.
@@ -122,16 +163,54 @@ impl<W: Write> Writer<W, AvroBinaryFormat> {
 impl<W: Write, F: AvroFormat> Writer<W, F> {
     /// Serialize one [`RecordBatch`] to the output.
     pub fn write(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
+        // Lazily initialize the stream and prepare the per‑field write plan
+        // upon the first `write(...)`.
         if !self.started {
+            // 1) Choose the **exact Avro JSON** we will advertise
+            let chosen_json = if let Some(s) = &self.avro_json_override {
+                s.clone()
+            } else if let Some(json) = self.schema.metadata.get(SCHEMA_METADATA_KEY) {
+                json.clone()
+            } else if let Some(opts) = &self.schema_gen_options {
+                // Generate JSON from Arrow using requested options
+                let avro = AvroSchema::from_arrow_with_options(self.schema.as_ref(), opts.clone())?;
+                avro.json_string
+            } else {
+                // Default generation (typically null‑first)
+                AvroSchema::try_from(self.schema.as_ref())?.json_string
+            };
+
+            // 2) Inject the chosen JSON into the **writer schema's metadata**
+            //    so the header and the encoder share the same single source of truth.
+            let mut md = self.schema.metadata().clone();
+            md.insert(SCHEMA_METADATA_KEY.to_string(), chosen_json.clone());
+            let updated = Schema::new_with_metadata(self.schema.fields().clone(), md);
+            self.schema = Arc::new(updated);
+
+            // 3) Start the stream (writes header / single‑object prefix)
             self.format
                 .start_stream(&mut self.writer, &self.schema, self.compression)?;
+
+            // 4) Build the **schema‑driven write plan** from the chosen Avro JSON
+            //    NOTE: Keep the AvroSchema owner alive while borrowing from it
+            //    to avoid E0716 (temporary value dropped while borrowed).
+            let avro_holder = AvroSchema::new(chosen_json);
+            let avro_ast = avro_holder.schema()?;
+            let avro_root = AvroFieldBuilder::new(&avro_ast).build()?;
+            let plan = build_write_plan_from_avro_root(&avro_root, self.schema.as_ref())?;
+            self.plan = Some(plan);
+
             self.started = true;
         }
-        if batch.schema() != self.schema {
+
+        // Validate incoming batch matches the writer's Arrow **fields** (ignore metadata)
+        if batch.schema().fields() != self.schema.fields() {
             return Err(ArrowError::SchemaError(
-                "Schema of RecordBatch differs from Writer schema".to_string(),
+                "Schema of RecordBatch differs from Writer schema (fields/types)".to_string(),
             ));
         }
+
+        // Encode according to container format
         match self.format.sync_marker() {
             Some(&sync) => self.write_ocf_block(batch, &sync),
             None => self.write_stream(batch),
@@ -165,9 +244,15 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
         self.writer
     }
 
+    /// Write a single OCF data block: row count, block length, block bytes, sync.
     fn write_ocf_block(&mut self, batch: &RecordBatch, sync: &[u8; 16]) -> Result<(), ArrowError> {
+        let plan = self
+            .plan
+            .as_ref()
+            .ok_or_else(|| ArrowError::ComputeError("internal: write plan missing".into()))?;
         let mut buf = Vec::<u8>::with_capacity(1024);
-        encode_record_batch(batch, &mut buf)?;
+        // Encode with the **plan** (schema‑driven union ordering)
+        encode_record_batch_with_plan(batch, &mut buf, plan)?;
         let encoded = match self.compression {
             Some(codec) => codec.compress(&buf)?,
             None => buf,
@@ -183,13 +268,18 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
         Ok(())
     }
 
+    /// Write in streaming/binary mode, using Single‑Object framing if available.
     fn write_stream(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
+        let plan = self
+            .plan
+            .as_ref()
+            .ok_or_else(|| ArrowError::ComputeError("internal: write plan missing".into()))?;
         if let Some(prefix) = self.format.single_object_prefix() {
-            // Avro Single-Object encoding per record: magic + fingerprint + record
-            encode_record_batch_single_object(batch, &mut self.writer, prefix)
+            // Avro Single‑Object encoding per record: magic + fingerprint + record
+            encode_record_batch_single_object_with_plan(batch, &mut self.writer, prefix, plan)
         } else {
             // Raw Avro binary (no header/prefix)
-            encode_record_batch(batch, &mut self.writer)
+            encode_record_batch_with_plan(batch, &mut self.writer, plan)
         }
     }
 }
@@ -437,13 +527,17 @@ mod tests {
 
     #[test]
     fn test_round_trip_duration_and_uuid_ocf() -> Result<(), ArrowError> {
-        let in_file = File::open("test/data/duration_uuid.avro").expect("open test/data/duration_uuid.avro");
+        let in_file =
+            File::open("test/data/duration_uuid.avro").expect("open test/data/duration_uuid.avro");
         let mut reader = ReaderBuilder::new()
             .build(BufReader::new(in_file))
             .expect("build reader for duration_uuid.avro");
         let in_schema = reader.schema();
         let has_mdn = in_schema.fields().iter().any(|f| {
-            matches!(f.data_type(), DataType::Interval(IntervalUnit::MonthDayNano))
+            matches!(
+                f.data_type(),
+                DataType::Interval(IntervalUnit::MonthDayNano)
+            )
         });
         assert!(
             has_mdn,
