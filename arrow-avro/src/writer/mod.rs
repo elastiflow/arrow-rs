@@ -294,7 +294,7 @@ mod tests {
     use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, IntervalUnit, Schema};
     use std::fs::File;
-    use std::io::BufReader;
+    use std::io::{BufReader, Cursor};
     use std::sync::Arc;
     use tempfile::NamedTempFile;
 
@@ -612,6 +612,60 @@ mod tests {
         assert_eq!(
             decoded, batch,
             "decoded RecordBatch should match the original input batch"
+        );
+        Ok(())
+    }
+
+    // === New round-trip test that exercises Map support ===
+    //
+    // This test reads the same 'nonnullable.impala.avro' used by the reader tests,
+    // writes it back out with the writer (hitting Map encoding paths), then reads it
+    // again and asserts exact Arrow equivalence.
+    #[test]
+    fn test_nonnullable_impala_roundtrip_writer() -> Result<(), ArrowError> {
+        // Load source Avro with Map fields
+        let path = arrow_test_data("avro/nonnullable.impala.avro");
+        let rdr_file = File::open(&path).expect("open avro/nonnullable.impala.avro");
+        let mut reader = ReaderBuilder::new()
+            .build(BufReader::new(rdr_file))
+            .expect("build reader for nonnullable.impala.avro");
+
+        // Collect all input batches and concatenate to a single RecordBatch
+        let in_schema = reader.schema();
+        // Sanity: ensure the file actually contains at least one Map field
+        let has_map = in_schema
+            .fields()
+            .iter()
+            .any(|f| matches!(f.data_type(), DataType::Map(_, _)));
+        assert!(
+            has_map,
+            "expected at least one Map field in avro/nonnullable.impala.avro"
+        );
+
+        let input_batches = reader.collect::<Result<Vec<_>, _>>()?;
+        let original =
+            arrow::compute::concat_batches(&in_schema, &input_batches).expect("concat input");
+
+        // Write out using the OCF writer into an in-memory Vec<u8>
+        let buffer = Vec::<u8>::new();
+        let mut writer = AvroWriter::new(buffer, in_schema.as_ref().clone())?;
+        writer.write(&original)?;
+        writer.finish()?;
+        let out_bytes = writer.into_inner();
+
+        // Read the produced bytes back with the Reader
+        let mut rt_reader = ReaderBuilder::new()
+            .build(Cursor::new(out_bytes))
+            .expect("build reader for round-tripped in-memory OCF");
+        let rt_schema = rt_reader.schema();
+        let rt_batches = rt_reader.collect::<Result<Vec<_>, _>>()?;
+        let roundtrip =
+            arrow::compute::concat_batches(&rt_schema, &rt_batches).expect("concat roundtrip");
+
+        // Exact value fidelity (schema + data)
+        assert_eq!(
+            roundtrip, original,
+            "Round-trip Avro map data mismatch for nonnullable.impala.avro"
         );
         Ok(())
     }

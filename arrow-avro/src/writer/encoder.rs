@@ -5,7 +5,7 @@ use arrow_array::types::{
 };
 use arrow_array::{
     Array, FixedSizeBinaryArray, GenericBinaryArray, GenericStringArray, LargeListArray, ListArray,
-    PrimitiveArray, RecordBatch, StructArray,
+    MapArray, PrimitiveArray, RecordBatch, StructArray,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, Schema as ArrowSchema, TimeUnit};
@@ -94,10 +94,6 @@ fn write_optional_index<W: Write + ?Sized>(
         .map_err(|e| ArrowError::IoError(format!("write union branch: {e}"), e))
 }
 
-// ================================================================================================
-// Plan: schema‑driven write plan derived from the actual Avro schema (Option A with Codec)
-// ================================================================================================
-
 /// Per‑site encoder plan for a field. This mirrors Avro structure so nested
 /// optional branch order can be honored exactly as declared by the schema.
 #[derive(Debug, Clone)]
@@ -111,7 +107,7 @@ enum FieldPlan {
         items_nullability: Option<Nullability>,
         item_plan: Box<FieldPlan>,
     },
-    /// (Reserved) Avro map with value‑site nullability and nested plan
+    /// Avro map with value‑site nullability and nested plan
     Map {
         values_nullability: Option<Nullability>,
         value_plan: Box<FieldPlan>,
@@ -140,6 +136,12 @@ struct ColumnPlan {
     plan: FieldPlan,
 }
 
+/// A pre-computed plan for encoding a `RecordBatch` to Avro.
+///
+/// A `WritePlan` is derived from an Avro schema and an Arrow schema. It maps
+/// top-level Avro fields to Arrow columns and contains a nested encoding plan
+/// for each column. This allows the encoder to write records efficiently without
+/// repeatedly consulting schemas or field names.
 #[derive(Debug, Clone)]
 pub struct WritePlan {
     columns: Vec<ColumnPlan>,
@@ -147,6 +149,14 @@ pub struct WritePlan {
 
 fn find_struct_child_index(fields: &arrow_schema::Fields, name: &str) -> Option<usize> {
     fields.iter().position(|f| f.name() == name)
+}
+
+#[inline]
+fn find_map_value_field_index(fields: &arrow_schema::Fields) -> Option<usize> {
+    // Prefer common Arrow field names; fall back to second child if exactly two
+    find_struct_child_index(fields, "value")
+        .or_else(|| find_struct_child_index(fields, "values"))
+        .or_else(|| if fields.len() == 2 { Some(1) } else { None })
 }
 
 fn build_field_plan(avro_dt: &AvroDataType, arrow_field: &Field) -> Result<FieldPlan, ArrowError> {
@@ -206,10 +216,31 @@ fn build_field_plan(avro_dt: &AvroDataType, arrow_field: &Field) -> Result<Field
             }
         }
         AvroCodec::Map(values_dt) => {
-            // Writer does not currently implement Map encoding; keep plan for future
+            // Avro map -> Arrow DataType::Map(entries_struct, sorted)
+            let entries_field = match arrow_field.data_type() {
+                DataType::Map(entries, _sorted) => entries.as_ref(),
+                other => {
+                    return Err(ArrowError::SchemaError(format!(
+                        "Avro map maps to Arrow DataType::Map, found: {other:?}"
+                    )))
+                }
+            };
+            let entries_struct_fields = match entries_field.data_type() {
+                DataType::Struct(fs) => fs,
+                other => {
+                    return Err(ArrowError::SchemaError(format!(
+                        "Arrow Map entries must be Struct, found: {other:?}"
+                    )))
+                }
+            };
+            let value_idx = find_map_value_field_index(entries_struct_fields).ok_or_else(|| {
+                ArrowError::SchemaError("Map entries struct missing value field".into())
+            })?;
+            let value_field = entries_struct_fields[value_idx].as_ref();
+            let value_plan = build_field_plan(values_dt.as_ref(), value_field)?;
             Ok(FieldPlan::Map {
                 values_nullability: values_dt.nullability(),
-                value_plan: Box::new(FieldPlan::Scalar),
+                value_plan: Box::new(value_plan),
             })
         }
         _ => Ok(FieldPlan::Scalar),
@@ -250,10 +281,6 @@ pub fn build_write_plan_from_avro_root(
     Ok(WritePlan { columns })
 }
 
-// ================================================================================================
-// Public entry points
-// ================================================================================================
-
 /// Derive the write plan for `batch` from its advertised Avro schema in
 /// `SCHEMA_METADATA_KEY`, or generate Avro JSON from Arrow if missing.
 ///
@@ -264,7 +291,6 @@ fn derive_plan_for_batch(
     batch: &RecordBatch,
     order_override: Option<Nullability>,
 ) -> Result<WritePlan, ArrowError> {
-    // 1) Choose the exact Avro JSON we will advertise
     let avro_json = if let Some(json) = batch.schema().metadata.get(SCHEMA_METADATA_KEY) {
         AvroJson::new(json.clone())
     } else {
@@ -273,12 +299,8 @@ fn derive_plan_for_batch(
         };
         AvroJson::from_arrow_with_options(batch.schema().as_ref(), opts)?
     };
-
-    // 2) Parse into AST -> Codec tree
     let avro_ast: AvroJsonAst<'_> = avro_json.schema()?;
     let root = AvroFieldBuilder::new(&avro_ast).build()?;
-
-    // 3) Build the concrete write plan
     build_write_plan_from_avro_root(&root, batch.schema().as_ref())
 }
 
@@ -366,10 +388,6 @@ pub fn encode_record_batch_single_object_with_plan<W: Write>(
     })
 }
 
-// ================================================================================================
-// Encoder preparation and row loop (plan‑aware)
-// ================================================================================================
-
 /// Internal representation of a prepared column encoder for a record batch.
 /// This caches per-column properties and the encoder itself.
 ///
@@ -422,7 +440,6 @@ fn encode_rows_with_prefix_plan<W: Write>(
 ) -> Result<(), ArrowError> {
     for row in 0..rows {
         per_row_prefix(out, row)?;
-
         for ColumnEncoder {
             nullability,
             has_nulls,
@@ -453,14 +470,10 @@ fn encode_rows_with_prefix_plan<W: Write>(
     Ok(())
 }
 
-// ================================================================================================
-// Value encoders
-// ================================================================================================
-
 /// An encoder + a null buffer for nullable fields.
 ///
 /// This stores the inner `Encoder` **by value**. To break recursive size
-/// cycles, the `Encoder` enum boxes only **recursive** variants (Struct/List).
+/// cycles, the `Encoder` enum boxes only **recursive** variants (Struct/List/Map).
 pub struct NullableEncoder<'a> {
     encoder: Encoder<'a>,
     nulls: Option<NullBuffer>,
@@ -602,6 +615,14 @@ fn make_encoder<'a>(array: &'a dyn Array, field: &Field) -> Result<NullableEncod
             let enc = ListEncoder64::try_new_default(arr)?;
             NullableEncoder::new(Encoder::LargeList(Box::new(enc)), nulls, has_nulls)
         }
+        DataType::Map(_, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| ArrowError::SchemaError("Expected MapArray".into()))?;
+            let enc = MapEncoder::try_new_default(arr)?;
+            NullableEncoder::new(Encoder::Map(Box::new(enc)), nulls, has_nulls)
+        }
         DataType::Struct(_) => {
             let arr = array
                 .as_any()
@@ -658,6 +679,14 @@ fn make_encoder_with_plan<'a>(
             let enc = ListEncoder64::try_new_with_plan(arr, *items_nullability, item_plan)?;
             NullableEncoder::new(Encoder::LargeList(Box::new(enc)), nulls, has_nulls)
         }
+        (DataType::Map(_, _), FieldPlan::Map { values_nullability, value_plan }) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| ArrowError::SchemaError("Expected MapArray".into()))?;
+            let enc = MapEncoder::try_new_with_plan(arr, *values_nullability, value_plan)?;
+            NullableEncoder::new(Encoder::Map(Box::new(enc)), nulls, has_nulls)
+        }
         // Fallback to default scalar encoders for non-nested
         _ => make_encoder(array, field)?,
     };
@@ -685,6 +714,7 @@ enum Encoder<'a> {
     Struct(Box<StructEncoder<'a>>),
     List(Box<ListEncoder32<'a>>),
     LargeList(Box<ListEncoder64<'a>>),
+    Map(Box<MapEncoder<'a>>),
 }
 
 impl<'a> Encoder<'a> {
@@ -708,6 +738,7 @@ impl<'a> Encoder<'a> {
             Encoder::Struct(e) => e.encode(idx, out),
             Encoder::List(e) => e.encode(idx, out),
             Encoder::LargeList(e) => e.encode(idx, out),
+            Encoder::Map(e) => e.encode(idx, out),
         }
     }
 }
@@ -848,7 +879,6 @@ impl<'a, O: arrow_array::OffsetSizeTrait> Utf8GenericEncoder<'a, O> {
     }
 }
 
-// Preserve the existing variant names via type aliases (no behavior change).
 type Utf8Encoder<'a> = Utf8GenericEncoder<'a, i32>;
 type Utf8LargeEncoder<'a> = Utf8GenericEncoder<'a, i64>;
 
@@ -1031,5 +1061,170 @@ impl<'a, O: arrow_array::OffsetSizeTrait> ListEncoder<'a, O> {
             self.items_nullability,
             &mut self.values,
         )
+    }
+}
+
+/// Avro `map` encoder for Arrow `MapArray`
+///
+/// Each row encodes as one (possibly empty) map block sequence:
+///   count (long), then for each entry: key (string), value (union index if nullable + value),
+///   terminated by a zero count. Keys are strings per Avro spec. :contentReference[oaicite:2]{index=2}
+enum KeyArrayRef<'a> {
+    Utf8(&'a GenericStringArray<i32>),
+    LargeUtf8(&'a GenericStringArray<i64>),
+}
+
+struct MapEncoder<'a> {
+    map: &'a MapArray,
+    keys: KeyArrayRef<'a>,
+    values: NullableEncoder<'a>,
+    values_nullability: Option<Nullability>,
+    keys_offset: usize,
+    values_offset: usize,
+}
+
+impl<'a> MapEncoder<'a> {
+    /// Legacy constructor: default union ordering (NullFirst) if value field nullable.
+    fn try_new_default(map: &'a MapArray) -> Result<Self, ArrowError> {
+        // Determine key array and offsets
+        let keys_arr = map.keys();
+        let keys_offset = keys_arr.offset();
+        let keys = match keys_arr.data_type() {
+            DataType::Utf8 => KeyArrayRef::Utf8(keys_arr.as_ref().as_string::<i32>()),
+            DataType::LargeUtf8 => KeyArrayRef::LargeUtf8(keys_arr.as_ref().as_string::<i64>()),
+            other => {
+                return Err(ArrowError::SchemaError(format!(
+                    "Arrow Map keys must be Utf8/LargeUtf8, found: {other:?}"
+                )))
+            }
+        };
+
+        // Find value Field from DataType::Map(entries_struct)
+        let (value_field, values_nullable) = match map.data_type() {
+            DataType::Map(entries, _sorted) => {
+                let entries_struct_fields = match entries.data_type() {
+                    DataType::Struct(fs) => fs,
+                    other => {
+                        return Err(ArrowError::SchemaError(format!(
+                            "Arrow Map entries must be Struct, found: {other:?}"
+                        )))
+                    }
+                };
+                let v_idx = find_map_value_field_index(entries_struct_fields).ok_or_else(|| {
+                    ArrowError::SchemaError("Map entries struct missing value field".into())
+                })?;
+                let vf = entries_struct_fields[v_idx].as_ref();
+                (vf.clone(), vf.is_nullable())
+            }
+            _ => unreachable!("Validated by MapArray::data_type"),
+        };
+
+        let values_enc = make_encoder(map.values().as_ref(), &value_field)?;
+        Ok(Self {
+            map,
+            keys,
+            values: values_enc,
+            values_nullability: values_nullable.then_some(Nullability::NullFirst),
+            keys_offset,
+            values_offset: map.values().offset(),
+        })
+    }
+
+    /// Plan‑aware constructor: preserves Avro union order for values.
+    fn try_new_with_plan(
+        map: &'a MapArray,
+        values_nullability: Option<Nullability>,
+        value_plan: &FieldPlan,
+    ) -> Result<Self, ArrowError> {
+        let keys_arr = map.keys();
+        let keys_offset = keys_arr.offset();
+        let keys = match keys_arr.data_type() {
+            DataType::Utf8 => KeyArrayRef::Utf8(keys_arr.as_ref().as_string::<i32>()),
+            DataType::LargeUtf8 => KeyArrayRef::LargeUtf8(keys_arr.as_ref().as_string::<i64>()),
+            other => {
+                return Err(ArrowError::SchemaError(format!(
+                    "Arrow Map keys must be Utf8/LargeUtf8, found: {other:?}"
+                )))
+            }
+        };
+
+        // Locate the Arrow value field from the Map's entries struct
+        let value_field = match map.data_type() {
+            DataType::Map(entries, _sorted) => {
+                let entries_struct_fields = match entries.data_type() {
+                    DataType::Struct(fs) => fs,
+                    other => {
+                        return Err(ArrowError::SchemaError(format!(
+                            "Arrow Map entries must be Struct, found: {other:?}"
+                        )))
+                    }
+                };
+                let v_idx = find_map_value_field_index(entries_struct_fields).ok_or_else(|| {
+                    ArrowError::SchemaError("Map entries struct missing value field".into())
+                })?;
+                entries_struct_fields[v_idx].as_ref().clone()
+            }
+            _ => unreachable!("Validated by MapArray::data_type"),
+        };
+
+        let values_enc =
+            make_encoder_with_plan(map.values().as_ref(), &value_field, value_plan)?;
+        Ok(Self {
+            map,
+            keys,
+            values: values_enc,
+            values_nullability,
+            keys_offset,
+            values_offset: map.values().offset(),
+        })
+    }
+
+    #[inline]
+    fn encode<W: Write + ?Sized>(&mut self, idx: usize, out: &mut W) -> Result<(), ArrowError> {
+        // Compute entry range [start, end)
+        let offsets = self.map.offsets();
+        // MapArray offsets are i32 and guaranteed >= 0. :contentReference[oaicite:3]{index=3}
+        let start = offsets[idx] as usize;
+        let end = offsets[idx + 1] as usize;
+
+        let len = end.saturating_sub(start);
+        if len == 0 {
+            // Empty map: just write the terminator block
+            write_long(out, 0)?;
+            return Ok(());
+        }
+
+        // Single block containing all entries, then terminator 0
+        write_long(out, len as i64)?;
+
+        for j in start..end {
+            // Keys
+            let j_key = j.saturating_sub(self.keys_offset);
+            match self.keys {
+                KeyArrayRef::Utf8(arr) => {
+                    let s = arr.value(j_key);
+                    write_len_prefixed(out, s.as_bytes())?;
+                }
+                KeyArrayRef::LargeUtf8(arr) => {
+                    let s = arr.value(j_key);
+                    write_len_prefixed(out, s.as_bytes())?;
+                }
+            }
+
+            // Values (optional union branch if declared nullable in Avro)
+            let j_val = j.saturating_sub(self.values_offset);
+            if let Some(order) = self.values_nullability {
+                let is_null = self.values.is_null(j_val);
+                write_optional_index(out, is_null, order)?;
+                if is_null {
+                    continue;
+                }
+            }
+            self.values.encode(j_val, out)?;
+        }
+
+        // End-of-map marker
+        write_long(out, 0)?;
+        Ok(())
     }
 }
