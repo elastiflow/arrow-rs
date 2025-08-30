@@ -4,15 +4,14 @@ use arrow_array::types::{
     TimestampMicrosecondType,
 };
 use arrow_array::{
-    Array, FixedSizeBinaryArray, GenericBinaryArray, GenericStringArray, LargeListArray, ListArray,
-    MapArray, PrimitiveArray, RecordBatch, StructArray,
+    Array, DictionaryArray, FixedSizeBinaryArray, GenericBinaryArray, GenericStringArray,
+    LargeListArray, ListArray, MapArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, Schema as ArrowSchema, TimeUnit};
 use std::io::Write;
+use std::sync::Arc;
 use uuid::Uuid;
-
-// === New, plan‑driven encoding imports ===
 use crate::codec::{
     AvroDataType, AvroField as CodecAvroField, AvroFieldBuilder, Codec as AvroCodec, Nullability,
 };
@@ -22,7 +21,8 @@ use crate::schema::{
 
 /// Encode a single Avro-`long` using ZigZag + variable length, buffered.
 ///
-/// Spec: https://avro.apache.org/docs/1.11.0/spec.html (Binary Encoding)
+/// Avro binary encoding uses variable-length zig-zag encoding for integral types.
+/// See: https://avro.apache.org/docs/1.11.1/specification/ (Binary Encoding)
 #[inline]
 pub fn write_long<W: Write + ?Sized>(writer: &mut W, value: i64) -> Result<(), ArrowError> {
     let mut zz = ((value << 1) ^ (value >> 63)) as u64;
@@ -65,6 +65,7 @@ fn write_bool<W: Write + ?Sized>(writer: &mut W, v: bool) -> Result<(), ArrowErr
 ///
 /// Branch index is 0‑based per Avro unions. We special-case 0 or 1 which
 /// are single-byte varints: `0x00` (index 0) and `0x02` (index 1).
+/// See: https://avro.apache.org/docs/1.11.1/specification/ (Unions)
 #[inline]
 fn write_optional_index<W: Write + ?Sized>(
     writer: &mut W,
@@ -112,6 +113,9 @@ enum FieldPlan {
         values_nullability: Option<Nullability>,
         value_plan: Box<FieldPlan>,
     },
+    /// Avro enum; maps to Arrow Dictionary<Int32, Utf8> with dictionary values
+    /// exactly equal and ordered as the Avro enum `symbols`.
+    Enum { symbols: Arc<[String]> },
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +165,29 @@ fn find_map_value_field_index(fields: &arrow_schema::Fields) -> Option<usize> {
 
 fn build_field_plan(avro_dt: &AvroDataType, arrow_field: &Field) -> Result<FieldPlan, ArrowError> {
     match avro_dt.codec() {
+        AvroCodec::Enum(symbols) => {
+            match arrow_field.data_type() {
+                DataType::Dictionary(key_dt, value_dt) => {
+                    // Enforce exact reader-compatible shape: Dictionary<Int32, Utf8>
+                    if **key_dt != DataType::Int32 {
+                        return Err(ArrowError::SchemaError(
+                            "Avro enum requires Dictionary<Int32, Utf8>".into(),
+                        ));
+                    }
+                    if **value_dt != DataType::Utf8 {
+                        return Err(ArrowError::SchemaError(
+                            "Avro enum requires Dictionary<Int32, Utf8>".into(),
+                        ));
+                    }
+                    Ok(FieldPlan::Enum {
+                        symbols: symbols.clone(),
+                    })
+                }
+                other => Err(ArrowError::SchemaError(format!(
+                    "Avro enum maps to Arrow Dictionary<Int32, Utf8>, found: {other:?}"
+                ))),
+            }
+        }
         AvroCodec::Struct(avro_children) => {
             let fields = match arrow_field.data_type() {
                 DataType::Struct(fs) => fs,
@@ -687,6 +714,50 @@ fn make_encoder_with_plan<'a>(
             let enc = MapEncoder::try_new_with_plan(arr, *values_nullability, value_plan)?;
             NullableEncoder::new(Encoder::Map(Box::new(enc)), nulls, has_nulls)
         }
+        // === NEW: Enum support ===
+        (DataType::Dictionary(key_dt, value_dt), FieldPlan::Enum { symbols }) => {
+            // Enforce the same shape we validated in build_field_plan
+            if **key_dt != DataType::Int32 || **value_dt != DataType::Utf8 {
+                return Err(ArrowError::SchemaError(
+                    "Avro enum requires Dictionary<Int32, Utf8>".into(),
+                ));
+            }
+
+            let dict = array
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .ok_or_else(|| ArrowError::SchemaError("Expected DictionaryArray<Int32>".into()))?;
+
+            // Validate dictionary values exactly match schema symbols (order & content)
+            let values = dict
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| ArrowError::SchemaError("Dictionary values must be Utf8".into()))?;
+
+            if values.len() != symbols.len() {
+                return Err(ArrowError::SchemaError(format!(
+                    "Enum symbol length {} != dictionary size {}",
+                    symbols.len(),
+                    values.len()
+                )));
+            }
+            for i in 0..values.len() {
+                if values.value(i) != symbols[i].as_str() {
+                    return Err(ArrowError::SchemaError(format!(
+                        "Enum symbol mismatch at {i}: schema='{}' dict='{}'",
+                        symbols[i],
+                        values.value(i)
+                    )));
+                }
+            }
+
+            // Keys are the Avro enum indices (zero-based position into symbols)
+            // Per Avro spec, enums encode as an int equal to symbol index.
+            let keys = dict.keys();
+            let enc = EnumEncoder { keys };
+            NullableEncoder::new(Encoder::Enum(enc), nulls, has_nulls)
+        }
         // Fallback to default scalar encoders for non-nested
         _ => make_encoder(array, field)?,
     };
@@ -711,6 +782,8 @@ enum Encoder<'a> {
     /// Avro `string` encoder variants (Utf8/LargeUtf8)
     Utf8(Utf8Encoder<'a>),
     Utf8Large(Utf8LargeEncoder<'a>),
+    /// Avro `enum` encoder: writes the key (int) as the enum index.
+    Enum(EnumEncoder<'a>),
     Struct(Box<StructEncoder<'a>>),
     List(Box<ListEncoder32<'a>>),
     LargeList(Box<ListEncoder64<'a>>),
@@ -735,6 +808,7 @@ impl<'a> Encoder<'a> {
             Encoder::IntervalMonthDayNano(e) => e.encode(idx, out),
             Encoder::Utf8(e) => e.encode(idx, out),
             Encoder::Utf8Large(e) => e.encode(idx, out),
+            Encoder::Enum(e) => e.encode(idx, out),
             Encoder::Struct(e) => e.encode(idx, out),
             Encoder::List(e) => e.encode(idx, out),
             Encoder::LargeList(e) => e.encode(idx, out),
@@ -881,6 +955,23 @@ impl<'a, O: arrow_array::OffsetSizeTrait> Utf8GenericEncoder<'a, O> {
 
 type Utf8Encoder<'a> = Utf8GenericEncoder<'a, i32>;
 type Utf8LargeEncoder<'a> = Utf8GenericEncoder<'a, i64>;
+
+/// Avro `enum` encoder for Arrow `DictionaryArray<Int32, Utf8>`.
+///
+/// Per Avro 1.11.1 spec, an enum is encoded as an **int** equal to the
+/// zero-based position of the symbol in the schema’s `symbols` list.
+/// We validate at construction that the dictionary values equal the symbols,
+/// so we can directly write the key value here.
+struct EnumEncoder<'a> {
+    keys: &'a PrimitiveArray<Int32Type>,
+}
+impl EnumEncoder<'_> {
+    #[inline]
+    fn encode<W: Write + ?Sized>(&mut self, row: usize, out: &mut W) -> Result<(), ArrowError> {
+        let idx = self.keys.value(row);
+        write_int(out, idx)
+    }
+}
 
 /// Avro `record` encoder for Arrow `StructArray`
 ///
@@ -1068,7 +1159,7 @@ impl<'a, O: arrow_array::OffsetSizeTrait> ListEncoder<'a, O> {
 ///
 /// Each row encodes as one (possibly empty) map block sequence:
 ///   count (long), then for each entry: key (string), value (union index if nullable + value),
-///   terminated by a zero count. Keys are strings per Avro spec. :contentReference[oaicite:2]{index=2}
+///   terminated by a zero count. Keys are strings per Avro spec.
 enum KeyArrayRef<'a> {
     Utf8(&'a GenericStringArray<i32>),
     LargeUtf8(&'a GenericStringArray<i64>),
@@ -1183,7 +1274,7 @@ impl<'a> MapEncoder<'a> {
     fn encode<W: Write + ?Sized>(&mut self, idx: usize, out: &mut W) -> Result<(), ArrowError> {
         // Compute entry range [start, end)
         let offsets = self.map.offsets();
-        // MapArray offsets are i32 and guaranteed >= 0. :contentReference[oaicite:3]{index=3}
+        // MapArray offsets are i32 and guaranteed >= 0.
         let start = offsets[idx] as usize;
         let end = offsets[idx + 1] as usize;
 

@@ -669,4 +669,58 @@ mod tests {
         );
         Ok(())
     }
+
+    // === New round-trip test for Avro Enum <-> Arrow Dictionary<Int32, Utf8> ===
+    //
+    // This test uses the same "avro/simple_enum.avro" fixture as the reader's
+    // `test_simple` to ensure the writer produces bytes that read back to the
+    // exact same Arrow representation (Dictionary<Int32, Utf8>), consistent with:
+    // * Avro enum binary encoding (int index into `symbols`)
+    // * arrow-avro's documented mapping (Codec::Enum -> Dictionary(Int32, Utf8))
+    #[test]
+    fn test_enum_roundtrip_uses_reader_fixture() -> Result<(), ArrowError> {
+        // Read the known-good enum file (same as reader::test_simple)
+        let path = arrow_test_data("avro/simple_enum.avro");
+        let rdr_file = File::open(&path).expect("open avro/simple_enum.avro");
+        let mut reader = ReaderBuilder::new()
+            .build(BufReader::new(rdr_file))
+            .expect("build reader for simple_enum.avro");
+
+        // Concatenate all batches to one RecordBatch for a clean equality check
+        let in_schema = reader.schema();
+        let input_batches = reader.collect::<Result<Vec<_>, _>>()?;
+        let original =
+            arrow::compute::concat_batches(&in_schema, &input_batches).expect("concat input");
+
+        // Sanity: expect at least one Dictionary(Int32, Utf8) column (enum)
+        let has_enum_dict = in_schema.fields().iter().any(|f| {
+            matches!(
+                f.data_type(),
+                DataType::Dictionary(k, v) if **k == DataType::Int32 && **v == DataType::Utf8
+            )
+        });
+        assert!(
+            has_enum_dict,
+            "Expected at least one enum-mapped Dictionary<Int32, Utf8> field"
+        );
+
+        // Write with OCF writer into memory using the reader-provided Arrow schema.
+        // The writer will embed the Avro JSON from `avro.schema` metadata if present.
+        let buffer: Vec<u8> = Vec::new();
+        let mut writer = AvroWriter::new(buffer, in_schema.as_ref().clone())?;
+        writer.write(&original)?;
+        writer.finish()?;
+        let bytes = writer.into_inner();
+
+        // Read back and compare for exact equality (schema + data)
+        let mut rt_reader = ReaderBuilder::new()
+            .build(Cursor::new(bytes))
+            .expect("reader for round-trip");
+        let rt_schema = rt_reader.schema();
+        let rt_batches = rt_reader.collect::<Result<Vec<_>, _>>()?;
+        let roundtrip =
+            arrow::compute::concat_batches(&rt_schema, &rt_batches).expect("concat roundtrip");
+        assert_eq!(roundtrip, original, "Avro enum round-trip mismatch");
+        Ok(())
+    }
 }
