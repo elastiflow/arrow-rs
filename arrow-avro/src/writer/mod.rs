@@ -312,7 +312,7 @@ mod tests {
             Arc::new(make_schema()),
             vec![Arc::new(ids) as ArrayRef, Arc::new(names) as ArrayRef],
         )
-            .expect("failed to build test RecordBatch")
+        .expect("failed to build test RecordBatch")
     }
 
     #[test]
@@ -543,11 +543,10 @@ mod tests {
             has_mdn,
             "expected at least one Interval(MonthDayNano) field in duration_uuid.avro"
         );
-        let has_uuid_fixed =
-            in_schema
-                .fields()
-                .iter()
-                .any(|f| matches!(f.data_type(), DataType::FixedSizeBinary(16)));
+        let has_uuid_fixed = in_schema
+            .fields()
+            .iter()
+            .any(|f| matches!(f.data_type(), DataType::FixedSizeBinary(16)));
         assert!(
             has_uuid_fixed,
             "expected at least one FixedSizeBinary(16) (uuid) field in duration_uuid.avro"
@@ -592,7 +591,9 @@ mod tests {
         // Build a SchemaStore and register the writer Avro schema to obtain the fingerprint
         let avro_schema = AvroSchema::try_from(&schema)?;
         let mut store = SchemaStore::new();
-        let fp = store.register(avro_schema.clone()).expect("register schema");
+        let fp = store
+            .register(avro_schema.clone())
+            .expect("register schema");
         // Decode the streaming bytes with the low-level Decoder
         let mut decoder = ReaderBuilder::new()
             .with_batch_size(1024)

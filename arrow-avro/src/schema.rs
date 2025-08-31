@@ -23,8 +23,6 @@ use std::cmp::PartialEq;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use strum_macros::AsRefStr;
-
-// NEW: Use codec Nullability to control union order in schema generation
 use crate::codec::Nullability;
 
 /// The metadata key used for storing the JSON encoded [`Schema`]
@@ -939,9 +937,9 @@ fn datatype_to_avro_with_opts(
                 .get("logicalType")
                 .is_some_and(|value| value == "uuid")
                 || (*len == 16
-                && metadata
-                .get("ARROW:extension:name")
-                .is_some_and(|value| value == "uuid"));
+                    && metadata
+                        .get("ARROW:extension:name")
+                        .is_some_and(|value| value == "uuid"));
             if is_uuid {
                 json!({ "type": "string", "logicalType": "uuid" })
             } else {
@@ -1034,8 +1032,13 @@ fn datatype_to_avro_with_opts(
             if matches!(dt, DataType::LargeList(_)) {
                 extras.insert("arrowLargeList".into(), Value::Bool(true));
             }
-            let (items_inner, ie) =
-                datatype_to_avro_with_opts(child.data_type(), child.name(), child.metadata(), name_gen, opts)?;
+            let (items_inner, ie) = datatype_to_avro_with_opts(
+                child.data_type(),
+                child.name(),
+                child.metadata(),
+                name_gen,
+                opts,
+            )?;
             let items_with_meta = merge_extras(items_inner, ie);
             let items_schema = if child.is_nullable() {
                 wrap_nullable(items_with_meta, order)
@@ -1049,8 +1052,13 @@ fn datatype_to_avro_with_opts(
         }
         DataType::FixedSizeList(child, len) => {
             extras.insert("arrowFixedSize".into(), json!(len));
-            let (items_inner, ie) =
-                datatype_to_avro_with_opts(child.data_type(), child.name(), child.metadata(), name_gen, opts)?;
+            let (items_inner, ie) = datatype_to_avro_with_opts(
+                child.data_type(),
+                child.name(),
+                child.metadata(),
+                name_gen,
+                opts,
+            )?;
             let items_with_meta = merge_extras(items_inner, ie);
             let items_schema = if child.is_nullable() {
                 wrap_nullable(items_with_meta, order)
@@ -1110,8 +1118,13 @@ fn datatype_to_avro_with_opts(
                     "symbols": symbols
                 })
             } else {
-                let (inner, ie) =
-                    datatype_to_avro_with_opts(value.as_ref(), field_name, metadata, name_gen, opts)?;
+                let (inner, ie) = datatype_to_avro_with_opts(
+                    value.as_ref(),
+                    field_name,
+                    metadata,
+                    name_gen,
+                    opts,
+                )?;
                 merge_extras(inner, ie)
             }
         }
@@ -1150,8 +1163,13 @@ fn arrow_field_to_avro_with_opts(
 
     // Sanitize field name to ensure Avro validity but store the original in metadata
     let avro_name = sanitise_avro_name(field.name());
-    let (schema, extras) =
-        datatype_to_avro_with_opts(field.data_type(), &avro_name, field.metadata(), name_gen, opts)?;
+    let (schema, extras) = datatype_to_avro_with_opts(
+        field.data_type(),
+        &avro_name,
+        field.metadata(),
+        name_gen,
+        opts,
+    )?;
     let merged = merge_extras(schema, extras);
 
     // If nullable, wrap union using requested order
@@ -1261,7 +1279,7 @@ mod tests {
                    "logicalType":"timestamp-micros"
                 }"#,
         )
-            .unwrap();
+        .unwrap();
 
         let timestamp = Type {
             r#type: TypeName::Primitive(PrimitiveType::Long),
@@ -1284,7 +1302,7 @@ mod tests {
                    "scale":2
                 }"#,
         )
-            .unwrap();
+        .unwrap();
 
         let decimal = ComplexType::Fixed(Fixed {
             name: "fixed",
@@ -1324,7 +1342,7 @@ mod tests {
                ]
             }"#,
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(
             schema,
@@ -1357,7 +1375,7 @@ mod tests {
                   ]
                 }"#,
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(
             schema,
@@ -1416,7 +1434,7 @@ mod tests {
                ]
             }"#,
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(
             schema,
@@ -1477,7 +1495,7 @@ mod tests {
                   ]
             }"#,
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(
             schema,

@@ -17,10 +17,9 @@
 
 use crate::compression::{CompressionCodec, CODEC_METADATA_KEY};
 use crate::schema::{AvroSchema, Fingerprint, SCHEMA_METADATA_KEY, SINGLE_OBJECT_MAGIC};
-use crate::writer::encoder::{write_long, EncoderOptions};
+use crate::writer::encoder::write_long;
 use arrow_schema::{ArrowError, Schema};
 use rand::RngCore;
-use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::fmt::Debug;
 use std::io::Write;
 
@@ -55,29 +54,6 @@ pub trait AvroFormat: Debug + Default {
 #[derive(Debug, Default)]
 pub struct AvroOcfFormat {
     sync_marker: [u8; 16],
-    /// Legacy encoder behavior knob retained for API compatibility.
-    /// **Deprecated**: encoding is now schema‑driven; this is ignored.
-    #[allow(dead_code)]
-    encoder_options: EncoderOptions,
-}
-
-impl AvroOcfFormat {
-    /// **Deprecated**: No‑op. Encoding is driven by the Avro schema written into the header,
-    /// not by encoder options.
-    #[deprecated(
-        note = "No-op: encoding is schema-driven; use schema JSON/metadata to control union order"
-    )]
-    #[allow(dead_code)]
-    pub fn with_encoder_options(mut self, opts: EncoderOptions) -> Self {
-        let _ = opts; // ignore
-        self
-    }
-
-    /// Accessor retained for compatibility. Returns the stored (unused) options.
-    #[allow(dead_code)]
-    pub fn encoder_options(&self) -> &EncoderOptions {
-        &self.encoder_options
-    }
 }
 
 impl AvroFormat for AvroOcfFormat {
@@ -148,19 +124,9 @@ pub struct AvroBinaryFormat {
     /// Pre-built 10-byte single-object prefix written before each record.
     /// [0..2) = magic, [2..10) = schema fingerprint (little endian)
     prefix: [u8; 10],
-    /// Legacy encoder behavior knob (currently unused by the format layer).
-    #[allow(dead_code)]
-    encoder_options: EncoderOptions,
 }
 
 impl AvroBinaryFormat {
-    /// Optional helper retained for compatibility (currently a no-op for the format layer).
-    #[allow(dead_code)]
-    pub fn with_encoder_options(mut self, opts: EncoderOptions) -> Self {
-        self.encoder_options = opts;
-        self
-    }
-
     /// Returns the 10-byte prefix (`C3 01` + fingerprint) to be written before each record.
     #[inline]
     pub fn prefix(&self) -> &[u8; 10] {
@@ -174,13 +140,6 @@ impl AvroBinaryFormat {
         let mut fp = [0u8; 8];
         fp.copy_from_slice(&self.prefix[2..10]);
         fp
-    }
-
-    /// Access the encoder options used by this format (unused; compatibility only).
-    #[allow(dead_code)]
-    #[inline]
-    pub fn encoder_options(&self) -> &EncoderOptions {
-        &self.encoder_options
     }
 }
 

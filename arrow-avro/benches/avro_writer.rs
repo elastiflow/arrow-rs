@@ -452,7 +452,7 @@ static STRUCT_DATA: Lazy<Vec<RecordBatch>> = Lazy::new(|| {
             Field::new("s2", DataType::Int32, false),
             Field::new("s3", DataType::Float64, false),
         ]
-            .into(),
+        .into(),
     );
     let schema = schema_single("field1", struct_dt);
     SIZES

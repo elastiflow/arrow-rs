@@ -1,3 +1,9 @@
+use crate::codec::{
+    AvroDataType, AvroField as CodecAvroField, AvroFieldBuilder, Codec as AvroCodec, Nullability,
+};
+use crate::schema::{
+    AvroSchema as AvroJson, Schema as AvroJsonAst, SchemaGenOptions, SCHEMA_METADATA_KEY,
+};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     ArrowPrimitiveType, Float32Type, Float64Type, Int32Type, Int64Type, IntervalMonthDayNanoType,
@@ -12,12 +18,6 @@ use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, Schema as ArrowSch
 use std::io::Write;
 use std::sync::Arc;
 use uuid::Uuid;
-use crate::codec::{
-    AvroDataType, AvroField as CodecAvroField, AvroFieldBuilder, Codec as AvroCodec, Nullability,
-};
-use crate::schema::{
-    AvroSchema as AvroJson, Schema as AvroJsonAst, SchemaGenOptions, SCHEMA_METADATA_KEY,
-};
 
 /// Encode a single Avro-`long` using ZigZag + variable length, buffered.
 ///
@@ -293,9 +293,9 @@ pub fn build_write_plan_from_avro_root(
     let mut columns = Vec::with_capacity(avro_children.len());
     for avro_child in avro_children.iter() {
         let name = avro_child.name();
-        let arrow_index = arrow_schema
-            .index_of(name)
-            .map_err(|e| ArrowError::SchemaError(format!("Schema mismatch for field '{name}': {e}")))?;
+        let arrow_index = arrow_schema.index_of(name).map_err(|e| {
+            ArrowError::SchemaError(format!("Schema mismatch for field '{name}': {e}"))
+        })?;
         // In this Arrow version, `Schema::field` returns `&Field` directly.
         let arrow_field = arrow_schema.field(arrow_index);
         let plan = build_field_plan(avro_child.data_type(), arrow_field)?;
@@ -311,18 +311,14 @@ pub fn build_write_plan_from_avro_root(
 /// Derive the write plan for `batch` from its advertised Avro schema in
 /// `SCHEMA_METADATA_KEY`, or generate Avro JSON from Arrow if missing.
 ///
-/// If `order_override` is `Some`, it is only used when synthesizing Avro JSON
-/// from Arrow (i.e., metadata is absent); otherwise the **actual** Avro JSON
-/// controls all union orders.
-fn derive_plan_for_batch(
-    batch: &RecordBatch,
-    order_override: Option<Nullability>,
-) -> Result<WritePlan, ArrowError> {
+/// When synthesizing Avro JSON from Arrow (i.e., metadata is absent), the
+/// default union order is used (no override).
+fn derive_plan_for_batch(batch: &RecordBatch) -> Result<WritePlan, ArrowError> {
     let avro_json = if let Some(json) = batch.schema().metadata.get(SCHEMA_METADATA_KEY) {
         AvroJson::new(json.clone())
     } else {
         let opts = SchemaGenOptions {
-            null_union_order: order_override,
+            null_union_order: None,
         };
         AvroJson::from_arrow_with_options(batch.schema().as_ref(), opts)?
     };
@@ -333,33 +329,7 @@ fn derive_plan_for_batch(
 
 /// Encode a `RecordBatch` in Avro binary format using the **schema‑driven plan**.
 pub fn encode_record_batch<W: Write>(batch: &RecordBatch, out: &mut W) -> Result<(), ArrowError> {
-    let plan = derive_plan_for_batch(batch, None)?;
-    encode_record_batch_with_plan(batch, out, &plan)
-}
-
-/// **Deprecated:** legacy options. Kept for compatibility. These no longer
-/// directly drive the encoder; instead they are used only to synthesize a
-/// temporary Avro schema when none is present in metadata.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct EncoderOptions {
-    /// If `true`, nullable unions are generated as `[T,"null"]` when *creating*
-    /// a temporary Avro JSON from Arrow (NullSecond). If `false`, `["null",T]`.
-    pub(crate) impala_mode: bool,
-}
-
-/// Deprecated: encodes with options by synthesizing an Avro JSON (if needed)
-/// matching `opts`, and then following the resulting schema exactly.
-pub fn encode_record_batch_with_options<W: Write>(
-    batch: &RecordBatch,
-    out: &mut W,
-    opts: &EncoderOptions,
-) -> Result<(), ArrowError> {
-    let override_order = if opts.impala_mode {
-        Some(Nullability::NullSecond)
-    } else {
-        Some(Nullability::NullFirst)
-    };
-    let plan = derive_plan_for_batch(batch, override_order)?;
+    let plan = derive_plan_for_batch(batch)?;
     encode_record_batch_with_plan(batch, out, &plan)
 }
 
@@ -371,23 +341,7 @@ pub fn encode_record_batch_single_object<W: Write>(
     out: &mut W,
     prefix: &[u8; 10],
 ) -> Result<(), ArrowError> {
-    let plan = derive_plan_for_batch(batch, None)?;
-    encode_record_batch_single_object_with_plan(batch, out, prefix, &plan)
-}
-
-/// Deprecated: single‑object with legacy options (see note on `encode_record_batch_with_options`)
-pub fn encode_record_batch_single_object_with_options<W: Write>(
-    batch: &RecordBatch,
-    out: &mut W,
-    prefix: &[u8; 10],
-    opts: &EncoderOptions,
-) -> Result<(), ArrowError> {
-    let override_order = if opts.impala_mode {
-        Some(Nullability::NullSecond)
-    } else {
-        Some(Nullability::NullFirst)
-    };
-    let plan = derive_plan_for_batch(batch, override_order)?;
+    let plan = derive_plan_for_batch(batch)?;
     encode_record_batch_single_object_with_plan(batch, out, prefix, &plan)
 }
 
@@ -439,9 +393,9 @@ fn prepare_encoders_for_batch_with_plan<'a>(
     let mut out = Vec::with_capacity(plan.columns.len());
     for col_plan in plan.columns.iter() {
         let arrow_index = col_plan.arrow_index;
-        let array = arrays
-            .get(arrow_index)
-            .ok_or_else(|| ArrowError::SchemaError(format!("Column index {arrow_index} out of range")))?;
+        let array = arrays.get(arrow_index).ok_or_else(|| {
+            ArrowError::SchemaError(format!("Column index {arrow_index} out of range"))
+        })?;
         let field = fields[arrow_index].as_ref();
         let enc = make_encoder_with_plan(array.as_ref(), field, &col_plan.plan)?;
         let has_nulls = enc.has_nulls();
@@ -541,7 +495,10 @@ impl<'a> NullableEncoder<'a> {
 /// logical type / extension metadata so that the binary encoding matches the
 /// emitted Avro schema (e.g., `fixed` vs `string`+`logicalType=uuid`,
 /// and `fixed(12)`+`logicalType=duration` for MonthDayNano).
-fn make_encoder<'a>(array: &'a dyn Array, field: &Field) -> Result<NullableEncoder<'a>, ArrowError> {
+fn make_encoder<'a>(
+    array: &'a dyn Array,
+    field: &Field,
+) -> Result<NullableEncoder<'a>, ArrowError> {
     let nulls = array.nulls().cloned();
     let has_nulls = array.null_count() > 0;
     let enc = match array.data_type() {
@@ -551,11 +508,19 @@ fn make_encoder<'a>(array: &'a dyn Array, field: &Field) -> Result<NullableEncod
         }
         DataType::Utf8 => {
             let arr = array.as_string::<i32>();
-            NullableEncoder::new(Encoder::Utf8(Utf8GenericEncoder::<i32>(arr)), nulls, has_nulls)
+            NullableEncoder::new(
+                Encoder::Utf8(Utf8GenericEncoder::<i32>(arr)),
+                nulls,
+                has_nulls,
+            )
         }
         DataType::LargeUtf8 => {
             let arr = array.as_string::<i64>();
-            NullableEncoder::new(Encoder::Utf8Large(Utf8GenericEncoder::<i64>(arr)), nulls, has_nulls)
+            NullableEncoder::new(
+                Encoder::Utf8Large(Utf8GenericEncoder::<i64>(arr)),
+                nulls,
+                has_nulls,
+            )
         }
         DataType::Int32 => {
             let arr = array.as_primitive::<Int32Type>();
@@ -690,7 +655,13 @@ fn make_encoder_with_plan<'a>(
             let enc = StructEncoder::try_new_with_plan(arr, children)?;
             NullableEncoder::new(Encoder::Struct(Box::new(enc)), nulls, has_nulls)
         }
-        (DataType::List(_), FieldPlan::List { items_nullability, item_plan }) => {
+        (
+            DataType::List(_),
+            FieldPlan::List {
+                items_nullability,
+                item_plan,
+            },
+        ) => {
             let arr = array
                 .as_any()
                 .downcast_ref::<ListArray>()
@@ -698,7 +669,13 @@ fn make_encoder_with_plan<'a>(
             let enc = ListEncoder32::try_new_with_plan(arr, *items_nullability, item_plan)?;
             NullableEncoder::new(Encoder::List(Box::new(enc)), nulls, has_nulls)
         }
-        (DataType::LargeList(_), FieldPlan::List { items_nullability, item_plan }) => {
+        (
+            DataType::LargeList(_),
+            FieldPlan::List {
+                items_nullability,
+                item_plan,
+            },
+        ) => {
             let arr = array
                 .as_any()
                 .downcast_ref::<LargeListArray>()
@@ -706,7 +683,13 @@ fn make_encoder_with_plan<'a>(
             let enc = ListEncoder64::try_new_with_plan(arr, *items_nullability, item_plan)?;
             NullableEncoder::new(Encoder::LargeList(Box::new(enc)), nulls, has_nulls)
         }
-        (DataType::Map(_, _), FieldPlan::Map { values_nullability, value_plan }) => {
+        (
+            DataType::Map(_, _),
+            FieldPlan::Map {
+                values_nullability,
+                value_plan,
+            },
+        ) => {
             let arr = array
                 .as_any()
                 .downcast_ref::<MapArray>()
@@ -1010,10 +993,9 @@ impl<'a> StructEncoder<'a> {
         let mut encs = Vec::with_capacity(plan_children.len());
         for child_plan in plan_children {
             let idx = child_plan.arrow_index;
-            let col = array
-                .columns()
-                .get(idx)
-                .ok_or_else(|| ArrowError::SchemaError(format!("Struct child index {idx} out of range")))?;
+            let col = array.columns().get(idx).ok_or_else(|| {
+                ArrowError::SchemaError(format!("Struct child index {idx} out of range"))
+            })?;
             let field = fields[idx].as_ref();
             let child = make_encoder_with_plan(col.as_ref(), field, &child_plan.plan)?;
             encs.push((child_plan.nullability, child));
@@ -1088,7 +1070,9 @@ type ListEncoder64<'a> = ListEncoder<'a, i64>;
 
 impl<'a, O: arrow_array::OffsetSizeTrait> ListEncoder<'a, O> {
     /// Legacy constructor: preserves previous behavior (NullFirst for items).
-    fn try_new_default(list: &'a arrow_array::array::GenericListArray<O>) -> Result<Self, ArrowError> {
+    fn try_new_default(
+        list: &'a arrow_array::array::GenericListArray<O>,
+    ) -> Result<Self, ArrowError> {
         let (child_field, items_nullable) = match list.data_type() {
             DataType::List(field) => (field.as_ref(), field.is_nullable()),
             DataType::LargeList(field) => (field.as_ref(), field.is_nullable()),
@@ -1122,8 +1106,7 @@ impl<'a, O: arrow_array::OffsetSizeTrait> ListEncoder<'a, O> {
                 ))
             }
         };
-        let values_enc =
-            make_encoder_with_plan(list.values().as_ref(), child_field, item_plan)?;
+        let values_enc = make_encoder_with_plan(list.values().as_ref(), child_field, item_plan)?;
         Ok(Self {
             list,
             values: values_enc,
@@ -1258,8 +1241,7 @@ impl<'a> MapEncoder<'a> {
             _ => unreachable!("Validated by MapArray::data_type"),
         };
 
-        let values_enc =
-            make_encoder_with_plan(map.values().as_ref(), &value_field, value_plan)?;
+        let values_enc = make_encoder_with_plan(map.values().as_ref(), &value_field, value_plan)?;
         Ok(Self {
             map,
             keys,
