@@ -39,14 +39,11 @@ use crate::writer::encoder::{
     encode_record_batch_with_plan, write_long, WritePlan,
 };
 use crate::writer::format::{AvroBinaryFormat, AvroFormat, AvroOcfFormat};
-
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema};
 use std::io::{self, Write};
 use std::sync::Arc;
 
-// Plan construction: parse the Avro JSON we are going to advertise and build a
-// schema‑driven, per‑site union ordering for the encoder.
 use crate::codec::AvroFieldBuilder;
 
 /// Builder to configure and create a `Writer`.
@@ -126,7 +123,7 @@ pub struct Writer<W: Write, F: AvroFormat> {
     avro_json_override: Option<String>,
     /// Options controlling Arrow→Avro JSON generation if needed.
     schema_gen_options: Option<SchemaGenOptions>,
-    /// Prepared, schema‑driven write plan computed on first `write(...)`.
+    /// Prepared, schema‑driven write plan computed on the first ` write (...)`.
     plan: Option<WritePlan>,
 }
 
@@ -166,7 +163,6 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
         // Lazily initialize the stream and prepare the per‑field write plan
         // upon the first `write(...)`.
         if !self.started {
-            // 1) Choose the **exact Avro JSON** we will advertise
             let chosen_json = if let Some(s) = &self.avro_json_override {
                 s.clone()
             } else if let Some(json) = self.schema.metadata.get(SCHEMA_METADATA_KEY) {
@@ -179,27 +175,17 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
                 // Default generation (typically null‑first)
                 AvroSchema::try_from(self.schema.as_ref())?.json_string
             };
-
-            // 2) Inject the chosen JSON into the **writer schema's metadata**
-            //    so the header and the encoder share the same single source of truth.
             let mut md = self.schema.metadata().clone();
             md.insert(SCHEMA_METADATA_KEY.to_string(), chosen_json.clone());
             let updated = Schema::new_with_metadata(self.schema.fields().clone(), md);
             self.schema = Arc::new(updated);
-
-            // 3) Start the stream (writes header / single‑object prefix)
             self.format
                 .start_stream(&mut self.writer, &self.schema, self.compression)?;
-
-            // 4) Build the **schema‑driven write plan** from the chosen Avro JSON
-            //    NOTE: Keep the AvroSchema owner alive while borrowing from it
-            //    to avoid E0716 (temporary value dropped while borrowed).
             let avro_holder = AvroSchema::new(chosen_json);
             let avro_ast = avro_holder.schema()?;
             let avro_root = AvroFieldBuilder::new(&avro_ast).build()?;
             let plan = build_write_plan_from_avro_root(&avro_root, self.schema.as_ref())?;
             self.plan = Some(plan);
-
             self.started = true;
         }
 
@@ -630,7 +616,6 @@ mod tests {
         let mut reader = ReaderBuilder::new()
             .build(BufReader::new(rdr_file))
             .expect("build reader for nonnullable.impala.avro");
-
         // Collect all input batches and concatenate to a single RecordBatch
         let in_schema = reader.schema();
         // Sanity: ensure the file actually contains at least one Map field
@@ -646,14 +631,12 @@ mod tests {
         let input_batches = reader.collect::<Result<Vec<_>, _>>()?;
         let original =
             arrow::compute::concat_batches(&in_schema, &input_batches).expect("concat input");
-
         // Write out using the OCF writer into an in-memory Vec<u8>
         let buffer = Vec::<u8>::new();
         let mut writer = AvroWriter::new(buffer, in_schema.as_ref().clone())?;
         writer.write(&original)?;
         writer.finish()?;
         let out_bytes = writer.into_inner();
-
         // Read the produced bytes back with the Reader
         let mut rt_reader = ReaderBuilder::new()
             .build(Cursor::new(out_bytes))
@@ -662,7 +645,6 @@ mod tests {
         let rt_batches = rt_reader.collect::<Result<Vec<_>, _>>()?;
         let roundtrip =
             arrow::compute::concat_batches(&rt_schema, &rt_batches).expect("concat roundtrip");
-
         // Exact value fidelity (schema + data)
         assert_eq!(
             roundtrip, original,
@@ -671,13 +653,6 @@ mod tests {
         Ok(())
     }
 
-    // === New round-trip test for Avro Enum <-> Arrow Dictionary<Int32, Utf8> ===
-    //
-    // This test uses the same "avro/simple_enum.avro" fixture as the reader's
-    // `test_simple` to ensure the writer produces bytes that read back to the
-    // exact same Arrow representation (Dictionary<Int32, Utf8>), consistent with:
-    // * Avro enum binary encoding (int index into `symbols`)
-    // * arrow-avro's documented mapping (Codec::Enum -> Dictionary(Int32, Utf8))
     #[test]
     fn test_enum_roundtrip_uses_reader_fixture() -> Result<(), ArrowError> {
         // Read the known-good enum file (same as reader::test_simple)
@@ -686,13 +661,11 @@ mod tests {
         let mut reader = ReaderBuilder::new()
             .build(BufReader::new(rdr_file))
             .expect("build reader for simple_enum.avro");
-
         // Concatenate all batches to one RecordBatch for a clean equality check
         let in_schema = reader.schema();
         let input_batches = reader.collect::<Result<Vec<_>, _>>()?;
         let original =
             arrow::compute::concat_batches(&in_schema, &input_batches).expect("concat input");
-
         // Sanity: expect at least one Dictionary(Int32, Utf8) column (enum)
         let has_enum_dict = in_schema.fields().iter().any(|f| {
             matches!(
@@ -704,7 +677,6 @@ mod tests {
             has_enum_dict,
             "Expected at least one enum-mapped Dictionary<Int32, Utf8> field"
         );
-
         // Write with OCF writer into memory using the reader-provided Arrow schema.
         // The writer will embed the Avro JSON from `avro.schema` metadata if present.
         let buffer: Vec<u8> = Vec::new();
@@ -712,7 +684,6 @@ mod tests {
         writer.write(&original)?;
         writer.finish()?;
         let bytes = writer.into_inner();
-
         // Read back and compare for exact equality (schema + data)
         let mut rt_reader = ReaderBuilder::new()
             .build(Cursor::new(bytes))

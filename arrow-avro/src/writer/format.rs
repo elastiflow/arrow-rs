@@ -65,17 +65,14 @@ impl AvroFormat for AvroOcfFormat {
     ) -> Result<(), ArrowError> {
         let mut rng = rand::rng();
         rng.fill_bytes(&mut self.sync_marker);
-
         // Choose the Avro schema JSON that the file will advertise.
         // If `schema.metadata[SCHEMA_METADATA_KEY]` exists, AvroSchema::try_from
         // uses it verbatim; otherwise it is generated from the Arrow schema.
         let avro_schema = AvroSchema::try_from(schema)?;
-
         // Magic
         writer
             .write_all(b"Obj\x01")
             .map_err(|e| ArrowError::IoError(format!("write OCF magic: {e}"), e))?;
-
         // File metadata map: { "avro.schema": <json>, "avro.codec": <codec> }
         let codec_str = match compression {
             Some(CompressionCodec::Deflate) => "deflate",
@@ -85,24 +82,17 @@ impl AvroFormat for AvroOcfFormat {
             Some(CompressionCodec::Xz) => "xz",
             None => "null",
         };
-
         // Map block: count=2, then key/value pairs, then terminating count=0
         write_long(writer, 2)?; // two entries
-
         write_string(writer, SCHEMA_METADATA_KEY)?;
         write_bytes(writer, avro_schema.json_string.as_bytes())?;
-
         write_string(writer, CODEC_METADATA_KEY)?;
         write_bytes(writer, codec_str.as_bytes())?;
-
-        // end of map
         write_long(writer, 0)?;
-
         // Sync marker (16 bytes)
         writer
             .write_all(&self.sync_marker)
             .map_err(|e| ArrowError::IoError(format!("write OCF sync marker: {e}"), e))?;
-
         Ok(())
     }
 
@@ -157,17 +147,14 @@ impl AvroFormat for AvroBinaryFormat {
                     .to_string(),
             ));
         }
-
         // Compute and stash the schema fingerprint (CRC-64-AVRO) once.
         let avro_schema = AvroSchema::try_from(schema)?;
         let fp = match avro_schema.fingerprint()? {
             Fingerprint::Rabin(v) => v.to_le_bytes(),
         };
-
         // Build the 10-byte prefix: magic (2) + fingerprint (8)
         self.prefix[..2].copy_from_slice(&SINGLE_OBJECT_MAGIC);
         self.prefix[2..].copy_from_slice(&fp);
-
         Ok(())
     }
 
