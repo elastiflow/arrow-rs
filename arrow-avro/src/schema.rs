@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::codec::Nullability;
 use arrow_schema::{
     ArrowError, DataType, Field as ArrowField, IntervalUnit, Schema as ArrowSchema, TimeUnit,
 };
@@ -52,6 +51,19 @@ pub fn compare_schemas(writer: &Schema, reader: &Schema) -> Result<bool, ArrowEr
     let canon_writer = generate_canonical_form(writer)?;
     let canon_reader = generate_canonical_form(reader)?;
     Ok(canon_writer == canon_reader)
+}
+
+/// Avro types are not nullable, with nullability instead encoded as a union
+/// where one of the variants is the null type.
+///
+/// To accommodate this we special case two-variant unions where one of the
+/// variants is the null type, and use this to derive arrow's notion of nullability
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Nullability {
+    /// The nulls are encoded as the first union variant
+    NullFirst,
+    /// The nulls are encoded as the second union variant
+    NullSecond,
 }
 
 /// Either a [`PrimitiveType`] or a reference to a previously defined named type
@@ -348,19 +360,8 @@ impl TryFrom<&ArrowSchema> for AvroSchema {
             record.insert("doc".into(), Value::String(doc.clone()));
         }
         record.insert("fields".into(), Value::Array(fields_json));
-        let schema_prefix = format!("{SCHEMA_METADATA_KEY}.");
-        for (meta_key, meta_val) in &schema.metadata {
-            // Skip keys already handled or internal
-            if meta_key.starts_with("avro.")
-                || meta_key.starts_with(schema_prefix.as_str())
-                || is_internal_arrow_key(meta_key)
-            {
-                continue;
-            }
-            let json_val =
-                serde_json::from_str(meta_val).unwrap_or_else(|_| Value::String(meta_val.clone()));
-            record.insert(meta_key.clone(), json_val);
-        }
+        // Copy through non-internal metadata
+        copy_non_internal_metadata_to_record(&mut record, &schema.metadata);
         let json_string = serde_json::to_string(&Value::Object(record))
             .map_err(|e| ArrowError::SchemaError(format!("Serialising Avro JSON failed: {e}")))?;
         Ok(AvroSchema::new(json_string))
@@ -390,7 +391,7 @@ impl AvroSchema {
     ///
     /// If the input Arrow schema already contains Avro JSON in
     /// [`SCHEMA_METADATA_KEY`], that JSON is returned verbatim to preserve
-    /// exact header↔encoding alignment; otherwise, a new JSON is generated
+    ///  the exact header ↔encoding alignment; otherwise, a new JSON is generated
     /// honoring `opts.null_union_order` at **all nullable sites**.
     pub fn from_arrow_with_options(
         schema: &ArrowSchema,
@@ -399,14 +400,12 @@ impl AvroSchema {
         if let Some(json) = schema.metadata.get(SCHEMA_METADATA_KEY) {
             return Ok(AvroSchema::new(json.clone()));
         }
-
         let mut name_gen = NameGenerator::default();
         let fields_json = schema
             .fields()
             .iter()
             .map(|f| arrow_field_to_avro_with_opts(f, &mut name_gen, opts))
             .collect::<Result<Vec<_>, _>>()?;
-
         let record_name = schema
             .metadata
             .get(AVRO_NAME_METADATA_KEY)
@@ -424,21 +423,8 @@ impl AvroSchema {
             record.insert("doc".into(), Value::String(doc.clone()));
         }
         record.insert("fields".into(), Value::Array(fields_json));
-
         // Copy through non-internal metadata (same behavior as `TryFrom`)
-        let schema_prefix = format!("{SCHEMA_METADATA_KEY}.");
-        for (meta_key, meta_val) in &schema.metadata {
-            if meta_key.starts_with("avro.")
-                || meta_key.starts_with(schema_prefix.as_str())
-                || is_internal_arrow_key(meta_key)
-            {
-                continue;
-            }
-            let json_val =
-                serde_json::from_str(meta_val).unwrap_or_else(|_| Value::String(meta_val.clone()));
-            record.insert(meta_key.clone(), json_val);
-        }
-
+        copy_non_internal_metadata_to_record(&mut record, &schema.metadata);
         let json_string = serde_json::to_string(&Value::Object(record))
             .map_err(|e| ArrowError::SchemaError(format!("Serialising Avro JSON failed: {e}")))?;
         Ok(AvroSchema::new(json_string))
@@ -793,6 +779,32 @@ fn is_internal_arrow_key(key: &str) -> bool {
     key.starts_with("ARROW:") || key == SCHEMA_METADATA_KEY
 }
 
+/// Copies non-internal, non-Avro metadata entries from an Arrow schema's metadata
+/// map into the provided JSON record, parsing values as JSON when possible.
+///
+/// Skips:
+///   * Keys starting with `"avro."`
+///   * Keys starting with `"avro.schema."` (reserved for nested Avro-related metadata)
+///   * Internal Arrow keys as determined by [`is_internal_arrow_key`]
+#[inline]
+fn copy_non_internal_metadata_to_record(
+    record: &mut JsonMap<String, Value>,
+    schema_metadata: &HashMap<String, String>,
+) {
+    let schema_prefix = format!("{SCHEMA_METADATA_KEY}.");
+    for (meta_key, meta_val) in schema_metadata {
+        if meta_key.starts_with("avro.")
+            || meta_key.starts_with(schema_prefix.as_str())
+            || is_internal_arrow_key(meta_key)
+        {
+            continue;
+        }
+        let json_val =
+            serde_json::from_str(meta_val).unwrap_or_else(|_| Value::String(meta_val.clone()));
+        record.insert(meta_key.clone(), json_val);
+    }
+}
+
 // Sanitize an arbitrary string so it is a valid Avro field or type name
 fn sanitise_avro_name(base_name: &str) -> String {
     if base_name.is_empty() {
@@ -871,8 +883,6 @@ fn wrap_nullable(inner: Value, order: Nullability) -> Value {
     }
 }
 
-// === Avro JSON generation (DEFAULT path: NullFirst) ===
-
 // Convert an Arrow `DataType` into an Avro schema `Value`.
 fn datatype_to_avro(
     dt: &DataType,
@@ -905,8 +915,6 @@ fn arrow_field_to_avro(
         },
     )
 }
-
-// === Avro JSON generation (CONFIGURABLE path) ===
 
 /// Convert an Arrow `DataType` into an Avro schema `Value`, honoring `opts`.
 fn datatype_to_avro_with_opts(
@@ -954,7 +962,6 @@ fn datatype_to_avro_with_opts(
         | DataType::Decimal64(precision, scale)
         | DataType::Decimal128(precision, scale)
         | DataType::Decimal256(precision, scale) => {
-            // === Avro-decimal validation per spec (1.11.1) ===
             // Scale must be >= 0 and <= precision; otherwise the logical
             // type is invalid. We surface a schema error at generation time
             // to avoid silently downgrading to the base type later.
@@ -971,9 +978,8 @@ fn datatype_to_avro_with_opts(
                      must be <= precision ({precision})"
                 )));
             }
-
-            // Prefer fixed if original size hint is present in field metadata.
-            // Otherwise emit bytes-backed decimal (reader/writer compatible).
+            // Prefer fixed if an original size hint is present in field metadata.
+            // Otherwise, emit bytes-backed decimal (reader/writer compatible).
             let mut meta = JsonMap::from_iter([
                 ("logicalType".into(), json!("decimal")),
                 ("precision".into(), json!(*precision)),
@@ -1179,10 +1185,7 @@ fn arrow_field_to_avro_with_opts(
     name_gen: &mut NameGenerator,
     opts: SchemaGenOptions,
 ) -> Result<Value, ArrowError> {
-    let order = opts
-        .null_union_order
-        .unwrap_or(Nullability::NullFirst /* default */);
-
+    let order = opts.null_union_order.unwrap_or(Nullability::NullFirst);
     // Sanitize field name to ensure Avro validity but store the original in metadata
     let avro_name = sanitise_avro_name(field.name());
     let (schema, extras) = datatype_to_avro_with_opts(
@@ -1193,14 +1196,12 @@ fn arrow_field_to_avro_with_opts(
         opts,
     )?;
     let merged = merge_extras(schema, extras);
-
-    // If nullable, wrap union using requested order
+    // If nullable, wrap union using the requested order
     let schema_value = if field.is_nullable() {
         wrap_nullable(merged, order)
     } else {
         merged
     };
-
     // Build the field map
     let mut map = JsonMap::with_capacity(field.metadata().len() + 3);
     map.insert("name".into(), Value::String(avro_name));
