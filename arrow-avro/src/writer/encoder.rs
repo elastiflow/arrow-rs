@@ -15,34 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::codec::{
-    AvroDataType, AvroField as CodecAvroField, AvroFieldBuilder, Codec as AvroCodec, Nullability,
-};
-use crate::schema::{
-    AvroSchema as AvroJson, Schema as AvroJsonAst, SchemaGenOptions, SCHEMA_METADATA_KEY,
-};
+use crate::codec::{AvroDataType, AvroField as CodecAvroField, Codec as AvroCodec, Nullability};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     ArrowPrimitiveType, Float32Type, Float64Type, Int32Type, Int64Type, IntervalMonthDayNanoType,
     TimestampMicrosecondType,
 };
 use arrow_array::{
-    Array,
-    Decimal128Array,
-    Decimal256Array,
-    Decimal32Array,
-    Decimal64Array,
-    DictionaryArray,
-    FixedSizeBinaryArray,
-    GenericBinaryArray,
-    GenericStringArray,
-    LargeListArray,
-    ListArray,
-    MapArray,
-    PrimitiveArray,
-    RecordBatch,
-    StringArray,
-    StructArray,
+    Array, Decimal128Array, Decimal256Array, Decimal32Array, Decimal64Array, DictionaryArray,
+    FixedSizeBinaryArray, GenericBinaryArray, GenericStringArray, LargeListArray, ListArray,
+    MapArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, Schema as ArrowSchema, TimeUnit};
@@ -56,7 +38,6 @@ type PlanRef<'p> = Option<&'p FieldPlan>;
 /// Encode a single Avro-`long` using ZigZag + variable length, buffered.
 ///
 /// Avro binary encoding uses variable-length zig-zag encoding for integral types.
-/// See: https://avro.apache.org/docs/1.11.1/specification/ (Binary Encoding)
 #[inline]
 pub fn write_long<W: Write + ?Sized>(writer: &mut W, value: i64) -> Result<(), ArrowError> {
     let mut zz = ((value << 1) ^ (value >> 63)) as u64;
@@ -102,8 +83,7 @@ fn write_bool<W: Write + ?Sized>(writer: &mut W, v: bool) -> Result<(), ArrowErr
 /// The resulting slice still encodes the same signed value.
 ///
 /// See Avro spec: decimal over `bytes` uses two's-complement big-endian
-/// representation of the unscaled integer value. 1.11.1 specification.  */
-/*  Spec ref: https://avro.apache.org/docs/1.11.1/specification/ */
+/// representation of the unscaled integer value. 1.11.1 specification.
 #[inline]
 fn minimal_twos_complement(be: &[u8]) -> &[u8] {
     if be.is_empty() {
@@ -171,7 +151,6 @@ fn sign_extend_to_exact(src_be: &[u8], n: usize) -> Result<Vec<u8>, ArrowError> 
 ///
 /// Branch index is 0‑based per Avro unions. We special-case 0 or 1 which
 /// are single-byte varints: `0x00` (index 0) and `0x02` (index 1).
-/// See: https://avro.apache.org/docs/1.11.1/specification/ (Unions)
 #[inline]
 fn write_optional_index<W: Write + ?Sized>(
     writer: &mut W,
@@ -219,7 +198,7 @@ enum FieldPlan {
         values_nullability: Option<Nullability>,
         value_plan: Box<FieldPlan>,
     },
-    /// NEW: Avro decimal logical type (bytes or fixed). `size=None` => bytes(decimal), `Some(n)` => fixed(n)
+    /// Avro decimal logical type (bytes or fixed). `size=None` => bytes(decimal), `Some(n)` => fixed(n)
     Decimal { size: Option<usize> },
     /// Avro enum; maps to Arrow Dictionary<Int32, Utf8> with dictionary values
     /// exactly equal and ordered as the Avro enum `symbols`.
@@ -248,15 +227,115 @@ struct ColumnPlan {
     plan: FieldPlan,
 }
 
+/// Builder for `RecordEncoder` write plan
+#[derive(Debug)]
+pub struct RecordEncoderBuilder<'a> {
+    avro_root: &'a CodecAvroField,
+    arrow_schema: &'a ArrowSchema,
+}
+
+impl<'a> RecordEncoderBuilder<'a> {
+    /// Create a new builder from the Avro root and Arrow schema.
+    pub fn new(avro_root: &'a CodecAvroField, arrow_schema: &'a ArrowSchema) -> Self {
+        Self {
+            avro_root,
+            arrow_schema,
+        }
+    }
+
+    /// Build the `RecordEncoder` by walking the Avro **record** root in Avro order,
+    /// resolving each field to an Arrow index by name.
+    pub fn build(self) -> Result<RecordEncoder, ArrowError> {
+        let avro_root_dt = self.avro_root.data_type();
+        let avro_children = match avro_root_dt.codec() {
+            AvroCodec::Struct(children) => children,
+            _ => {
+                return Err(ArrowError::SchemaError(
+                    "Top-level Avro schema must be a record/struct".into(),
+                ))
+            }
+        };
+        let mut columns = Vec::with_capacity(avro_children.len());
+        for avro_child in avro_children.iter() {
+            let name = avro_child.name();
+            let arrow_index = self.arrow_schema.index_of(name).map_err(|e| {
+                ArrowError::SchemaError(format!("Schema mismatch for field '{name}': {e}"))
+            })?;
+            let arrow_field = self.arrow_schema.field(arrow_index);
+            let plan = build_field_plan(avro_child.data_type(), arrow_field)?;
+            columns.push(ColumnPlan {
+                arrow_index,
+                nullability: avro_child.data_type().nullability(),
+                plan,
+            });
+        }
+        Ok(RecordEncoder { columns })
+    }
+}
+
 /// A pre-computed plan for encoding a `RecordBatch` to Avro.
 ///
-/// A `WritePlan` is derived from an Avro schema and an Arrow schema. It maps
+/// Derived from an Avro schema and an Arrow schema. It maps
 /// top-level Avro fields to Arrow columns and contains a nested encoding plan
-/// for each column. This allows the encoder to write records efficiently without
-/// repeatedly consulting schemas or field names.
+/// for each column.
 #[derive(Debug, Clone)]
 pub struct RecordEncoder {
     columns: Vec<ColumnPlan>,
+}
+
+impl RecordEncoder {
+    /// Prepare column encoders for a specific batch using the precomputed plan.
+    fn prepare_for_batch<'a>(
+        &'a self,
+        batch: &'a RecordBatch,
+    ) -> Result<Vec<ColumnEncoder<'a>>, ArrowError> {
+        // bind schema to extend lifetime of `fields()` borrow
+        let schema_binding = batch.schema();
+        let fields = schema_binding.fields();
+        let arrays = batch.columns();
+        let mut out = Vec::with_capacity(self.columns.len());
+        for col_plan in self.columns.iter() {
+            let arrow_index = col_plan.arrow_index;
+            let array = arrays.get(arrow_index).ok_or_else(|| {
+                ArrowError::SchemaError(format!("Column index {arrow_index} out of range"))
+            })?;
+            let field = fields[arrow_index].as_ref();
+            let enc = make_encoder(array.as_ref(), field, Some(&col_plan.plan))?;
+            let pre = precomputed_union_value_branch(col_plan.nullability, enc.has_nulls());
+            out.push(ColumnEncoder {
+                nullability: col_plan.nullability,
+                pre,
+                enc,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Encode a `RecordBatch` using this encoder plan.
+    ///
+    /// Tip: Wrap `out` in a `std::io::BufWriter` to reduce the overhead of many small writes.
+    pub fn encode_batch<W: Write>(
+        &self,
+        batch: &RecordBatch,
+        out: &mut W,
+    ) -> Result<(), ArrowError> {
+        let mut cols = self.prepare_for_batch(batch)?;
+        encode_rows_with_prefix_plan(batch.num_rows(), &mut cols, out, |_w, _row| Ok(()))
+    }
+
+    /// Encode a `RecordBatch` with a per-row single‑object `prefix`.
+    pub fn encode_batch_single_object<W: Write>(
+        &self,
+        batch: &RecordBatch,
+        out: &mut W,
+        prefix: &[u8; 10],
+    ) -> Result<(), ArrowError> {
+        let mut cols = self.prepare_for_batch(batch)?;
+        encode_rows_with_prefix_plan(batch.num_rows(), &mut cols, out, |w, _row| {
+            w.write_all(prefix)
+                .map_err(|e| ArrowError::IoError(format!("write single-object prefix: {e}"), e))
+        })
+    }
 }
 
 fn find_struct_child_index(fields: &arrow_schema::Fields, name: &str) -> Option<usize> {
@@ -273,30 +352,28 @@ fn find_map_value_field_index(fields: &arrow_schema::Fields) -> Option<usize> {
 
 fn build_field_plan(avro_dt: &AvroDataType, arrow_field: &Field) -> Result<FieldPlan, ArrowError> {
     match avro_dt.codec() {
-        AvroCodec::Enum(symbols) => {
-            match arrow_field.data_type() {
-                DataType::Dictionary(key_dt, value_dt) => {
-                    // Enforce the exact reader-compatible shape: Dictionary<Int32, Utf8>
-                    if **key_dt != DataType::Int32 {
-                        return Err(ArrowError::SchemaError(
-                            "Avro enum requires Dictionary<Int32, Utf8>".into(),
-                        ));
-                    }
-                    if **value_dt != DataType::Utf8 {
-                        return Err(ArrowError::SchemaError(
-                            "Avro enum requires Dictionary<Int32, Utf8>".into(),
-                        ));
-                    }
-                    Ok(FieldPlan::Enum {
-                        symbols: symbols.clone(),
-                    })
+        AvroCodec::Enum(symbols) => match arrow_field.data_type() {
+            DataType::Dictionary(key_dt, value_dt) => {
+                // Enforce the exact reader-compatible shape: Dictionary<Int32, Utf8>
+                if **key_dt != DataType::Int32 {
+                    return Err(ArrowError::SchemaError(
+                        "Avro enum requires Dictionary<Int32, Utf8>".into(),
+                    ));
                 }
-                other => Err(ArrowError::SchemaError(format!(
-                    "Avro enum maps to Arrow Dictionary<Int32, Utf8>, found: {other:?}"
-                ))),
+                if **value_dt != DataType::Utf8 {
+                    return Err(ArrowError::SchemaError(
+                        "Avro enum requires Dictionary<Int32, Utf8>".into(),
+                    ));
+                }
+                Ok(FieldPlan::Enum {
+                    symbols: symbols.clone(),
+                })
             }
-        }
-        // NEW: decimal site (bytes or fixed(N)) with precision/scale validation
+            other => Err(ArrowError::SchemaError(format!(
+                "Avro enum maps to Arrow Dictionary<Int32, Utf8>, found: {other:?}"
+            ))),
+        },
+        // decimal site (bytes or fixed(N)) with precision/scale validation
         AvroCodec::Decimal(precision, scale_opt, fixed_size_opt) => {
             let (ap, as_) = match arrow_field.data_type() {
                 DataType::Decimal32(p, s) => (*p as usize, *s as i32),
@@ -351,8 +428,7 @@ fn build_field_plan(avro_dt: &AvroDataType, arrow_field: &Field) -> Result<Field
             Ok(FieldPlan::Struct { children: kids })
         }
         AvroCodec::List(items_dt) => {
-            // Map Avro array -> Arrow List/LargeList. IMPORTANT:
-            // Recurse on the **item field** of the Arrow list, not the list field itself.
+            // Map Avro array -> Arrow List/LargeList. Recurse on the **item field** of the Arrow list.
             match arrow_field.data_type() {
                 DataType::List(child) => {
                     let child_field: &Field = child.as_ref();
@@ -407,65 +483,6 @@ fn build_field_plan(avro_dt: &AvroDataType, arrow_field: &Field) -> Result<Field
     }
 }
 
-/// Build a [`WritePlan`] by walking the Avro **record** root in Avro order, and
-/// resolving each field to an Arrow index by name.
-pub fn build_write_plan_from_avro_root(
-    root: &CodecAvroField,
-    arrow_schema: &ArrowSchema,
-) -> Result<RecordEncoder, ArrowError> {
-    let avro_root_dt = root.data_type();
-    let avro_children = match avro_root_dt.codec() {
-        AvroCodec::Struct(children) => children,
-        _ => {
-            return Err(ArrowError::SchemaError(
-                "Top-level Avro schema must be a record/struct".into(),
-            ))
-        }
-    };
-    let mut columns = Vec::with_capacity(avro_children.len());
-    for avro_child in avro_children.iter() {
-        let name = avro_child.name();
-        let arrow_index = arrow_schema.index_of(name).map_err(|e| {
-            ArrowError::SchemaError(format!("Schema mismatch for field '{name}': {e}"))
-        })?;
-        // In this Arrow version, `Schema::field` returns `&Field` directly.
-        let arrow_field = arrow_schema.field(arrow_index);
-        let plan = build_field_plan(avro_child.data_type(), arrow_field)?;
-        columns.push(ColumnPlan {
-            arrow_index,
-            nullability: avro_child.data_type().nullability(),
-            plan,
-        });
-    }
-    Ok(RecordEncoder { columns })
-}
-
-/// Encode a `RecordBatch` using a precomputed [`WritePlan`].
-///
-/// Tip: Wrap `out` in a `std::io::BufWriter` to reduce the overhead of many small writes.
-pub fn encode_record_batch_with_plan<W: Write>(
-    batch: &RecordBatch,
-    out: &mut W,
-    encoder: &RecordEncoder,
-) -> Result<(), ArrowError> {
-    let mut cols = prepare_encoders_for_batch_with_plan(batch, encoder)?;
-    encode_rows_with_prefix_plan(batch.num_rows(), &mut cols, out, |_w, _row| Ok(()))
-}
-
-/// Encode a `RecordBatch` with a plan, adding a single‑object `prefix` before each row.
-pub fn encode_record_batch_single_object_with_plan<W: Write>(
-    batch: &RecordBatch,
-    out: &mut W,
-    prefix: &[u8; 10],
-    encoder: &RecordEncoder,
-) -> Result<(), ArrowError> {
-    let mut cols = prepare_encoders_for_batch_with_plan(batch, encoder)?;
-    encode_rows_with_prefix_plan(batch.num_rows(), &mut cols, out, |w, _row| {
-        w.write_all(prefix)
-            .map_err(|e| ArrowError::IoError(format!("write single-object prefix: {e}"), e))
-    })
-}
-
 /// Internal representation of a prepared column encoder for a record batch.
 /// This caches per-column properties and the encoder itself.
 ///
@@ -475,33 +492,6 @@ struct ColumnEncoder<'a> {
     nullability: Option<Nullability>,
     pre: Option<u8>,
     enc: NullableEncoder<'a>,
-}
-
-#[inline]
-fn prepare_encoders_for_batch_with_plan<'a>(
-    batch: &'a RecordBatch,
-    encoder: &RecordEncoder,
-) -> Result<Vec<ColumnEncoder<'a>>, ArrowError> {
-    // bind schema to extend lifetime of `fields()` borrow
-    let schema_binding = batch.schema();
-    let fields = schema_binding.fields();
-    let arrays = batch.columns();
-    let mut out = Vec::with_capacity(encoder.columns.len());
-    for col_plan in encoder.columns.iter() {
-        let arrow_index = col_plan.arrow_index;
-        let array = arrays.get(arrow_index).ok_or_else(|| {
-            ArrowError::SchemaError(format!("Column index {arrow_index} out of range"))
-        })?;
-        let field = fields[arrow_index].as_ref();
-        let enc = make_encoder(array.as_ref(), field, Some(&col_plan.plan))?;
-        let pre = precomputed_union_value_branch(col_plan.nullability, enc.has_nulls());
-        out.push(ColumnEncoder {
-            nullability: col_plan.nullability,
-            pre,
-            enc,
-        });
-    }
-    Ok(out)
 }
 
 /// Encode `rows` rows by iterating columns and writing values for each row.
@@ -634,7 +624,7 @@ fn make_encoder<'a>(
                 let enc = MapEncoder::try_new(arr, *values_nullability, Some(value_plan.as_ref()))?;
                 NullableEncoder::new(Encoder::Map(Box::new(enc)), nulls, has_nulls)
             }
-            // NEW: plan-aware decimal sites (bytes or fixed)
+            // plan-aware decimal sites (bytes or fixed)
             (DataType::Decimal32(_, _), FieldPlan::Decimal { size }) => {
                 let arr = array
                     .as_any()
@@ -705,7 +695,6 @@ fn make_encoder<'a>(
                         )));
                     }
                 }
-
                 // Keys are the Avro enum indices (zero-based position in `symbols`).
                 let keys = dict.keys();
                 let enc = EnumEncoder { keys };
@@ -1166,7 +1155,7 @@ type Utf8LargeEncoder<'a> = Utf8GenericEncoder<'a, i64>;
 
 /// Avro `enum` encoder for Arrow `DictionaryArray<Int32, Utf8>`.
 ///
-/// Per Avro 1.11.1 spec, an enum is encoded as an **int** equal to the
+/// Per Avro spec, an enum is encoded as an **int** equal to the
 /// zero-based position of the symbol in the schema’s `symbols` list.
 /// We validate at construction that the dictionary values equal the symbols,
 /// so we can directly write the key value here.
@@ -1207,26 +1196,21 @@ impl<'a> StructEncoder<'a> {
             DataType::Struct(fs) => fs,
             _ => return Err(ArrowError::SchemaError("Expected Struct".into())),
         };
-
         let cols = array.columns();
         let capacity = plan_children.map_or(fields.len(), |c| c.len());
         let mut children = Vec::with_capacity(capacity);
-
         if let Some(children_plan) = plan_children {
             for child_plan in children_plan {
                 let idx = child_plan.arrow_index;
-
                 let col = cols.get(idx).ok_or_else(|| {
                     ArrowError::SchemaError(format!("Struct child index {idx} out of range"))
                 })?;
-
                 let field = fields
                     .get(idx)
                     .ok_or_else(|| {
                         ArrowError::SchemaError(format!("Struct child index {idx} out of range"))
                     })?
                     .as_ref();
-
                 // Use unified helper for value-site preparation
                 let (child_enc, eff_null, pre) = prepare_value_site_encoder(
                     col.as_ref(),
@@ -1234,7 +1218,6 @@ impl<'a> StructEncoder<'a> {
                     child_plan.nullability,
                     Some(&child_plan.plan),
                 )?;
-
                 children.push(StructChildEncoder {
                     nullability: eff_null,
                     pre,
@@ -1253,7 +1236,6 @@ impl<'a> StructEncoder<'a> {
                 });
             }
         }
-
         Ok(Self { children })
     }
 
@@ -1506,7 +1488,7 @@ fn prepare_value_site_encoder<'a>(
     let enc = make_encoder(values_array, value_field, plan)?;
     // Resolve effective nullability:
     // - If a plan is provided *and* site nullability is specified, use it.
-    // - If no plan is provided, default to Arrow field nullability → NullFirst.
+    // - If no plan is provided, default to Arrow field nullability to NullFirst.
     // - Otherwise, pass through caller-provided value.
     let effective_nullability = match (site_nullability, plan) {
         (Some(n), Some(_)) => Some(n),
@@ -1572,7 +1554,6 @@ impl<'a> MapEncoder<'a> {
         value_plan: Option<&FieldPlan>,
     ) -> Result<Self, ArrowError> {
         let (keys, keys_offset, value_field, values_offset) = resolve_map_components(map)?;
-        // Refactored: use unified helper for value-site preparation
         let (values_enc, effective_nullability, pre) = prepare_value_site_encoder(
             map.values().as_ref(),
             value_field,
@@ -1622,25 +1603,18 @@ mod tests_decimal_helpers {
     fn test_minimal_twos_complement() {
         // 0 -> [0x00]
         assert_eq!(minimal_twos_complement(&[0x00]), &[0x00]);
-
         // +127 -> [0x7F]
         assert_eq!(minimal_twos_complement(&[0x7F]), &[0x7F]);
-
         // +128 -> minimal requires leading 0x00 so the sign bit stays 0
         assert_eq!(minimal_twos_complement(&[0x00, 0x80]), &[0x00, 0x80]);
-
         // -1 -> [0xFF]
         assert_eq!(minimal_twos_complement(&[0xFF]), &[0xFF]);
-
         // -128 -> [0x80]
         assert_eq!(minimal_twos_complement(&[0x80]), &[0x80]);
-
         // -129 (16-bit) -> [0xFF, 0x7F]
         assert_eq!(minimal_twos_complement(&[0xFF, 0x7F]), &[0xFF, 0x7F]);
-
         // Already minimal multi-byte positive
         assert_eq!(minimal_twos_complement(&[0x01, 0x00]), &[0x01, 0x00]);
-
         // Already minimal multi-byte negative
         assert_eq!(minimal_twos_complement(&[0xFE, 0xFF]), &[0xFE, 0xFF]);
     }
@@ -1649,14 +1623,11 @@ mod tests_decimal_helpers {
     fn test_sign_extend_to_exact() {
         // Extend positive: 0x7F -> 0x00 0x7F
         assert_eq!(sign_extend_to_exact(&[0x7F], 2).unwrap(), vec![0x00, 0x7F]);
-
         // Extend negative: 0x80 -> 0xFF 0x80
         assert_eq!(sign_extend_to_exact(&[0x80], 2).unwrap(), vec![0xFF, 0x80]);
-
         // Shrink with valid sign bytes
         assert_eq!(sign_extend_to_exact(&[0x00, 0x7F], 1).unwrap(), vec![0x7F]);
         assert_eq!(sign_extend_to_exact(&[0xFF, 0x80], 1).unwrap(), vec![0x80]);
-
         // Overflow when truncation would change the value/sign:
         // - dropping a non-sign 0x01 from the left
         assert!(sign_extend_to_exact(&[0x01, 0x00], 1).is_err());
