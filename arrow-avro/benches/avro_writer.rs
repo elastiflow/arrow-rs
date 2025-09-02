@@ -24,10 +24,12 @@ extern crate once_cell;
 use arrow_array::{
     builder::{ListBuilder, StringBuilder},
     types::{Int32Type, Int64Type, IntervalMonthDayNanoType, TimestampMicrosecondType},
-    ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float32Array, Float64Array,
-    ListArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Decimal256Array, Decimal32Array,
+    Decimal64Array, FixedSizeBinaryArray, Float32Array, Float64Array, ListArray, PrimitiveArray,
+    RecordBatch, StringArray, StructArray,
 };
 use arrow_avro::writer::AvroWriter;
+use arrow_buffer::i256;
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use once_cell::sync::Lazy;
@@ -172,6 +174,67 @@ fn make_ts_micros_array_with_tag(n: usize, tag: u64) -> PrimitiveArray<Timestamp
     PrimitiveArray::<TimestampMicrosecondType>::from_iter_values(values)
 }
 
+// === Decimal helpers & generators ===
+
+#[inline]
+fn pow10_i32(p: u8) -> i32 {
+    (0..p).fold(1i32, |acc, _| acc.saturating_mul(10))
+}
+
+#[inline]
+fn pow10_i64(p: u8) -> i64 {
+    (0..p).fold(1i64, |acc, _| acc.saturating_mul(10))
+}
+
+#[inline]
+fn pow10_i128(p: u8) -> i128 {
+    (0..p).fold(1i128, |acc, _| acc.saturating_mul(10))
+}
+
+#[inline]
+fn make_decimal32_array_with_tag(n: usize, tag: u64, precision: u8, scale: i8) -> Decimal32Array {
+    let mut rng = rng_for(tag, n);
+    let max = pow10_i32(precision).saturating_sub(1);
+    let values = (0..n).map(|_| rng.random_range(-max..=max));
+    Decimal32Array::from_iter_values(values)
+        .with_precision_and_scale(precision, scale)
+        .expect("set precision/scale on Decimal32Array")
+}
+
+#[inline]
+fn make_decimal64_array_with_tag(n: usize, tag: u64, precision: u8, scale: i8) -> Decimal64Array {
+    let mut rng = rng_for(tag, n);
+    let max = pow10_i64(precision).saturating_sub(1);
+    let values = (0..n).map(|_| rng.random_range(-max..=max));
+    Decimal64Array::from_iter_values(values)
+        .with_precision_and_scale(precision, scale)
+        .expect("set precision/scale on Decimal64Array")
+}
+
+#[inline]
+fn make_decimal128_array_with_tag(n: usize, tag: u64, precision: u8, scale: i8) -> Decimal128Array {
+    let mut rng = rng_for(tag, n);
+    let max = pow10_i128(precision).saturating_sub(1);
+    let values = (0..n).map(|_| rng.random_range(-max..=max));
+    Decimal128Array::from_iter_values(values)
+        .with_precision_and_scale(precision, scale)
+        .expect("set precision/scale on Decimal128Array")
+}
+
+#[inline]
+fn make_decimal256_array_with_tag(n: usize, tag: u64, precision: u8, scale: i8) -> Decimal256Array {
+    // Generate within i128 range and widen to i256 to keep generation cheap and portable
+    let mut rng = rng_for(tag, n);
+    let max128 = pow10_i128(30).saturating_sub(1);
+    let values = (0..n).map(|_| {
+        let v: i128 = rng.random_range(-max128..=max128);
+        i256::from_i128(v)
+    });
+    Decimal256Array::from_iter_values(values)
+        .with_precision_and_scale(precision, scale)
+        .expect("set precision/scale on Decimal256Array")
+}
+
 #[inline]
 fn make_fixed16_array(n: usize) -> FixedSizeBinaryArray {
     make_fixed16_array_with_tag(n, 0xF15E_D016)
@@ -293,6 +356,18 @@ fn schema_uuid16() -> Arc<Schema> {
 #[inline]
 fn schema_interval_mdn() -> Arc<Schema> {
     schema_single("duration", DataType::Interval(IntervalUnit::MonthDayNano))
+}
+
+#[inline]
+fn schema_decimal_with_size(name: &str, dt: DataType, size_meta: Option<usize>) -> Arc<Schema> {
+    let field = if let Some(size) = size_meta {
+        let mut md = HashMap::new();
+        md.insert("size".to_string(), size.to_string());
+        Field::new(name, dt, false).with_metadata(md)
+    } else {
+        Field::new(name, dt, false)
+    };
+    Arc::new(Schema::new(vec![field]))
 }
 
 static BOOLEAN_DATA: Lazy<Vec<RecordBatch>> = Lazy::new(|| {
@@ -464,6 +539,82 @@ static STRUCT_DATA: Lazy<Vec<RecordBatch>> = Lazy::new(|| {
         .collect()
 });
 
+// === NEW: Decimal datasets ===
+
+static DECIMAL32_DATA: Lazy<Vec<RecordBatch>> = Lazy::new(|| {
+    // Choose a representative precision/scale within Decimal32 limits
+    let precision: u8 = 7;
+    let scale: i8 = 2;
+    let schema = schema_single("amount", DataType::Decimal32(precision, scale));
+    SIZES
+        .iter()
+        .map(|&n| {
+            let arr = make_decimal32_array_with_tag(n, 0xDEC_0032, precision, scale);
+            let col: ArrayRef = Arc::new(arr);
+            RecordBatch::try_new(schema.clone(), vec![col]).unwrap()
+        })
+        .collect()
+});
+
+static DECIMAL64_DATA: Lazy<Vec<RecordBatch>> = Lazy::new(|| {
+    let precision: u8 = 13;
+    let scale: i8 = 3;
+    let schema = schema_single("amount", DataType::Decimal64(precision, scale));
+    SIZES
+        .iter()
+        .map(|&n| {
+            let arr = make_decimal64_array_with_tag(n, 0xDEC_0064, precision, scale);
+            let col: ArrayRef = Arc::new(arr);
+            RecordBatch::try_new(schema.clone(), vec![col]).unwrap()
+        })
+        .collect()
+});
+
+static DECIMAL128_BYTES_DATA: Lazy<Vec<RecordBatch>> = Lazy::new(|| {
+    let precision: u8 = 25;
+    let scale: i8 = 6;
+    let schema = schema_single("amount", DataType::Decimal128(precision, scale));
+    SIZES
+        .iter()
+        .map(|&n| {
+            let arr = make_decimal128_array_with_tag(n, 0xDEC_0128, precision, scale);
+            let col: ArrayRef = Arc::new(arr);
+            RecordBatch::try_new(schema.clone(), vec![col]).unwrap()
+        })
+        .collect()
+});
+
+static DECIMAL128_FIXED16_DATA: Lazy<Vec<RecordBatch>> = Lazy::new(|| {
+    // Same logical type as above but force Avro fixed(16) via metadata "size": "16"
+    let precision: u8 = 25;
+    let scale: i8 = 6;
+    let schema =
+        schema_decimal_with_size("amount", DataType::Decimal128(precision, scale), Some(16));
+    SIZES
+        .iter()
+        .map(|&n| {
+            let arr = make_decimal128_array_with_tag(n, 0xDEC_F128, precision, scale);
+            let col: ArrayRef = Arc::new(arr);
+            RecordBatch::try_new(schema.clone(), vec![col]).unwrap()
+        })
+        .collect()
+});
+
+static DECIMAL256_DATA: Lazy<Vec<RecordBatch>> = Lazy::new(|| {
+    // Use a higher precision typical of 256-bit decimals
+    let precision: u8 = 50;
+    let scale: i8 = 10;
+    let schema = schema_single("amount", DataType::Decimal256(precision, scale));
+    SIZES
+        .iter()
+        .map(|&n| {
+            let arr = make_decimal256_array_with_tag(n, 0xDEC_0256, precision, scale);
+            let col: ArrayRef = Arc::new(arr);
+            RecordBatch::try_new(schema.clone(), vec![col]).unwrap()
+        })
+        .collect()
+});
+
 fn ocf_size_for_batch(batch: &RecordBatch) -> usize {
     let schema_owned: Schema = (*batch.schema()).clone();
     let cursor = Cursor::new(Vec::<u8>::with_capacity(1024));
@@ -535,6 +686,11 @@ fn criterion_benches(c: &mut Criterion) {
     bench_writer_scenario(c, "write-FixedSizeBinary16", &FIXED16_DATA);
     bench_writer_scenario(c, "write-UUID(logicalType)", &UUID16_DATA);
     bench_writer_scenario(c, "write-IntervalMonthDayNanoDuration", &INTERVAL_MDN_DATA);
+    bench_writer_scenario(c, "write-Decimal32(bytes)", &DECIMAL32_DATA);
+    bench_writer_scenario(c, "write-Decimal64(bytes)", &DECIMAL64_DATA);
+    bench_writer_scenario(c, "write-Decimal128(bytes)", &DECIMAL128_BYTES_DATA);
+    bench_writer_scenario(c, "write-Decimal128(fixed16)", &DECIMAL128_FIXED16_DATA);
+    bench_writer_scenario(c, "write-Decimal256(bytes)", &DECIMAL256_DATA);
 }
 
 criterion_group! {

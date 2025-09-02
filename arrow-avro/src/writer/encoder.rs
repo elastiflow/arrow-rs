@@ -27,8 +27,22 @@ use arrow_array::types::{
     TimestampMicrosecondType,
 };
 use arrow_array::{
-    Array, DictionaryArray, FixedSizeBinaryArray, GenericBinaryArray, GenericStringArray,
-    LargeListArray, ListArray, MapArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    Array,
+    Decimal128Array,
+    Decimal256Array,
+    Decimal32Array,
+    Decimal64Array,
+    DictionaryArray,
+    FixedSizeBinaryArray,
+    GenericBinaryArray,
+    GenericStringArray,
+    LargeListArray,
+    ListArray,
+    MapArray,
+    PrimitiveArray,
+    RecordBatch,
+    StringArray,
+    StructArray,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, Schema as ArrowSchema, TimeUnit};
@@ -79,6 +93,78 @@ fn write_bool<W: Write + ?Sized>(writer: &mut W, v: bool) -> Result<(), ArrowErr
     writer
         .write_all(&[v as u8])
         .map_err(|e| ArrowError::IoError(format!("write bool: {e}"), e))
+}
+
+/// Minimal two's-complement big-endian representation helper for Avro decimal (bytes).
+///
+/// For positive numbers, trim leading 0x00 while the next byte's MSB is 0.
+/// For negative numbers, trim leading 0xFF while the next byte's MSB is 1.
+/// The resulting slice still encodes the same signed value.
+///
+/// See Avro spec: decimal over `bytes` uses two's-complement big-endian
+/// representation of the unscaled integer value. 1.11.1 specification.  */
+/*  Spec ref: https://avro.apache.org/docs/1.11.1/specification/ */
+#[inline]
+fn minimal_twos_complement(be: &[u8]) -> &[u8] {
+    if be.is_empty() {
+        return be;
+    }
+    let mut i = 0usize;
+    let sign = (be[0] & 0x80) != 0;
+    while i + 1 < be.len() {
+        let b = be[i];
+        let next = be[i + 1];
+        let trim_pos = !sign && b == 0x00 && (next & 0x80) == 0;
+        let trim_neg = sign && b == 0xFF && (next & 0x80) != 0;
+        if trim_pos || trim_neg {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    &be[i..]
+}
+
+/// Sign-extend (or validate/truncate) big-endian integer bytes to exactly `n` bytes.
+///
+/// If `src_be` is longer than `n`, ensure that dropped leading bytes are all sign bytes,
+/// and that the MSB of the first kept byte matches the sign; otherwise return an overflow error.
+/// If shorter than `n`, left-pad with the sign byte.
+///
+/// Used for Avro decimal over `fixed(N)`.
+#[inline]
+fn sign_extend_to_exact(src_be: &[u8], n: usize) -> Result<Vec<u8>, ArrowError> {
+    let len = src_be.len();
+    let sign_byte = if len > 0 && (src_be[0] & 0x80) != 0 {
+        0xFF
+    } else {
+        0x00
+    };
+    if len == n {
+        return Ok(src_be.to_vec());
+    }
+    if len > n {
+        let extra = len - n;
+        if src_be[..extra].iter().any(|&b| b != sign_byte) {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Decimal value with {} bytes cannot be represented in {} bytes without overflow",
+                len, n
+            )));
+        }
+        if n > 0 {
+            let first_kept = src_be[extra];
+            if ((first_kept ^ sign_byte) & 0x80) != 0 {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "Decimal value with {} bytes cannot be represented in {} bytes without overflow",
+                    len, n
+                )));
+            }
+        }
+        return Ok(src_be[extra..].to_vec());
+    }
+    let mut out = vec![sign_byte; n];
+    out[n - len..].copy_from_slice(src_be);
+    Ok(out)
 }
 
 /// Write the union branch index for an optional site with the specified `order`.
@@ -133,6 +219,8 @@ enum FieldPlan {
         values_nullability: Option<Nullability>,
         value_plan: Box<FieldPlan>,
     },
+    /// NEW: Avro decimal logical type (bytes or fixed). `size=None` => bytes(decimal), `Some(n)` => fixed(n)
+    Decimal { size: Option<usize> },
     /// Avro enum; maps to Arrow Dictionary<Int32, Utf8> with dictionary values
     /// exactly equal and ordered as the Avro enum `symbols`.
     Enum { symbols: Arc<[String]> },
@@ -167,7 +255,7 @@ struct ColumnPlan {
 /// for each column. This allows the encoder to write records efficiently without
 /// repeatedly consulting schemas or field names.
 #[derive(Debug, Clone)]
-pub struct WritePlan {
+pub struct RecordEncoder {
     columns: Vec<ColumnPlan>,
 }
 
@@ -207,6 +295,31 @@ fn build_field_plan(avro_dt: &AvroDataType, arrow_field: &Field) -> Result<Field
                     "Avro enum maps to Arrow Dictionary<Int32, Utf8>, found: {other:?}"
                 ))),
             }
+        }
+        // NEW: decimal site (bytes or fixed(N)) with precision/scale validation
+        AvroCodec::Decimal(precision, scale_opt, fixed_size_opt) => {
+            let (ap, as_) = match arrow_field.data_type() {
+                DataType::Decimal32(p, s) => (*p as usize, *s as i32),
+                DataType::Decimal64(p, s) => (*p as usize, *s as i32),
+                DataType::Decimal128(p, s) => (*p as usize, *s as i32),
+                DataType::Decimal256(p, s) => (*p as usize, *s as i32),
+                other => {
+                    return Err(ArrowError::SchemaError(format!(
+                        "Avro decimal requires Arrow decimal, got {other:?} for field '{}'",
+                        arrow_field.name()
+                    )))
+                }
+            };
+            let sc = scale_opt.unwrap_or(0) as i32; // Avro scale defaults to 0 if absent
+            if ap != *precision || as_ != sc {
+                return Err(ArrowError::SchemaError(format!(
+                    "Decimal precision/scale mismatch for field '{}': Avro({precision},{sc}) vs Arrow({ap},{as_})",
+                    arrow_field.name()
+                )));
+            }
+            Ok(FieldPlan::Decimal {
+                size: *fixed_size_opt,
+            })
         }
         AvroCodec::Struct(avro_children) => {
             let fields = match arrow_field.data_type() {
@@ -299,7 +412,7 @@ fn build_field_plan(avro_dt: &AvroDataType, arrow_field: &Field) -> Result<Field
 pub fn build_write_plan_from_avro_root(
     root: &CodecAvroField,
     arrow_schema: &ArrowSchema,
-) -> Result<WritePlan, ArrowError> {
+) -> Result<RecordEncoder, ArrowError> {
     let avro_root_dt = root.data_type();
     let avro_children = match avro_root_dt.codec() {
         AvroCodec::Struct(children) => children,
@@ -324,46 +437,7 @@ pub fn build_write_plan_from_avro_root(
             plan,
         });
     }
-    Ok(WritePlan { columns })
-}
-
-/// Derive the write plan for `batch` from its advertised Avro schema in
-/// `SCHEMA_METADATA_KEY`, or generate Avro JSON from Arrow if missing.
-///
-/// When synthesizing Avro JSON from Arrow (i.e., metadata is absent), the
-/// default union order is used (no override).
-fn derive_plan_for_batch(batch: &RecordBatch) -> Result<WritePlan, ArrowError> {
-    let avro_json = if let Some(json) = batch.schema().metadata.get(SCHEMA_METADATA_KEY) {
-        AvroJson::new(json.clone())
-    } else {
-        let opts = SchemaGenOptions {
-            null_union_order: None,
-        };
-        AvroJson::from_arrow_with_options(batch.schema().as_ref(), opts)?
-    };
-    let avro_ast: AvroJsonAst<'_> = avro_json.schema()?;
-    let root = AvroFieldBuilder::new(&avro_ast).build()?;
-    build_write_plan_from_avro_root(&root, batch.schema().as_ref())
-}
-
-/// Encode a `RecordBatch` in Avro binary format using the **schema‑driven plan**.
-///
-/// Tip: Wrap `out` in a `std::io::BufWriter` to reduce the overhead of many small writes.
-pub fn encode_record_batch<W: Write>(batch: &RecordBatch, out: &mut W) -> Result<(), ArrowError> {
-    let plan = derive_plan_for_batch(batch)?;
-    encode_record_batch_with_plan(batch, out, &plan)
-}
-
-/// Encode a `RecordBatch` as a stream of Avro **single-object encodings**,
-/// writing the provided 10-byte `prefix` (magic + 8-byte fingerprint)
-/// **before each record** using a **schema‑driven plan**.
-pub fn encode_record_batch_single_object<W: Write>(
-    batch: &RecordBatch,
-    out: &mut W,
-    prefix: &[u8; 10],
-) -> Result<(), ArrowError> {
-    let plan = derive_plan_for_batch(batch)?;
-    encode_record_batch_single_object_with_plan(batch, out, prefix, &plan)
+    Ok(RecordEncoder { columns })
 }
 
 /// Encode a `RecordBatch` using a precomputed [`WritePlan`].
@@ -372,9 +446,9 @@ pub fn encode_record_batch_single_object<W: Write>(
 pub fn encode_record_batch_with_plan<W: Write>(
     batch: &RecordBatch,
     out: &mut W,
-    plan: &WritePlan,
+    encoder: &RecordEncoder,
 ) -> Result<(), ArrowError> {
-    let mut cols = prepare_encoders_for_batch_with_plan(batch, plan)?;
+    let mut cols = prepare_encoders_for_batch_with_plan(batch, encoder)?;
     encode_rows_with_prefix_plan(batch.num_rows(), &mut cols, out, |_w, _row| Ok(()))
 }
 
@@ -383,9 +457,9 @@ pub fn encode_record_batch_single_object_with_plan<W: Write>(
     batch: &RecordBatch,
     out: &mut W,
     prefix: &[u8; 10],
-    plan: &WritePlan,
+    encoder: &RecordEncoder,
 ) -> Result<(), ArrowError> {
-    let mut cols = prepare_encoders_for_batch_with_plan(batch, plan)?;
+    let mut cols = prepare_encoders_for_batch_with_plan(batch, encoder)?;
     encode_rows_with_prefix_plan(batch.num_rows(), &mut cols, out, |w, _row| {
         w.write_all(prefix)
             .map_err(|e| ArrowError::IoError(format!("write single-object prefix: {e}"), e))
@@ -406,14 +480,14 @@ struct ColumnEncoder<'a> {
 #[inline]
 fn prepare_encoders_for_batch_with_plan<'a>(
     batch: &'a RecordBatch,
-    plan: &WritePlan,
+    encoder: &RecordEncoder,
 ) -> Result<Vec<ColumnEncoder<'a>>, ArrowError> {
     // bind schema to extend lifetime of `fields()` borrow
     let schema_binding = batch.schema();
     let fields = schema_binding.fields();
     let arrays = batch.columns();
-    let mut out = Vec::with_capacity(plan.columns.len());
-    for col_plan in plan.columns.iter() {
+    let mut out = Vec::with_capacity(encoder.columns.len());
+    for col_plan in encoder.columns.iter() {
         let arrow_index = col_plan.arrow_index;
         let array = arrays.get(arrow_index).ok_or_else(|| {
             ArrowError::SchemaError(format!("Column index {arrow_index} out of range"))
@@ -442,7 +516,12 @@ fn encode_rows_with_prefix_plan<W: Write>(
 ) -> Result<(), ArrowError> {
     for row in 0..rows {
         per_row_prefix(out, row)?;
-        for ColumnEncoder { nullability, pre, enc } in cols.iter_mut() {
+        for ColumnEncoder {
+            nullability,
+            pre,
+            enc,
+        } in cols.iter_mut()
+        {
             write_value_with_union(out, enc, *nullability, *pre, row)?;
         }
     }
@@ -552,9 +631,41 @@ fn make_encoder<'a>(
                     .as_any()
                     .downcast_ref::<MapArray>()
                     .ok_or_else(|| ArrowError::SchemaError("Expected MapArray".into()))?;
-                let enc =
-                    MapEncoder::try_new(arr, *values_nullability, Some(value_plan.as_ref()))?;
+                let enc = MapEncoder::try_new(arr, *values_nullability, Some(value_plan.as_ref()))?;
                 NullableEncoder::new(Encoder::Map(Box::new(enc)), nulls, has_nulls)
+            }
+            // NEW: plan-aware decimal sites (bytes or fixed)
+            (DataType::Decimal32(_, _), FieldPlan::Decimal { size }) => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal32Array>()
+                    .ok_or_else(|| ArrowError::SchemaError("Expected Decimal32Array".into()))?;
+                let dec = DecimalEncoder::<4, Decimal32Array>::new(arr, *size);
+                NullableEncoder::new(Encoder::Decimal32(dec), nulls, has_nulls)
+            }
+            (DataType::Decimal64(_, _), FieldPlan::Decimal { size }) => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal64Array>()
+                    .ok_or_else(|| ArrowError::SchemaError("Expected Decimal64Array".into()))?;
+                let dec = DecimalEncoder::<8, Decimal64Array>::new(arr, *size);
+                NullableEncoder::new(Encoder::Decimal64(dec), nulls, has_nulls)
+            }
+            (DataType::Decimal128(_, _), FieldPlan::Decimal { size }) => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| ArrowError::SchemaError("Expected Decimal128Array".into()))?;
+                let dec = DecimalEncoder::<16, Decimal128Array>::new(arr, *size);
+                NullableEncoder::new(Encoder::Decimal128(dec), nulls, has_nulls)
+            }
+            (DataType::Decimal256(_, _), FieldPlan::Decimal { size }) => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal256Array>()
+                    .ok_or_else(|| ArrowError::SchemaError("Expected Decimal256Array".into()))?;
+                let dec = DecimalEncoder::<32, Decimal256Array>::new(arr, *size);
+                NullableEncoder::new(Encoder::Decimal256(dec), nulls, has_nulls)
             }
             (DataType::Dictionary(key_dt, value_dt), FieldPlan::Enum { symbols }) => {
                 // Enforce the same shape we validated during plan build:
@@ -657,12 +768,12 @@ fn make_encoder<'a>(
                 let arr = array
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
-                    .ok_or_else(|| ArrowError::SchemaError("Expected FixedSizeBinaryArray".into()))?;
+                    .ok_or_else(|| {
+                        ArrowError::SchemaError("Expected FixedSizeBinaryArray".into())
+                    })?;
                 let md = field.metadata();
                 let is_uuid = md.get("logicalType").is_some_and(|v| v == "uuid")
-                    || (*len == 16
-                    && md.get("ARROW:extension:name")
-                    .is_some_and(|v| v == "uuid"));
+                    || (*len == 16 && md.get("ARROW:extension:name").is_some_and(|v| v == "uuid"));
                 if is_uuid {
                     if *len != 16 {
                         return Err(ArrowError::InvalidArgumentError(
@@ -673,6 +784,54 @@ fn make_encoder<'a>(
                 } else {
                     NullableEncoder::new(Encoder::Fixed(FixedEncoder(arr)), nulls, has_nulls)
                 }
+            }
+            DataType::Decimal32(_, _) => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal32Array>()
+                    .ok_or_else(|| ArrowError::SchemaError("Expected Decimal32Array".into()))?;
+                let fixed_size = field
+                    .metadata()
+                    .get("size")
+                    .and_then(|s| s.parse::<usize>().ok());
+                let dec = DecimalEncoder::<4, Decimal32Array>::new(arr, fixed_size);
+                NullableEncoder::new(Encoder::Decimal32(dec), nulls, has_nulls)
+            }
+            DataType::Decimal64(_, _) => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal64Array>()
+                    .ok_or_else(|| ArrowError::SchemaError("Expected Decimal64Array".into()))?;
+                let fixed_size = field
+                    .metadata()
+                    .get("size")
+                    .and_then(|s| s.parse::<usize>().ok());
+                let dec = DecimalEncoder::<8, Decimal64Array>::new(arr, fixed_size);
+                NullableEncoder::new(Encoder::Decimal64(dec), nulls, has_nulls)
+            }
+            DataType::Decimal128(_, _) => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| ArrowError::SchemaError("Expected Decimal128Array".into()))?;
+                let fixed_size = field
+                    .metadata()
+                    .get("size")
+                    .and_then(|s| s.parse::<usize>().ok());
+                let dec = DecimalEncoder::<16, Decimal128Array>::new(arr, fixed_size);
+                NullableEncoder::new(Encoder::Decimal128(dec), nulls, has_nulls)
+            }
+            DataType::Decimal256(_, _) => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal256Array>()
+                    .ok_or_else(|| ArrowError::SchemaError("Expected Decimal256Array".into()))?;
+                let fixed_size = field
+                    .metadata()
+                    .get("size")
+                    .and_then(|s| s.parse::<usize>().ok());
+                let dec = DecimalEncoder::<32, Decimal256Array>::new(arr, fixed_size);
+                NullableEncoder::new(Encoder::Decimal256(dec), nulls, has_nulls)
             }
             DataType::Interval(IntervalUnit::MonthDayNano) => {
                 let arr = array.as_primitive::<IntervalMonthDayNanoType>();
@@ -758,6 +917,10 @@ enum Encoder<'a> {
     Utf8Large(Utf8LargeEncoder<'a>),
     /// Avro `enum` encoder: writes the key (int) as the enum index.
     Enum(EnumEncoder<'a>),
+    Decimal32(Decimal32Encoder<'a>),
+    Decimal64(Decimal64Encoder<'a>),
+    Decimal128(Decimal128Encoder<'a>),
+    Decimal256(Decimal256Encoder<'a>),
     Struct(Box<StructEncoder<'a>>),
     List(Box<ListEncoder32<'a>>),
     LargeList(Box<ListEncoder64<'a>>),
@@ -783,6 +946,10 @@ impl<'a> Encoder<'a> {
             Encoder::Utf8(e) => e.encode(idx, out),
             Encoder::Utf8Large(e) => e.encode(idx, out),
             Encoder::Enum(e) => e.encode(idx, out),
+            Encoder::Decimal32(e) => e.encode(idx, out),
+            Encoder::Decimal64(e) => e.encode(idx, out),
+            Encoder::Decimal128(e) => e.encode(idx, out),
+            Encoder::Decimal256(e) => e.encode(idx, out),
             Encoder::Struct(e) => e.encode(idx, out),
             Encoder::List(e) => e.encode(idx, out),
             Encoder::LargeList(e) => e.encode(idx, out),
@@ -895,6 +1062,73 @@ impl IntervalMonthDayNanoEncoder<'_> {
     }
 }
 
+/// Minimal trait to obtain a big-endian fixed-size byte array for a decimal's
+/// unscaled integer value at `idx`.
+trait DecimalBeBytes<const N: usize> {
+    fn value_be_bytes(&self, idx: usize) -> [u8; N];
+}
+
+impl DecimalBeBytes<4> for Decimal32Array {
+    #[inline]
+    fn value_be_bytes(&self, idx: usize) -> [u8; 4] {
+        self.value(idx).to_be_bytes()
+    }
+}
+impl DecimalBeBytes<8> for Decimal64Array {
+    #[inline]
+    fn value_be_bytes(&self, idx: usize) -> [u8; 8] {
+        self.value(idx).to_be_bytes()
+    }
+}
+impl DecimalBeBytes<16> for Decimal128Array {
+    #[inline]
+    fn value_be_bytes(&self, idx: usize) -> [u8; 16] {
+        self.value(idx).to_be_bytes()
+    }
+}
+impl DecimalBeBytes<32> for Decimal256Array {
+    #[inline]
+    fn value_be_bytes(&self, idx: usize) -> [u8; 32] {
+        // Arrow i256 → [u8; 32] big-endian
+        self.value(idx).to_be_bytes()
+    }
+}
+
+/// Generic Avro decimal encoder over Arrow decimal arrays.
+/// - When `fixed_size` is `None` → Avro `bytes(decimal)`; writes the minimal
+///   two's-complement representation with a length prefix.
+/// - When `Some(n)` → Avro `fixed(n, decimal)`; sign-extends (or validates)
+///   to exactly `n` bytes and writes them directly.
+struct DecimalEncoder<'a, const N: usize, A: DecimalBeBytes<N>> {
+    arr: &'a A,
+    fixed_size: Option<usize>,
+}
+
+impl<'a, const N: usize, A: DecimalBeBytes<N>> DecimalEncoder<'a, N, A> {
+    #[inline]
+    fn new(arr: &'a A, fixed_size: Option<usize>) -> Self {
+        Self { arr, fixed_size }
+    }
+
+    #[inline]
+    fn encode<W: Write + ?Sized>(&mut self, idx: usize, out: &mut W) -> Result<(), ArrowError> {
+        let be = self.arr.value_be_bytes(idx);
+        match self.fixed_size {
+            Some(n) => {
+                let bytes = sign_extend_to_exact(&be, n)?;
+                out.write_all(&bytes)
+                    .map_err(|e| ArrowError::IoError(format!("write decimal fixed: {e}"), e))
+            }
+            None => write_len_prefixed(out, minimal_twos_complement(&be)),
+        }
+    }
+}
+
+type Decimal32Encoder<'a> = DecimalEncoder<'a, 4, Decimal32Array>;
+type Decimal64Encoder<'a> = DecimalEncoder<'a, 8, Decimal64Array>;
+type Decimal128Encoder<'a> = DecimalEncoder<'a, 16, Decimal128Array>;
+type Decimal256Encoder<'a> = DecimalEncoder<'a, 32, Decimal256Array>;
+
 struct F32Encoder<'a>(&'a arrow_array::Float32Array);
 impl F32Encoder<'_> {
     #[inline]
@@ -973,46 +1207,54 @@ impl<'a> StructEncoder<'a> {
             DataType::Struct(fs) => fs,
             _ => return Err(ArrowError::SchemaError("Expected Struct".into())),
         };
-        let mut encs = Vec::new();
-        match plan_children {
-            Some(children_plan) => {
-                encs.reserve(children_plan.len());
-                for child_plan in children_plan {
-                    let idx = child_plan.arrow_index;
-                    let col = array.columns().get(idx).ok_or_else(|| {
+
+        let cols = array.columns();
+        let capacity = plan_children.map_or(fields.len(), |c| c.len());
+        let mut children = Vec::with_capacity(capacity);
+
+        if let Some(children_plan) = plan_children {
+            for child_plan in children_plan {
+                let idx = child_plan.arrow_index;
+
+                let col = cols.get(idx).ok_or_else(|| {
+                    ArrowError::SchemaError(format!("Struct child index {idx} out of range"))
+                })?;
+
+                let field = fields
+                    .get(idx)
+                    .ok_or_else(|| {
                         ArrowError::SchemaError(format!("Struct child index {idx} out of range"))
-                    })?;
-                    let field = fields[idx].as_ref();
-                    // Use unified helper for value-site preparation
-                    let (child, eff_null, pre) = prepare_value_site_encoder(
-                        col.as_ref(),
-                        field,
-                        child_plan.nullability,
-                        Some(&child_plan.plan),
-                    )?;
-                    encs.push(StructChildEncoder {
-                        nullability: eff_null, // same as child_plan.nullability
-                        pre,
-                        enc: child,
-                    });
-                }
+                    })?
+                    .as_ref();
+
+                // Use unified helper for value-site preparation
+                let (child_enc, eff_null, pre) = prepare_value_site_encoder(
+                    col.as_ref(),
+                    field,
+                    child_plan.nullability,
+                    Some(&child_plan.plan),
+                )?;
+
+                children.push(StructChildEncoder {
+                    nullability: eff_null,
+                    pre,
+                    enc: child_enc,
+                });
             }
-            None => {
-                encs.reserve(fields.len());
-                for (f_ref, col) in fields.iter().zip(array.columns().iter()) {
-                    let f: &Field = f_ref.as_ref();
-                    // Legacy default via unified helper (no plan)
-                    let (child, nb, pre) =
-                        prepare_value_site_encoder(col.as_ref(), f, None, None)?;
-                    encs.push(StructChildEncoder {
-                        nullability: nb, // f.is_nullable().then_some(Nullability::NullFirst)
-                        pre,
-                        enc: child,
-                    });
-                }
+        } else {
+            // Legacy default (no plan): Arrow field nullability => NullFirst
+            for (f_ref, col) in fields.iter().zip(cols.iter()) {
+                let f: &Field = f_ref.as_ref();
+                let (child, nb, pre) = prepare_value_site_encoder(col.as_ref(), f, None, None)?;
+                children.push(StructChildEncoder {
+                    nullability: nb,
+                    pre,
+                    enc: child,
+                });
             }
         }
-        Ok(Self { children: encs })
+
+        Ok(Self { children })
     }
 
     #[inline]
@@ -1150,7 +1392,7 @@ impl<'a, O: arrow_array::OffsetSizeTrait> ListEncoder<'a, O> {
 ///
 /// Each row encodes as one (possibly empty) map block sequence:
 ///   count (long), then for each entry: key (string), value (union index if nullable + value),
-///   terminated by a zero count. Keys are strings per Avro spec. :contentReference[oaicite:1]{index=1}
+///   terminated by a zero count. Keys are strings per Avro spec.
 /// Internal key array kind used by Map encoder.
 enum KeyKind<'a> {
     Utf8(&'a GenericStringArray<i32>),
@@ -1276,6 +1518,16 @@ fn prepare_value_site_encoder<'a>(
     Ok((enc, effective_nullability, pre))
 }
 
+/// NEW: compact context to keep `encode_map_entries_for_keys` under Clippy's
+/// `too_many_arguments` threshold without affecting performance.
+#[derive(Copy, Clone)]
+struct MapEntriesCtx {
+    keys_offset: usize,
+    values_offset: usize,
+    values_nullability: Option<Nullability>,
+    precomputed_branch: Option<u8>,
+}
+
 /// Generic helper that writes `(key, value)` pairs for `[start, end)` using a
 /// `GenericStringArray<O>` for keys. This is monomorphized for Utf8/LargeUtf8
 /// (static dispatch), so the hot loop has no per-entry type branching.
@@ -1285,10 +1537,7 @@ fn encode_map_entries_for_keys<W, O>(
     arr: &GenericStringArray<O>,
     start: usize,
     end: usize,
-    keys_offset: usize,
-    values_offset: usize,
-    values_nullability: Option<Nullability>,
-    precomputed_branch: Option<u8>,
+    ctx: MapEntriesCtx,
     values: &mut NullableEncoder<'_>,
 ) -> Result<(), ArrowError>
 where
@@ -1296,14 +1545,20 @@ where
     O: arrow_array::OffsetSizeTrait,
 {
     encode_blocked_range(out, start, end, |j, out| {
-        debug_assert!(j >= keys_offset && j >= values_offset);
-        let j_key = j.saturating_sub(keys_offset);
-        let j_val = j.saturating_sub(values_offset);
+        debug_assert!(j >= ctx.keys_offset && j >= ctx.values_offset);
+        let j_key = j.saturating_sub(ctx.keys_offset);
+        let j_val = j.saturating_sub(ctx.values_offset);
         // Key (string)
         let s = arr.value(j_key);
         write_len_prefixed(out, s.as_bytes())?;
         // Value (union index if necessary, then payload)
-        write_value_with_union(out, values, values_nullability, precomputed_branch, j_val)
+        write_value_with_union(
+            out,
+            values,
+            ctx.values_nullability,
+            ctx.precomputed_branch,
+            j_val,
+        )
     })
 }
 
@@ -1342,29 +1597,70 @@ impl<'a> MapEncoder<'a> {
         // MapArray offsets are i32 and guaranteed >= 0 by Arrow; align style with lists.
         let start = i32_to_usize(offsets[idx])?;
         let end = i32_to_usize(offsets[idx + 1])?;
+        let ctx = MapEntriesCtx {
+            keys_offset: self.keys_offset,
+            values_offset: self.values_offset,
+            values_nullability: self.values_nullability,
+            precomputed_branch: self.pre,
+        };
         match self.keys {
-            KeyKind::Utf8(arr) => encode_map_entries_for_keys(
-                out,
-                arr,
-                start,
-                end,
-                self.keys_offset,
-                self.values_offset,
-                self.values_nullability,
-                self.pre,
-                &mut self.values,
-            ),
-            KeyKind::LargeUtf8(arr) => encode_map_entries_for_keys(
-                out,
-                arr,
-                start,
-                end,
-                self.keys_offset,
-                self.values_offset,
-                self.values_nullability,
-                self.pre,
-                &mut self.values,
-            ),
+            KeyKind::Utf8(arr) => {
+                encode_map_entries_for_keys(out, arr, start, end, ctx, &mut self.values)
+            }
+            KeyKind::LargeUtf8(arr) => {
+                encode_map_entries_for_keys(out, arr, start, end, ctx, &mut self.values)
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_decimal_helpers {
+    use super::*;
+
+    #[test]
+    fn test_minimal_twos_complement() {
+        // 0 -> [0x00]
+        assert_eq!(minimal_twos_complement(&[0x00]), &[0x00]);
+
+        // +127 -> [0x7F]
+        assert_eq!(minimal_twos_complement(&[0x7F]), &[0x7F]);
+
+        // +128 -> minimal requires leading 0x00 so the sign bit stays 0
+        assert_eq!(minimal_twos_complement(&[0x00, 0x80]), &[0x00, 0x80]);
+
+        // -1 -> [0xFF]
+        assert_eq!(minimal_twos_complement(&[0xFF]), &[0xFF]);
+
+        // -128 -> [0x80]
+        assert_eq!(minimal_twos_complement(&[0x80]), &[0x80]);
+
+        // -129 (16-bit) -> [0xFF, 0x7F]
+        assert_eq!(minimal_twos_complement(&[0xFF, 0x7F]), &[0xFF, 0x7F]);
+
+        // Already minimal multi-byte positive
+        assert_eq!(minimal_twos_complement(&[0x01, 0x00]), &[0x01, 0x00]);
+
+        // Already minimal multi-byte negative
+        assert_eq!(minimal_twos_complement(&[0xFE, 0xFF]), &[0xFE, 0xFF]);
+    }
+
+    #[test]
+    fn test_sign_extend_to_exact() {
+        // Extend positive: 0x7F -> 0x00 0x7F
+        assert_eq!(sign_extend_to_exact(&[0x7F], 2).unwrap(), vec![0x00, 0x7F]);
+
+        // Extend negative: 0x80 -> 0xFF 0x80
+        assert_eq!(sign_extend_to_exact(&[0x80], 2).unwrap(), vec![0xFF, 0x80]);
+
+        // Shrink with valid sign bytes
+        assert_eq!(sign_extend_to_exact(&[0x00, 0x7F], 1).unwrap(), vec![0x7F]);
+        assert_eq!(sign_extend_to_exact(&[0xFF, 0x80], 1).unwrap(), vec![0x80]);
+
+        // Overflow when truncation would change the value/sign:
+        // - dropping a non-sign 0x01 from the left
+        assert!(sign_extend_to_exact(&[0x01, 0x00], 1).is_err());
+        // - dropping a non-sign 0xFE from the left (negative number)
+        assert!(sign_extend_to_exact(&[0xFE, 0xFF], 1).is_err());
     }
 }

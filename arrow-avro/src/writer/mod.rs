@@ -34,10 +34,7 @@ pub mod format;
 
 use crate::compression::CompressionCodec;
 use crate::schema::{AvroSchema, SchemaGenOptions, SCHEMA_METADATA_KEY};
-use crate::writer::encoder::{
-    build_write_plan_from_avro_root, encode_record_batch_single_object_with_plan,
-    encode_record_batch_with_plan, write_long, WritePlan,
-};
+use crate::writer::encoder::{build_write_plan_from_avro_root, encode_record_batch_single_object_with_plan, encode_record_batch_with_plan, write_long, RecordEncoder};
 use crate::writer::format::{AvroBinaryFormat, AvroFormat, AvroOcfFormat};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema};
@@ -106,7 +103,7 @@ impl WriterBuilder {
             started: false,
             avro_json_override: self.avro_json_override,
             schema_gen_options: self.schema_gen_options,
-            plan: None,
+            encoder: None,
         }
     }
 }
@@ -124,7 +121,7 @@ pub struct Writer<W: Write, F: AvroFormat> {
     /// Options controlling Arrow→Avro JSON generation if needed.
     schema_gen_options: Option<SchemaGenOptions>,
     /// Prepared, schema‑driven write plan computed on the first ` write (...)`.
-    plan: Option<WritePlan>,
+    encoder: Option<RecordEncoder>,
 }
 
 /// Alias for an Avro **Object Container File** writer.
@@ -169,7 +166,7 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
                 json.clone()
             } else if let Some(opts) = &self.schema_gen_options {
                 // Generate JSON from Arrow using requested options
-                let avro = AvroSchema::from_arrow_with_options(self.schema.as_ref(), opts.clone())?;
+                let avro = AvroSchema::from_arrow_with_options(self.schema.as_ref(), *opts)?;
                 avro.json_string
             } else {
                 // Default generation (typically null‑first)
@@ -184,18 +181,16 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
             let avro_holder = AvroSchema::new(chosen_json);
             let avro_ast = avro_holder.schema()?;
             let avro_root = AvroFieldBuilder::new(&avro_ast).build()?;
-            let plan = build_write_plan_from_avro_root(&avro_root, self.schema.as_ref())?;
-            self.plan = Some(plan);
+            let encoder = build_write_plan_from_avro_root(&avro_root, self.schema.as_ref())?;
+            self.encoder = Some(encoder);
             self.started = true;
         }
-
         // Validate incoming batch matches the writer's Arrow **fields** (ignore metadata)
         if batch.schema().fields() != self.schema.fields() {
             return Err(ArrowError::SchemaError(
                 "Schema of RecordBatch differs from Writer schema (fields/types)".to_string(),
             ));
         }
-
         // Encode according to container format
         match self.format.sync_marker() {
             Some(&sync) => self.write_ocf_block(batch, &sync),
@@ -232,13 +227,13 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
 
     /// Write a single OCF data block: row count, block length, block bytes, sync.
     fn write_ocf_block(&mut self, batch: &RecordBatch, sync: &[u8; 16]) -> Result<(), ArrowError> {
-        let plan = self
-            .plan
+        let encoder = self
+            .encoder
             .as_ref()
             .ok_or_else(|| ArrowError::ComputeError("internal: write plan missing".into()))?;
         let mut buf = Vec::<u8>::with_capacity(1024);
         // Encode with the **plan** (schema‑driven union ordering)
-        encode_record_batch_with_plan(batch, &mut buf, plan)?;
+        encode_record_batch_with_plan(batch, &mut buf, encoder)?;
         let encoded = match self.compression {
             Some(codec) => codec.compress(&buf)?,
             None => buf,
@@ -256,16 +251,16 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
 
     /// Write in streaming/binary mode, using Single‑Object framing if available.
     fn write_stream(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
-        let plan = self
-            .plan
+        let encoder = self
+            .encoder
             .as_ref()
             .ok_or_else(|| ArrowError::ComputeError("internal: write plan missing".into()))?;
         if let Some(prefix) = self.format.single_object_prefix() {
             // Avro Single‑Object encoding per record: magic + fingerprint + record
-            encode_record_batch_single_object_with_plan(batch, &mut self.writer, prefix, plan)
+            encode_record_batch_single_object_with_plan(batch, &mut self.writer, prefix, encoder)
         } else {
             // Raw Avro binary (no header/prefix)
-            encode_record_batch_with_plan(batch, &mut self.writer, plan)
+            encode_record_batch_with_plan(batch, &mut self.writer, encoder)
         }
     }
 }
@@ -281,6 +276,7 @@ mod tests {
     use arrow_schema::{DataType, Field, IntervalUnit, Schema};
     use std::fs::File;
     use std::io::{BufReader, Cursor};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
 
@@ -650,6 +646,55 @@ mod tests {
             roundtrip, original,
             "Round-trip Avro map data mismatch for nonnullable.impala.avro"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_roundtrip_decimals_via_writer() -> Result<(), ArrowError> {
+        // (file, resolve via ARROW_TEST_DATA?)
+        let files: [(&str, bool); 8] = [
+            ("avro/fixed_length_decimal.avro", true), // fixed-backed -> Decimal128(25,2)
+            ("avro/fixed_length_decimal_legacy.avro", true), // legacy fixed[8] -> Decimal64(13,2)
+            ("avro/int32_decimal.avro", true),        // bytes-backed -> Decimal32(4,2)
+            ("avro/int64_decimal.avro", true),        // bytes-backed -> Decimal64(10,2)
+            ("test/data/int256_decimal.avro", false), // bytes-backed -> Decimal256(76,2)
+            ("test/data/fixed256_decimal.avro", false), // fixed[32]-backed -> Decimal256(76,10)
+            ("test/data/fixed_length_decimal_legacy_32.avro", false), // legacy fixed[4] -> Decimal32(9,2)
+            ("test/data/int128_decimal.avro", false), // bytes-backed -> Decimal128(38,2)
+        ];
+        for (rel, in_test_data_dir) in files {
+            // Resolve path the same way as reader::test_decimal
+            let path: String = if in_test_data_dir {
+                arrow_test_data(rel)
+            } else {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join(rel)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            // Read original file into a single RecordBatch for comparison
+            let f_in = File::open(&path).expect("open input avro");
+            let mut rdr = ReaderBuilder::new().build(BufReader::new(f_in))?;
+            let in_schema = rdr.schema();
+            let in_batches = rdr.collect::<Result<Vec<_>, _>>()?;
+            let original =
+                arrow::compute::concat_batches(&in_schema, &in_batches).expect("concat input");
+            // Write it out with the OCF writer (no special compression)
+            let tmp = NamedTempFile::new().expect("create temp file");
+            let out_path = tmp.into_temp_path();
+            let out_file = File::create(&out_path).expect("create temp avro");
+            let mut writer = AvroWriter::new(out_file, original.schema().as_ref().clone())?;
+            writer.write(&original)?;
+            writer.finish()?;
+            // Read back the file we just wrote and compare equality (schema + data)
+            let f_rt = File::open(&out_path).expect("open roundtrip avro");
+            let mut rt_rdr = ReaderBuilder::new().build(BufReader::new(f_rt))?;
+            let rt_schema = rt_rdr.schema();
+            let rt_batches = rt_rdr.collect::<Result<Vec<_>, _>>()?;
+            let roundtrip =
+                arrow::compute::concat_batches(&rt_schema, &rt_batches).expect("concat rt");
+            assert_eq!(roundtrip, original, "decimal round-trip mismatch for {rel}");
+        }
         Ok(())
     }
 

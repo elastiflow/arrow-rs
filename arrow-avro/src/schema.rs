@@ -950,8 +950,30 @@ fn datatype_to_avro_with_opts(
                 })
             }
         }
-        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
-            // Prefer fixed if original size info present
+        DataType::Decimal32(precision, scale)
+        | DataType::Decimal64(precision, scale)
+        | DataType::Decimal128(precision, scale)
+        | DataType::Decimal256(precision, scale) => {
+            // === Avro-decimal validation per spec (1.11.1) ===
+            // Scale must be >= 0 and <= precision; otherwise the logical
+            // type is invalid. We surface a schema error at generation time
+            // to avoid silently downgrading to the base type later.
+            // Ref: Specification §Logical Types / Decimal.
+            if *scale < 0 {
+                return Err(ArrowError::SchemaError(format!(
+                    "Invalid Avro decimal for field '{field_name}': scale ({scale}) must be >= 0"
+                )));
+            }
+            let s = *scale as usize;
+            if s > *precision as usize {
+                return Err(ArrowError::SchemaError(format!(
+                    "Invalid Avro decimal for field '{field_name}': scale ({scale}) \
+                     must be <= precision ({precision})"
+                )));
+            }
+
+            // Prefer fixed if original size hint is present in field metadata.
+            // Otherwise emit bytes-backed decimal (reader/writer compatible).
             let mut meta = JsonMap::from_iter([
                 ("logicalType".into(), json!("decimal")),
                 ("precision".into(), json!(*precision)),
@@ -1768,6 +1790,38 @@ mod tests {
     }
 
     #[test]
+    fn test_decimal32_64_emit_logical_type() {
+        // Decimal32
+        let dec32_field = ArrowField::new("amt32", DataType::Decimal32(7, 2), true);
+        let s32 = single_field_schema(dec32_field);
+        let avro32 = AvroSchema::try_from(&s32).unwrap();
+        assert_json_contains(&avro32.json_string, "\"logicalType\":\"decimal\"");
+        assert_json_contains(&avro32.json_string, "\"precision\":7");
+        assert_json_contains(&avro32.json_string, "\"scale\":2");
+
+        // Decimal64
+        let dec64_field = ArrowField::new("amt64", DataType::Decimal64(13, 2), false);
+        let s64 = single_field_schema(dec64_field);
+        let avro64 = AvroSchema::try_from(&s64).unwrap();
+        assert_json_contains(&avro64.json_string, "\"logicalType\":\"decimal\"");
+        assert_json_contains(&avro64.json_string, "\"precision\":13");
+        assert_json_contains(&avro64.json_string, "\"scale\":2");
+    }
+
+    #[test]
+    fn test_decimal_fixed_size_metadata_emits_fixed() {
+        // Ensure that providing a "size" metadata hint emits a fixed decimal
+        let mut md = HashMap::new();
+        md.insert("size".into(), "8".into());
+        let field = ArrowField::new("price", DataType::Decimal64(13, 2), false).with_metadata(md);
+        let schema = single_field_schema(field);
+        let avro = AvroSchema::try_from(&schema).unwrap();
+        assert_json_contains(&avro.json_string, "\"type\":\"fixed\"");
+        assert_json_contains(&avro.json_string, "\"size\":8");
+        assert_json_contains(&avro.json_string, "\"logicalType\":\"decimal\"");
+    }
+
+    #[test]
     fn test_interval_duration() {
         let interval_field = ArrowField::new(
             "span",
@@ -2006,5 +2060,26 @@ mod tests {
         );
 
         assert_eq!(arrow_field, expected);
+    }
+
+    #[test]
+    fn test_decimal_invalid_scale_rejected() {
+        // Negative scale must be rejected
+        let neg = ArrowField::new("amt", DataType::Decimal128(10, -2), false);
+        let s = single_field_schema(neg);
+        let err = AvroSchema::try_from(&s).unwrap_err().to_string();
+        assert!(
+            err.contains("scale (-2) must be >= 0"),
+            "unexpected error: {err}"
+        );
+
+        // Scale greater than precision must be rejected
+        let too_big = ArrowField::new("amt2", DataType::Decimal64(5, 7), false);
+        let s2 = single_field_schema(too_big);
+        let err2 = AvroSchema::try_from(&s2).unwrap_err().to_string();
+        assert!(
+            err2.contains("scale (7) must be <= precision (5)"),
+            "unexpected error: {err2}"
+        );
     }
 }
