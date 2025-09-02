@@ -20,7 +20,7 @@
 //! # Overview
 //!
 //! *   Use **`AvroWriter`** (Object Container File) when you want a
-//!     self‑contained Avro file with header, schema JSON, optional compression,
+//!     self‑contained Avro file with header, optional compression,
 //!     blocks, and sync markers.
 //! *   Use **`AvroStreamWriter`** (raw binary stream) when you already know the
 //!     schema out‑of‑band (i.e., via a schema registry) and need a stream
@@ -31,14 +31,14 @@
 pub mod encoder;
 /// Logic for different Avro container file formats.
 pub mod format;
-
+use crate::codec::AvroFieldBuilder;
 use crate::compression::CompressionCodec;
-use crate::schema::AvroSchema;
-use crate::writer::encoder::{encode_record_batch, write_long};
+use crate::schema::{AvroSchema, SchemaGenOptions, SCHEMA_METADATA_KEY};
+use crate::writer::encoder::{write_long, RecordEncoder, RecordEncoderBuilder};
 use crate::writer::format::{AvroBinaryFormat, AvroFormat, AvroOcfFormat};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema};
-use std::io::{self, Write};
+use std::io::Write;
 use std::sync::Arc;
 
 /// Builder to configure and create a `Writer`.
@@ -46,6 +46,8 @@ use std::sync::Arc;
 pub struct WriterBuilder {
     schema: Schema,
     codec: Option<CompressionCodec>,
+    capacity: usize,
+    schema_gen_options: Option<SchemaGenOptions>,
 }
 
 impl WriterBuilder {
@@ -54,6 +56,8 @@ impl WriterBuilder {
         Self {
             schema,
             codec: None,
+            capacity: 1024,
+            schema_gen_options: None,
         }
     }
 
@@ -63,19 +67,52 @@ impl WriterBuilder {
         self
     }
 
+    /// Sets the capacity for the given object and returns the modified instance.
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity;
+        self
+    }
+
+    /// Provide options to control **generation** of Avro JSON from the Arrow
+    /// schema when no explicit `avro.schema` is provided.
+    pub fn with_schema_gen_options(mut self, opts: SchemaGenOptions) -> Self {
+        self.schema_gen_options = Some(opts);
+        self
+    }
+
     /// Create a new `Writer` with specified `AvroFormat` and builder options.
-    pub fn build<W, F>(self, writer: W) -> Writer<W, F>
+    /// Performs one‑time startup (header/stream init, encoder plan).
+    pub fn build<W, F>(self, mut writer: W) -> Result<Writer<W, F>, ArrowError>
     where
         W: Write,
         F: AvroFormat,
     {
-        Writer {
+        let mut format = F::default();
+        let chosen_json = if let Some(json) = self.schema.metadata.get(SCHEMA_METADATA_KEY) {
+            json.clone()
+        } else if let Some(opts) = &self.schema_gen_options {
+            let avro = AvroSchema::from_arrow_with_options(&self.schema, *opts)?;
+            avro.json_string
+        } else {
+            AvroSchema::try_from(&self.schema)?.json_string
+        };
+        let mut md = self.schema.metadata().clone();
+        md.insert(SCHEMA_METADATA_KEY.to_string(), chosen_json.clone());
+        let schema = Arc::new(Schema::new_with_metadata(self.schema.fields().clone(), md));
+        format.start_stream(&mut writer, &schema, self.codec)?;
+        let avro_holder = AvroSchema::new(chosen_json);
+        let avro_ast = avro_holder.schema()?;
+        let avro_root = AvroFieldBuilder::new(&avro_ast).build()?;
+        let encoder = RecordEncoderBuilder::new(&avro_root, schema.as_ref()).build()?;
+        Ok(Writer {
             writer,
-            schema: Arc::from(self.schema),
-            format: F::default(),
+            schema,
+            format,
             compression: self.codec,
-            started: false,
-        }
+            capacity: self.capacity,
+            schema_gen_options: self.schema_gen_options,
+            encoder,
+        })
     }
 }
 
@@ -86,7 +123,9 @@ pub struct Writer<W: Write, F: AvroFormat> {
     schema: Arc<Schema>,
     format: F,
     compression: Option<CompressionCodec>,
-    started: bool,
+    capacity: usize,
+    schema_gen_options: Option<SchemaGenOptions>,
+    encoder: RecordEncoder,
 }
 
 /// Alias for an Avro **Object Container File** writer.
@@ -95,15 +134,9 @@ pub type AvroWriter<W> = Writer<W, AvroOcfFormat>;
 pub type AvroStreamWriter<W> = Writer<W, AvroBinaryFormat>;
 
 impl<W: Write> Writer<W, AvroOcfFormat> {
-    /// Convenience constructor – same as
+    /// Convenience constructor – same as [`WriterBuilder::build`] with `AvroOcfFormat`.
     pub fn new(writer: W, schema: Schema) -> Result<Self, ArrowError> {
-        Ok(WriterBuilder::new(schema).build::<W, AvroOcfFormat>(writer))
-    }
-
-    /// Change the compression codec after construction.
-    pub fn with_compression(mut self, codec: Option<CompressionCodec>) -> Self {
-        self.compression = codec;
-        self
+        WriterBuilder::new(schema).build::<W, AvroOcfFormat>(writer)
     }
 
     /// Return a reference to the 16‑byte sync marker generated for this file.
@@ -115,23 +148,19 @@ impl<W: Write> Writer<W, AvroOcfFormat> {
 impl<W: Write> Writer<W, AvroBinaryFormat> {
     /// Convenience constructor to create a new [`AvroStreamWriter`].
     pub fn new(writer: W, schema: Schema) -> Result<Self, ArrowError> {
-        Ok(WriterBuilder::new(schema).build::<W, AvroBinaryFormat>(writer))
+        WriterBuilder::new(schema).build::<W, AvroBinaryFormat>(writer)
     }
 }
 
 impl<W: Write, F: AvroFormat> Writer<W, F> {
     /// Serialize one [`RecordBatch`] to the output.
     pub fn write(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
-        if !self.started {
-            self.format
-                .start_stream(&mut self.writer, &self.schema, self.compression)?;
-            self.started = true;
-        }
-        if batch.schema() != self.schema {
+        if batch.schema().fields() != self.schema.fields() {
             return Err(ArrowError::SchemaError(
-                "Schema of RecordBatch differs from Writer schema".to_string(),
+                "Schema of RecordBatch differs from Writer schema (fields/types)".to_string(),
             ));
         }
+        // Encode according to container format
         match self.format.sync_marker() {
             Some(&sync) => self.write_ocf_block(batch, &sync),
             None => self.write_stream(batch),
@@ -150,11 +179,6 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
 
     /// Flush remaining buffered data and (for OCF) ensure the header is present.
     pub fn finish(&mut self) -> Result<(), ArrowError> {
-        if !self.started {
-            self.format
-                .start_stream(&mut self.writer, &self.schema, self.compression)?;
-            self.started = true;
-        }
         self.writer
             .flush()
             .map_err(|e| ArrowError::IoError(format!("Error flushing writer: {e}"), e))
@@ -165,9 +189,11 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
         self.writer
     }
 
+    /// Write a single OCF data block: row count, block length, block bytes, sync.
     fn write_ocf_block(&mut self, batch: &RecordBatch, sync: &[u8; 16]) -> Result<(), ArrowError> {
         let mut buf = Vec::<u8>::with_capacity(1024);
-        encode_record_batch(batch, &mut buf)?;
+        // Encode with the plan (schema‑driven union ordering)
+        self.encoder.encode_batch(batch, &mut buf)?;
         let encoded = match self.compression {
             Some(codec) => codec.compress(&buf)?,
             None => buf,
@@ -183,20 +209,24 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
         Ok(())
     }
 
+    /// Write in streaming/binary mode, using Single‑Object framing if available.
     fn write_stream(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
-        encode_record_batch(batch, &mut self.writer)
+        self.encoder.encode_batch(batch, &mut self.writer)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::CompressionCodec;
     use crate::reader::ReaderBuilder;
+    use crate::schema::{AvroSchema, SchemaStore};
     use crate::test_util::arrow_test_data;
-    use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, IntervalUnit, Schema};
     use std::fs::File;
-    use std::io::BufReader;
+    use std::io::{BufReader, Cursor};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
 
@@ -217,10 +247,6 @@ mod tests {
         .expect("failed to build test RecordBatch")
     }
 
-    fn contains_ascii(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack.windows(needle.len()).any(|w| w == needle)
-    }
-
     #[test]
     fn test_ocf_writer_generates_header_and_sync() -> Result<(), ArrowError> {
         let batch = make_batch();
@@ -230,12 +256,8 @@ mod tests {
         writer.finish()?;
         let out = writer.into_inner();
         assert_eq!(&out[..4], b"Obj\x01", "OCF magic bytes missing/incorrect");
-        let sync = AvroWriter::new(Vec::new(), make_schema())?
-            .sync_marker()
-            .cloned();
         let trailer = &out[out.len() - 16..];
         assert_eq!(trailer.len(), 16, "expected 16‑byte sync marker");
-        let _ = sync;
         Ok(())
     }
 
@@ -309,16 +331,20 @@ mod tests {
             let tmp = NamedTempFile::new().expect("create temp file");
             let out_path = tmp.into_temp_path();
             let out_file = File::create(&out_path).expect("create temp avro");
-            let mut writer = AvroWriter::new(out_file, original.schema().as_ref().clone())?;
-            if rel.contains(".snappy.") {
-                writer = writer.with_compression(Some(CompressionCodec::Snappy));
+            let codec = if rel.contains(".snappy.") {
+                Some(CompressionCodec::Snappy)
             } else if rel.contains(".zstandard.") {
-                writer = writer.with_compression(Some(CompressionCodec::ZStandard));
+                Some(CompressionCodec::ZStandard)
             } else if rel.contains(".bzip2.") {
-                writer = writer.with_compression(Some(CompressionCodec::Bzip2));
+                Some(CompressionCodec::Bzip2)
             } else if rel.contains(".xz.") {
-                writer = writer.with_compression(Some(CompressionCodec::Xz));
-            }
+                Some(CompressionCodec::Xz)
+            } else {
+                None
+            };
+            let mut writer = WriterBuilder::new(original.schema().as_ref().clone())
+                .with_compression(codec)
+                .build::<_, AvroOcfFormat>(out_file)?;
             writer.write(&original)?;
             writer.finish()?;
             drop(writer);
@@ -336,6 +362,74 @@ mod tests {
                 rel
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_roundtrip_nested_records_writer() -> Result<(), ArrowError> {
+        let path = arrow_test_data("avro/nested_records.avro");
+        let rdr_file = File::open(&path).expect("open nested_records.avro");
+        let mut reader = ReaderBuilder::new()
+            .build(BufReader::new(rdr_file))
+            .expect("build reader for nested_records.avro");
+        let schema = reader.schema();
+        let batches = reader.collect::<Result<Vec<_>, _>>()?;
+        let original = arrow::compute::concat_batches(&schema, &batches).expect("concat original");
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let out_path = tmp.into_temp_path();
+        {
+            let out_file = File::create(&out_path).expect("create output avro");
+            let mut writer = AvroWriter::new(out_file, original.schema().as_ref().clone())?;
+            writer.write(&original)?;
+            writer.finish()?;
+        }
+        let rt_file = File::open(&out_path).expect("open round_trip avro");
+        let mut rt_reader = ReaderBuilder::new()
+            .build(BufReader::new(rt_file))
+            .expect("build round_trip reader");
+        let rt_schema = rt_reader.schema();
+        let rt_batches = rt_reader.collect::<Result<Vec<_>, _>>()?;
+        let round_trip =
+            arrow::compute::concat_batches(&rt_schema, &rt_batches).expect("concat round_trip");
+        assert_eq!(
+            round_trip, original,
+            "Round-trip batch mismatch for nested_records.avro"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_roundtrip_nested_lists_writer() -> Result<(), ArrowError> {
+        let path = arrow_test_data("avro/nested_lists.snappy.avro");
+        let rdr_file = File::open(&path).expect("open nested_lists.snappy.avro");
+        let mut reader = ReaderBuilder::new()
+            .build(BufReader::new(rdr_file))
+            .expect("build reader for nested_lists.snappy.avro");
+        let schema = reader.schema();
+        let batches = reader.collect::<Result<Vec<_>, _>>()?;
+        let original = arrow::compute::concat_batches(&schema, &batches).expect("concat original");
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let out_path = tmp.into_temp_path();
+        {
+            let out_file = File::create(&out_path).expect("create output avro");
+            let mut writer = WriterBuilder::new(original.schema().as_ref().clone())
+                .with_compression(Some(CompressionCodec::Snappy))
+                .build::<_, AvroOcfFormat>(out_file)?;
+            writer.write(&original)?;
+            writer.finish()?;
+        }
+        let rt_file = File::open(&out_path).expect("open round_trip avro");
+        let mut rt_reader = ReaderBuilder::new()
+            .build(BufReader::new(rt_file))
+            .expect("build round_trip reader");
+        let rt_schema = rt_reader.schema();
+        let rt_batches = rt_reader.collect::<Result<Vec<_>, _>>()?;
+        let round_trip =
+            arrow::compute::concat_batches(&rt_schema, &rt_batches).expect("concat round_trip");
+        assert_eq!(
+            round_trip, original,
+            "Round-trip batch mismatch for nested_lists.snappy.avro"
+        );
         Ok(())
     }
 }
