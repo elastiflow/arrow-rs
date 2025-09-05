@@ -1109,7 +1109,6 @@ trait DecimalBeBytes<const N: usize> {
 }
 
 impl DecimalBeBytes<4> for Decimal32Array {
-
     fn value_be_bytes(&self, idx: usize) -> [u8; 4] {
         self.value(idx).to_be_bytes()
     }
