@@ -38,6 +38,7 @@ use uuid::Uuid;
 /// Encode a single Avro-`long` using ZigZag + variable length, buffered.
 ///
 /// Spec: <https://avro.apache.org/docs/1.11.1/specification/#binary-encoding>
+#[inline]
 pub fn write_long<W: Write + ?Sized>(writer: &mut W, value: i64) -> Result<(), ArrowError> {
     let mut zz = ((value << 1) ^ (value >> 63)) as u64;
     // At most 10 bytes for 64-bit varint
@@ -55,10 +56,12 @@ pub fn write_long<W: Write + ?Sized>(writer: &mut W, value: i64) -> Result<(), A
         .map_err(|e| ArrowError::IoError(format!("write long: {e}"), e))
 }
 
+#[inline]
 fn write_int<W: Write + ?Sized>(writer: &mut W, value: i32) -> Result<(), ArrowError> {
     write_long(writer, value as i64)
 }
 
+#[inline]
 fn write_len_prefixed<W: Write + ?Sized>(writer: &mut W, bytes: &[u8]) -> Result<(), ArrowError> {
     write_long(writer, bytes.len() as i64)?;
     writer
@@ -66,6 +69,7 @@ fn write_len_prefixed<W: Write + ?Sized>(writer: &mut W, bytes: &[u8]) -> Result
         .map_err(|e| ArrowError::IoError(format!("write bytes: {e}"), e))
 }
 
+#[inline]
 fn write_bool<W: Write + ?Sized>(writer: &mut W, v: bool) -> Result<(), ArrowError> {
     writer
         .write_all(&[if v { 1 } else { 0 }])
@@ -80,6 +84,7 @@ fn write_bool<W: Write + ?Sized>(writer: &mut W, v: bool) -> Result<(), ArrowErr
 ///
 /// See Avro spec: decimal over `bytes` uses two's-complement big-endian
 /// representation of the unscaled integer value. 1.11.1 specification.
+#[inline]
 fn minimal_twos_complement(be: &[u8]) -> &[u8] {
     if be.is_empty() {
         return be;
@@ -107,6 +112,7 @@ fn minimal_twos_complement(be: &[u8]) -> &[u8] {
 /// If shorter than `n`, left-pad with the sign byte.
 ///
 /// Used for Avro decimal over `fixed(N)`.
+#[inline]
 fn sign_extend_to_exact(src_be: &[u8], n: usize) -> Result<Vec<u8>, ArrowError> {
     let len = src_be.len();
     let sign_byte = if len > 0 && (src_be[0] & 0x80) != 0 {
@@ -304,6 +310,14 @@ impl<'a> FieldEncoder<'a> {
                     )))
                 }
             },
+            FieldPlan::Map { values_nullability,
+                value_plan } => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<MapArray>()
+                    .ok_or_else(|| ArrowError::SchemaError("Expected MapArray".into()))?;
+                Encoder::Map(Box::new(MapEncoder::try_new(arr, *values_nullability, value_plan.as_ref())?))
+            }
             FieldPlan::Enum { symbols} => match array.data_type() {
                 DataType::Dictionary(key_dt, value_dt) => {
                     // Enforce the same shape we validated during plan build:
@@ -352,14 +366,6 @@ impl<'a> FieldEncoder<'a> {
                         "Avro enum site requires DataType::Dictionary, found: {other:?}"
                     )))
                 }
-            }
-            FieldPlan::Map { values_nullability,
-                value_plan } => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<MapArray>()
-                    .ok_or_else(|| ArrowError::SchemaError("Expected MapArray".into()))?;
-                Encoder::Map(Box::new(MapEncoder::try_new(arr, *values_nullability, value_plan.as_ref())?))
             }
             other => {
                 return Err(ArrowError::NotYetImplemented(
@@ -568,6 +574,7 @@ fn find_struct_child_index(fields: &arrow_schema::Fields, name: &str) -> Option<
     fields.iter().position(|f| f.name() == name)
 }
 
+#[inline]
 fn find_map_value_field_index(fields: &arrow_schema::Fields) -> Option<usize> {
     // Prefer common Arrow field names; fall back to second child if exactly two
     find_struct_child_index(fields, "value")
@@ -844,6 +851,7 @@ struct MapEncoder<'a> {
     values_offset: usize,
 }
 
+#[inline]
 fn encode_map_entries<W, O>(
     out: &mut W,
     keys: &GenericStringArray<O>,
@@ -1101,6 +1109,7 @@ trait DecimalBeBytes<const N: usize> {
 }
 
 impl DecimalBeBytes<4> for Decimal32Array {
+
     fn value_be_bytes(&self, idx: usize) -> [u8; 4] {
         self.value(idx).to_be_bytes()
     }
