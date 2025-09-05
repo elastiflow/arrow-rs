@@ -365,6 +365,33 @@ impl RecordEncoder {
         }
         Ok(())
     }
+
+    /// Encode all rows in `batch`, invoking `prefix(out)?` before each row.
+    ///
+    /// Used by streaming formats to add per‑row headers (i.e., Avro single‑object
+    /// encoding’s magic and schema fingerprint) without changing the datum’s Avro
+    /// binary encoding. The underlying field encoders continue to follow the
+    /// Avro 1.11.1 Binary Encoding rules (zig‑zag variants; arrays/maps in blocks;
+    /// unions prefixed by branch index).
+    pub fn encode_with_prefix<W, P>(
+        &self,
+        out: &mut W,
+        batch: &RecordBatch,
+        mut prefix: P,
+    ) -> Result<(), ArrowError>
+    where
+        W: Write + ?Sized,
+        P: FnMut(&mut W) -> Result<(), ArrowError>,
+    {
+        let mut column_encoders = self.prepare_for_batch(batch)?;
+        for row in 0..batch.num_rows() {
+            prefix(out)?;
+            for encoder in column_encoders.iter_mut() {
+                encoder.encode(out, row)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn find_struct_child_index(fields: &arrow_schema::Fields, name: &str) -> Option<usize> {

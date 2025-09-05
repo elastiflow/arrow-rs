@@ -25,7 +25,13 @@
 //! *   Use **`AvroStreamWriter`** (raw binary stream) when you already know the
 //!     schema out‑of‑band (i.e., via a schema registry) and need a stream
 //!     of Avro‑encoded records with minimal framing.
+//! *   Use **`AvroSingleObjectWriter`** when you need **Avro single‑object
+//!     encoding**: for each datum, it writes the two‑byte marker `C3 01`, the
+//!     **8‑byte little‑endian CRC‑64‑AVRO** fingerprint of the writer schema,
+//!     then the datum using Avro **binary encoding** (no compression or sync).
 //!
+//! See the Avro 1.11.1 specification for details on **Binary Encoding** and
+//! **Single‑Object Encoding**.
 
 /// Encodes `RecordBatch` into the Avro binary format.
 pub mod encoder;
@@ -34,9 +40,9 @@ pub mod format;
 
 use crate::codec::AvroFieldBuilder;
 use crate::compression::CompressionCodec;
-use crate::schema::{AvroSchema, SCHEMA_METADATA_KEY};
+use crate::schema::{AvroSchema, Fingerprint, SCHEMA_METADATA_KEY};
 use crate::writer::encoder::{write_long, RecordEncoder, RecordEncoderBuilder};
-use crate::writer::format::{AvroBinaryFormat, AvroFormat, AvroOcfFormat};
+use crate::writer::format::{AvroBinaryFormat, AvroFormat, AvroOcfFormat, AvroSingleObjectFormat};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema};
 use std::io::Write;
@@ -119,6 +125,8 @@ pub struct Writer<W: Write, F: AvroFormat> {
 pub type AvroWriter<W> = Writer<W, AvroOcfFormat>;
 /// Alias for a raw Avro **binary stream** writer.
 pub type AvroStreamWriter<W> = Writer<W, AvroBinaryFormat>;
+/// Alias for Avro **Single‑Object Encoding** writer.
+pub type AvroSingleObjectWriter<W> = Writer<W, AvroSingleObjectFormat>;
 
 impl<W: Write> Writer<W, AvroOcfFormat> {
     /// Convenience constructor – same as [`WriterBuilder::build`] with `AvroOcfFormat`.
@@ -136,6 +144,19 @@ impl<W: Write> Writer<W, AvroBinaryFormat> {
     /// Convenience constructor to create a new [`AvroStreamWriter`].
     pub fn new(writer: W, schema: Schema) -> Result<Self, ArrowError> {
         WriterBuilder::new(schema).build::<W, AvroBinaryFormat>(writer)
+    }
+}
+
+impl<W: Write> Writer<W, AvroSingleObjectFormat> {
+    /// Convenience constructor for a single‑object encoding writer.
+    pub fn new(writer: W, schema: Schema) -> Result<Self, ArrowError> {
+        WriterBuilder::new(schema).build::<W, AvroSingleObjectFormat>(writer)
+    }
+
+    /// Returns the computed writer‑schema fingerprint (if available).
+    pub fn fingerprint(&self) -> Option<Fingerprint> {
+        // Forward to the underlying format instance
+        self.format.fingerprint()
     }
 }
 
@@ -194,7 +215,10 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
     }
 
     fn write_stream(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
-        self.encoder.encode(&mut self.writer, batch)
+        // Always route via per‑row prefix hook; Binary is no‑op, Single‑Object emits the prefix.
+        let format = &mut self.format;
+        self.encoder
+            .encode_with_prefix(&mut self.writer, batch, |w| format.write_record_prefix(w))
     }
 }
 
@@ -203,7 +227,7 @@ mod tests {
     use super::*;
     use crate::compression::CompressionCodec;
     use crate::reader::ReaderBuilder;
-    use crate::schema::{AvroSchema, SchemaStore};
+    use crate::schema::{AvroSchema, SchemaStore, SINGLE_OBJECT_MAGIC};
     use crate::test_util::arrow_test_data;
     use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, IntervalUnit, Schema};
@@ -413,6 +437,61 @@ mod tests {
             round_trip, original,
             "Round-trip batch mismatch for nested_lists.snappy.avro"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_binary_stream_has_no_header_or_single_object_prefix() -> Result<(), ArrowError> {
+        let batch = make_batch();
+        let buffer: Vec<u8> = Vec::new();
+        let mut writer = AvroStreamWriter::new(buffer, make_schema())?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        let out = writer.into_inner();
+        assert!(out.len() > 0, "binary stream should produce bytes");
+        assert_ne!(&out[..4.min(out.len())], b"Obj\x01", "must not be OCF");
+        assert_ne!(
+            &out[..2.min(out.len())],
+            &SINGLE_OBJECT_MAGIC,
+            "must not be single-object"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_object_roundtrip_rabin() -> Result<(), ArrowError> {
+        let batch = make_batch();
+        let schema = make_schema();
+        let buffer: Vec<u8> = Vec::new();
+        let mut writer = AvroSingleObjectWriter::new(buffer, schema.clone())?;
+        let fp = writer.fingerprint().expect("fingerprint present");
+        writer.write(&batch)?;
+        writer.finish()?;
+        let out = writer.into_inner();
+        assert_eq!(
+            &out[..2],
+            &SINGLE_OBJECT_MAGIC,
+            "missing/incorrect single-object magic"
+        );
+        let mut store = SchemaStore::new();
+        let avro_schema = AvroSchema::try_from(&schema)?;
+        let registered = store.register(avro_schema)?;
+        assert_eq!(
+            registered, fp,
+            "store fingerprint must match writer's fingerprint"
+        );
+        let mut decoder = crate::reader::ReaderBuilder::new()
+            .with_writer_schema_store(store)
+            .build_decoder()?;
+        let consumed = decoder.decode(&out)?;
+        assert_eq!(consumed, out.len(), "decoder should consume entire buffer");
+        let maybe_batch = decoder.flush()?.expect("should flush a batch");
+        assert_eq!(
+            maybe_batch.num_rows(),
+            batch.num_rows(),
+            "row count should match"
+        );
+        assert_eq!(maybe_batch, batch, "single-object roundtrip mismatch");
         Ok(())
     }
 }
