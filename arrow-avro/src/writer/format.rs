@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::compression::{CompressionCodec, CODEC_METADATA_KEY};
-use crate::schema::{AvroSchema, SCHEMA_METADATA_KEY};
+use crate::schema::{
+    AvroSchema, Fingerprint, CONFLUENT_MAGIC, SCHEMA_METADATA_KEY, SINGLE_OBJECT_MAGIC,
+};
 use crate::writer::encoder::write_long;
 use arrow_schema::{ArrowError, Schema};
 use rand::RngCore;
@@ -36,6 +38,12 @@ pub trait AvroFormat: Debug + Default {
 
     /// Return the 16‑byte sync marker (OCF) or `None` (binary stream).
     fn sync_marker(&self) -> Option<&[u8; 16]>;
+
+    /// Called before writing each row for streaming formats.
+    /// Default: no‑op.
+    fn write_record_prefix<W: Write>(&mut self, _writer: &mut W) -> Result<(), ArrowError> {
+        Ok(())
+    }
 }
 
 /// Avro Object Container File (OCF) format writer.
@@ -93,15 +101,99 @@ impl AvroFormat for AvroBinaryFormat {
         &mut self,
         _writer: &mut W,
         _schema: &Schema,
-        _compression: Option<CompressionCodec>,
+        compression: Option<CompressionCodec>,
     ) -> Result<(), ArrowError> {
-        Err(ArrowError::NotYetImplemented(
-            "avro binary format not yet implemented".to_string(),
-        ))
+        // Binary streams have no header/sync; compression isn't supported in this mode.
+        if compression.is_some() {
+            return Err(ArrowError::InvalidArgumentError(
+                "AvroBinaryFormat does not support compression".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn sync_marker(&self) -> Option<&[u8; 16]> {
         None
+    }
+}
+
+/// Avro **Single‑Object Encoding** writer.
+///
+/// Per Avro 1.11.1, each datum is preceded by:
+///  1. Two‑byte marker `C3 01`,
+///  2. The 8‑byte **little‑endian** CRC‑64‑AVRO fingerprint of the writer schema,
+///  3. The datum in Avro **binary encoding**.
+///
+/// This implementation also mirrors reader support for:
+///  • **Confluent wire format** when given `Fingerprint::Id(id)` - `0x00` + 4‑bytes **big‑endian** ID and payload.
+///  • Feature‑gated MD5 / SHA‑256 variants (still prefixed by `C3 01`).
+#[derive(Debug, Default)]
+pub struct AvroSingleObjectFormat {
+    /// The header written before each datum (magic and fingerprint bytes).
+    header: Vec<u8>,
+    /// The writer‑schema fingerprint this stream uses (exposed for tests).
+    fingerprint: Option<Fingerprint>,
+}
+
+impl AvroSingleObjectFormat {
+    fn build_header(fp: &Fingerprint) -> Vec<u8> {
+        let mut out = Vec::new();
+        match fp {
+            Fingerprint::Rabin(u) => {
+                out.extend_from_slice(&SINGLE_OBJECT_MAGIC);
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            Fingerprint::Id(id) => {
+                out.extend_from_slice(&CONFLUENT_MAGIC);
+                out.extend_from_slice(&id.to_be_bytes());
+            }
+            #[cfg(feature = "md5")]
+            Fingerprint::MD5(bytes) => {
+                out.extend_from_slice(&SINGLE_OBJECT_MAGIC);
+                out.extend_from_slice(bytes);
+            }
+            #[cfg(feature = "sha256")]
+            Fingerprint::SHA256(bytes) => {
+                out.extend_from_slice(&SINGLE_OBJECT_MAGIC);
+                out.extend_from_slice(bytes);
+            }
+        }
+        out
+    }
+
+    /// Returns the computed writer‑schema fingerprint (if available).
+    pub fn fingerprint(&self) -> Option<Fingerprint> {
+        self.fingerprint
+    }
+}
+
+impl AvroFormat for AvroSingleObjectFormat {
+    fn start_stream<W: Write>(
+        &mut self,
+        _writer: &mut W,
+        schema: &Schema,
+        compression: Option<CompressionCodec>,
+    ) -> Result<(), ArrowError> {
+        if compression.is_some() {
+            return Err(ArrowError::InvalidArgumentError(
+                "AvroSingleObjectFormat does not support compression".to_string(),
+            ));
+        }
+        let avro_schema = AvroSchema::try_from(schema)?;
+        let fp = avro_schema.fingerprint()?;
+        self.header = Self::build_header(&fp);
+        self.fingerprint = Some(fp);
+        Ok(())
+    }
+
+    fn sync_marker(&self) -> Option<&[u8; 16]> {
+        None
+    }
+
+    fn write_record_prefix<W: Write>(&mut self, writer: &mut W) -> Result<(), ArrowError> {
+        writer
+            .write_all(&self.header)
+            .map_err(|e| ArrowError::IoError(format!("write single-object prefix: {e}"), e))
     }
 }
 
