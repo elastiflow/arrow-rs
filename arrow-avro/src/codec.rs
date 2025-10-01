@@ -18,7 +18,7 @@
 use crate::schema::{
     make_full_name, Array, Attributes, AvroSchema, ComplexType, Enum, Fixed, Map, Nullability,
     PrimitiveType, Record, Schema, Type, TypeName, AVRO_ENUM_SYMBOLS_METADATA_KEY,
-    AVRO_FIELD_DEFAULT_METADATA_KEY, AVRO_ROOT_RECORD_DEFAULT_NAME,
+    AVRO_FIELD_DEFAULT_METADATA_KEY, AVRO_NAME_METADATA_KEY, AVRO_ROOT_RECORD_DEFAULT_NAME,
 };
 use arrow_schema::{
     ArrowError, DataType, Field, Fields, IntervalUnit, TimeUnit, UnionFields, UnionMode,
@@ -817,6 +817,7 @@ impl Codec {
 
     #[inline]
     fn union_field_name(&self) -> String {
+        // TODO: THIS IS THE ISSUE
         UnionFieldKind::from(self).as_ref().to_owned()
     }
 }
@@ -981,7 +982,14 @@ impl From<&Codec> for UnionFieldKind {
 fn build_union_fields(encodings: &[AvroDataType]) -> UnionFields {
     let arrow_fields: Vec<Field> = encodings
         .iter()
-        .map(|encoding| encoding.field_with_name(&encoding.codec().union_field_name()))
+        .map(|encoding| {
+            let name = if let Some(specific_name) = encoding.metadata.get(AVRO_NAME_METADATA_KEY) {
+                specific_name.clone()
+            } else {
+                encoding.codec().union_field_name()
+            };
+            encoding.field_with_name(&name)
+        })
         .collect();
     let type_ids: Vec<i8> = (0..arrow_fields.len()).map(|i| i as i8).collect();
     UnionFields::new(type_ids, arrow_fields)
@@ -1072,22 +1080,73 @@ fn nullable_union_variants<'x, 'y>(
 enum UnionBranchKey {
     Named(String),
     Primitive(PrimitiveType),
+    PrimitiveLogical(String),
     Array,
     Map,
 }
 
+// fn branch_key_of<'a>(s: &Schema<'a>, enclosing_ns: Option<&'a str>) -> Option<UnionBranchKey> {
+//     let (name, namespace) = match s {
+//         Schema::TypeName(TypeName::Primitive(p))
+//         | Schema::Type(Type {
+//             r#type: TypeName::Primitive(p),
+//             ..
+//         }) => return Some(UnionBranchKey::Primitive(*p)),
+//         Schema::TypeName(TypeName::Ref(name))
+//         | Schema::Type(Type {
+//             r#type: TypeName::Ref(name),
+//             ..
+//         }) => (name, None),
+//         Schema::Complex(ComplexType::Array(_)) => return Some(UnionBranchKey::Array),
+//         Schema::Complex(ComplexType::Map(_)) => return Some(UnionBranchKey::Map),
+//         Schema::Complex(ComplexType::Record(r)) => (&r.name, r.namespace),
+//         Schema::Complex(ComplexType::Enum(e)) => (&e.name, e.namespace),
+//         Schema::Complex(ComplexType::Fixed(f)) => (&f.name, f.namespace),
+//         Schema::Union(_) => return None,
+//     };
+//     let (full, _) = make_full_name(name, namespace, enclosing_ns);
+//     Some(UnionBranchKey::Named(full))
+// }
 fn branch_key_of<'a>(s: &Schema<'a>, enclosing_ns: Option<&'a str>) -> Option<UnionBranchKey> {
     let (name, namespace) = match s {
-        Schema::TypeName(TypeName::Primitive(p))
-        | Schema::Type(Type {
-            r#type: TypeName::Primitive(p),
-            ..
-        }) => return Some(UnionBranchKey::Primitive(*p)),
-        Schema::TypeName(TypeName::Ref(name))
-        | Schema::Type(Type {
-            r#type: TypeName::Ref(name),
-            ..
-        }) => (name, None),
+        // Handle raw primitive type name (e.g., "bytes")
+        Schema::TypeName(TypeName::Primitive(p)) => return Some(UnionBranchKey::Primitive(*p)),
+
+        // Handle a type object (e.g., {"type": "bytes", "logicalType": "decimal"})
+        Schema::Type(Type { r#type, attributes }) => {
+            if let TypeName::Primitive(p) = r#type {
+                if let Some(lt) = attributes.logical_type {
+                    // This is the key change: handle decimals specifically.
+                    let key_string = if lt == "decimal" {
+                        // For decimals, precision and scale are part of the type's identity.
+                        let precision = attributes
+                            .additional
+                            .get("precision")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let scale = attributes
+                            .additional
+                            .get("scale")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        format!("{}-{}:{}:{}", p.as_ref(), lt, precision, scale)
+                    } else {
+                        format!("{}-{}", p.as_ref(), lt)
+                    };
+                    return Some(UnionBranchKey::PrimitiveLogical(key_string));
+                } else {
+                    return Some(UnionBranchKey::Primitive(*p));
+                }
+            }
+            if let TypeName::Ref(name) = r#type {
+                (name, None)
+            } else {
+                return None;
+            }
+        }
+
+        // --- The rest of the cases handle named types and are unchanged ---
+        Schema::TypeName(TypeName::Ref(name)) => (name, None),
         Schema::Complex(ComplexType::Array(_)) => return Some(UnionBranchKey::Array),
         Schema::Complex(ComplexType::Map(_)) => return Some(UnionBranchKey::Map),
         Schema::Complex(ComplexType::Record(r)) => (&r.name, r.namespace),
@@ -1110,6 +1169,9 @@ fn union_first_duplicate<'a>(
                 let msg = match key {
                     UnionBranchKey::Named(full) => format!("named type {full}"),
                     UnionBranchKey::Primitive(p) => format!("primitive {}", p.as_ref()),
+                    UnionBranchKey::PrimitiveLogical(key_string) => {
+                        format!("logical type {}", key_string)
+                    }
                     UnionBranchKey::Array => "array".to_string(),
                     UnionBranchKey::Map => "map".to_string(),
                 };
@@ -1234,10 +1296,14 @@ impl<'a> Maker<'a> {
                             })
                         })
                         .collect::<Result<_, ArrowError>>()?;
+                    let mut metadata = r.attributes.field_metadata();
+                    let (full, _) = make_full_name(r.name, namespace, None);
+                    // println!("CHECK RECORD full={:?}", full);
+                    metadata.insert(AVRO_NAME_METADATA_KEY.to_string(), full);
                     let field = AvroDataType {
                         nullability: None,
                         codec: Codec::Struct(fields),
-                        metadata: r.attributes.field_metadata(),
+                        metadata,
                         resolution: None,
                     };
                     self.resolver.register(r.name, namespace, field.clone());
@@ -1256,14 +1322,19 @@ impl<'a> Maker<'a> {
                     let size = f.size.try_into().map_err(|e| {
                         ArrowError::ParseError(format!("Overflow converting size to i32: {e}"))
                     })?;
-                    let md = f.attributes.field_metadata();
+                    let mut metadata = f.attributes.field_metadata();
+                    let (full, _) = make_full_name(f.name, namespace, None);
+                    println!("CHECK fixed: {}", full);
+                    metadata.insert(AVRO_NAME_METADATA_KEY.to_string(), full);
+                    let out = metadata.get(AVRO_NAME_METADATA_KEY).unwrap();
+                    // println!("OUT OF METADATA {}", out);
                     let field = match f.attributes.logical_type {
                         Some("decimal") => {
                             let (precision, scale, _) =
                                 parse_decimal_attributes(&f.attributes, Some(size as usize), true)?;
                             AvroDataType {
                                 nullability: None,
-                                metadata: md,
+                                metadata,
                                 codec: Codec::Decimal(precision, Some(scale), Some(size as usize)),
                                 resolution: None,
                             }
@@ -1276,19 +1347,20 @@ impl<'a> Maker<'a> {
                             };
                             AvroDataType {
                                 nullability: None,
-                                metadata: md,
+                                metadata,
                                 codec: Codec::Interval,
                                 resolution: None,
                             }
                         }
                         _ => AvroDataType {
                             nullability: None,
-                            metadata: md,
+                            metadata,
                             codec: Codec::Fixed(size),
                             resolution: None,
                         },
                     };
                     self.resolver.register(f.name, namespace, field.clone());
+                    // println!("FIELD.NAME, {}", f.name);
                     Ok(field)
                 }
                 ComplexType::Enum(e) => {
@@ -1300,6 +1372,9 @@ impl<'a> Maker<'a> {
                         .collect::<Arc<[String]>>();
 
                     let mut metadata = e.attributes.field_metadata();
+                    let (full, _) = make_full_name(e.name, namespace, None);
+                    println!("full ENUM: {}", full);
+                    metadata.insert(AVRO_NAME_METADATA_KEY.to_string(), full);
                     let symbols_json = serde_json::to_string(&e.symbols).map_err(|e| {
                         ArrowError::ParseError(format!("Failed to serialize enum symbols: {e}"))
                     })?;
@@ -1330,32 +1405,92 @@ impl<'a> Maker<'a> {
                     (Some("decimal"), c @ Codec::Binary) => {
                         let (prec, sc, _) = parse_decimal_attributes(&t.attributes, None, false)?;
                         *c = Codec::Decimal(prec, Some(sc), None);
+                        // Decimal attributes are stored in the Codec, but add logicalType for consistency.
+                        field
+                            .metadata
+                            .insert("logicalType".to_string(), "decimal".to_string());
                     }
-                    (Some("date"), c @ Codec::Int32) => *c = Codec::Date32,
-                    (Some("time-millis"), c @ Codec::Int32) => *c = Codec::TimeMillis,
-                    (Some("time-micros"), c @ Codec::Int64) => *c = Codec::TimeMicros,
+                    (Some("date"), c @ Codec::Int32) => {
+                        *c = Codec::Date32;
+                        field
+                            .metadata
+                            .insert("logicalType".to_string(), "date".to_string());
+                    }
+                    (Some("time-millis"), c @ Codec::Int32) => {
+                        *c = Codec::TimeMillis;
+                        field
+                            .metadata
+                            .insert("logicalType".to_string(), "time-millis".to_string());
+                    }
+                    (Some("time-micros"), c @ Codec::Int64) => {
+                        *c = Codec::TimeMicros;
+                        field
+                            .metadata
+                            .insert("logicalType".to_string(), "time-micros".to_string());
+                    }
                     (Some("timestamp-millis"), c @ Codec::Int64) => {
-                        *c = Codec::TimestampMillis(true)
+                        *c = Codec::TimestampMillis(true);
+                        field
+                            .metadata
+                            .insert("logicalType".to_string(), "timestamp-millis".to_string());
                     }
                     (Some("timestamp-micros"), c @ Codec::Int64) => {
-                        *c = Codec::TimestampMicros(true)
+                        *c = Codec::TimestampMicros(true);
+                        field
+                            .metadata
+                            .insert("logicalType".to_string(), "timestamp-micros".to_string());
                     }
                     (Some("local-timestamp-millis"), c @ Codec::Int64) => {
-                        *c = Codec::TimestampMillis(false)
+                        *c = Codec::TimestampMillis(false);
+                        field.metadata.insert(
+                            "logicalType".to_string(),
+                            "local-timestamp-millis".to_string(),
+                        );
                     }
                     (Some("local-timestamp-micros"), c @ Codec::Int64) => {
-                        *c = Codec::TimestampMicros(false)
+                        *c = Codec::TimestampMicros(false);
+                        field.metadata.insert(
+                            "logicalType".to_string(),
+                            "local-timestamp-micros".to_string(),
+                        );
                     }
-                    (Some("uuid"), c @ Codec::Utf8) => *c = Codec::Uuid,
+                    (Some("uuid"), c @ Codec::Utf8) => {
+                        *c = Codec::Uuid;
+                        field
+                            .metadata
+                            .insert("logicalType".to_string(), "uuid".to_string());
+                    }
                     #[cfg(feature = "avro_custom_types")]
-                    (Some("arrow.duration-nanos"), c @ Codec::Int64) => *c = Codec::DurationNanos,
+                    (Some("arrow.duration-nanos"), c @ Codec::Int64) => {
+                        *c = Codec::DurationNanos;
+                        field.metadata.insert(
+                            "logicalType".to_string(),
+                            "arrow.duration-nanos".to_string(),
+                        );
+                    }
                     #[cfg(feature = "avro_custom_types")]
-                    (Some("arrow.duration-micros"), c @ Codec::Int64) => *c = Codec::DurationMicros,
+                    (Some("arrow.duration-micros"), c @ Codec::Int64) => {
+                        *c = Codec::DurationMicros;
+                        field.metadata.insert(
+                            "logicalType".to_string(),
+                            "arrow.duration-micros".to_string(),
+                        );
+                    }
                     #[cfg(feature = "avro_custom_types")]
-                    (Some("arrow.duration-millis"), c @ Codec::Int64) => *c = Codec::DurationMillis,
+                    (Some("arrow.duration-millis"), c @ Codec::Int64) => {
+                        *c = Codec::DurationMillis;
+                        field.metadata.insert(
+                            "logicalType".to_string(),
+                            "arrow.duration-millis".to_string(),
+                        );
+                    }
                     #[cfg(feature = "avro_custom_types")]
                     (Some("arrow.duration-seconds"), c @ Codec::Int64) => {
-                        *c = Codec::DurationSeconds
+                        *c = Codec::DurationSeconds;
+                        field.metadata.insert(
+                            "logicalType".to_string(),
+                            "arrow.duration-seconds".to_string(),
+                        );
                     }
                     (Some(logical), _) => {
                         // Insert unrecognized logical type into metadata map

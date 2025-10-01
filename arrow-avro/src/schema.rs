@@ -913,6 +913,7 @@ fn build_canonical(schema: &Schema, enclosing_ns: Option<&str>) -> Result<String
         Schema::Complex(ct) => match ct {
             ComplexType::Record(r) => {
                 let (full_name, child_ns) = make_full_name(r.name, r.namespace, enclosing_ns);
+                println!("full_name in Record: {}", full_name);
                 let fields = r
                     .fields
                     .iter()
@@ -934,6 +935,7 @@ fn build_canonical(schema: &Schema, enclosing_ns: Option<&str>) -> Result<String
             }
             ComplexType::Enum(e) => {
                 let (full_name, _) = make_full_name(e.name, e.namespace, enclosing_ns);
+                println!("full_name in Enum: {}", full_name);
                 let symbols = e
                     .symbols
                     .iter()
@@ -955,6 +957,7 @@ fn build_canonical(schema: &Schema, enclosing_ns: Option<&str>) -> Result<String
             ),
             ComplexType::Fixed(f) => {
                 let (full_name, _) = make_full_name(f.name, f.namespace, enclosing_ns);
+                println!("full_name in Fixed: {}", full_name);
                 format!(
                     r#"{{"name":{},"type":"fixed","size":{}}}"#,
                     quote(&full_name)?,
@@ -1089,7 +1092,9 @@ struct NameGenerator {
 
 impl NameGenerator {
     fn make_unique(&mut self, field_name: &str) -> String {
+        println!("\nfield_name A: {:?}", field_name.to_string());
         let field_name = sanitise_avro_name(field_name);
+        println!("field_name B: {:?}", field_name.to_string());
         if self.used.insert(field_name.clone()) {
             self.counters.insert(field_name.clone(), 1);
             return field_name;
@@ -1162,6 +1167,7 @@ fn union_branch_signature(branch: &Value) -> Result<String, ArrowError> {
             let t = map.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
                 ArrowError::SchemaError("Union branch object missing string 'type'".into())
             })?;
+            let lt = map.get("logicalType").and_then(|v| v.as_str());
             match t {
                 "record" | "enum" | "fixed" => {
                     let name = map.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -1169,10 +1175,23 @@ fn union_branch_signature(branch: &Value) -> Result<String, ArrowError> {
                             "Union branch '{t}' missing required 'name'"
                         ))
                     })?;
+                    // println!("\n\nCHECK NAME {:?}", name.to_string());
                     Ok(format!("N:{t}:{name}"))
                 }
                 "array" | "map" => Ok(format!("C:{t}")),
-                other => Ok(format!("P:{other}")),
+                other => {
+                    if let Some(lt_val) = lt {
+                        if lt_val == "decimal" {
+                            let p = map.get("precision").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let s = map.get("scale").and_then(|v| v.as_u64()).unwrap_or(0);
+                            Ok(format!("L:{other}:{lt_val}:{p}:{s}"))
+                        } else {
+                            Ok(format!("L:{other}:{lt_val}"))
+                        }
+                    } else {
+                        Ok(format!("P:{other}"))
+                    }
+                }
             }
         }
         Value::Array(_) => Err(ArrowError::SchemaError(
@@ -1183,7 +1202,6 @@ fn union_branch_signature(branch: &Value) -> Result<String, ArrowError> {
         )),
     }
 }
-
 fn datatype_to_avro(
     dt: &DataType,
     field_name: &str,
@@ -1191,6 +1209,11 @@ fn datatype_to_avro(
     name_gen: &mut NameGenerator,
     null_order: Nullability,
 ) -> Result<(Value, JsonMap<String, Value>), ArrowError> {
+    let avro_type_name = metadata
+        .get(AVRO_NAME_METADATA_KEY)
+        .map(|s| s.as_str())
+        .unwrap_or(field_name);
+    // println!("\n\ndatatype_to_avro={:?}\n", field_name.to_string());
     let mut extras = JsonMap::new();
     let mut handle_decimal = |precision: &u8, scale: &i8| -> Result<Value, ArrowError> {
         if *scale < 0 {
@@ -1210,13 +1233,14 @@ fn datatype_to_avro(
             ("precision".into(), json!(*precision)),
             ("scale".into(), json!(*scale)),
         ]);
+        let name = metadata.get(AVRO_NAME_METADATA_KEY);
         if let Some(size) = metadata
             .get("size")
             .and_then(|val| val.parse::<usize>().ok())
         {
             meta.insert("type".into(), json!("fixed"));
             meta.insert("size".into(), json!(size));
-            meta.insert("name".into(), json!(name_gen.make_unique(field_name)));
+            meta.insert("name".into(), json!(avro_type_name)); // TODO use type name metadata
         } else {
             meta.insert("type".into(), json!("bytes"));
         }
@@ -1245,12 +1269,13 @@ fn datatype_to_avro(
                     && metadata
                         .get("ARROW:extension:name")
                         .is_some_and(|value| value == "uuid"));
+            let name = metadata.get(AVRO_NAME_METADATA_KEY);
             if is_uuid {
                 json!({ "type": "string", "logicalType": "uuid" })
             } else {
                 json!({
                     "type": "fixed",
-                    "name": name_gen.make_unique(field_name),
+                    "name": avro_type_name,
                     "size": len
                 })
             }
@@ -1315,12 +1340,15 @@ fn datatype_to_avro(
                 Value::String("long".into())
             }
         }
-        DataType::Interval(IntervalUnit::MonthDayNano) => json!({
-            "type": "fixed",
-            "name": name_gen.make_unique(&format!("{field_name}_duration")),
-            "size": 12,
-            "logicalType": "duration"
-        }),
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            let name = metadata.get(AVRO_NAME_METADATA_KEY);
+            json!({
+                "type": "fixed",
+                "name": avro_type_name,
+                "size": 12,
+                "logicalType": "duration"
+            })
+        }
         DataType::Interval(IntervalUnit::YearMonth) => {
             extras.insert(
                 "arrowIntervalUnit".into(),
@@ -1409,9 +1437,10 @@ fn datatype_to_avro(
                 .iter()
                 .map(|field| arrow_field_to_avro(field, name_gen, null_order))
                 .collect::<Result<Vec<_>, _>>()?;
+            let name = metadata.get(AVRO_NAME_METADATA_KEY);
             json!({
                 "type": "record",
-                "name": name_gen.make_unique(field_name),
+                "name": avro_type_name,
                 "fields": avro_fields
             })
         }
@@ -1419,9 +1448,10 @@ fn datatype_to_avro(
             if let Some(j) = metadata.get(AVRO_ENUM_SYMBOLS_METADATA_KEY) {
                 let symbols: Vec<&str> =
                     serde_json::from_str(j).map_err(|e| ArrowError::ParseError(e.to_string()))?;
+                let name = metadata.get(AVRO_NAME_METADATA_KEY);
                 json!({
                     "type": "enum",
-                    "name": name_gen.make_unique(field_name),
+                    "name": avro_type_name,
                     "symbols": symbols
                 })
             } else {
@@ -1467,7 +1497,8 @@ fn datatype_to_avro(
             let mut seen: HashSet<String> = HashSet::with_capacity(branches.len());
             for b in &branches {
                 let sig = union_branch_signature(b)?;
-                if !seen.insert(sig) {
+                if !seen.insert(sig.clone()) {
+                    println!("Duplicate union branch signature: {}", sig);
                     return Err(ArrowError::SchemaError(
                         "Avro union contains duplicate branch types (disallowed by spec)".into(),
                     ));

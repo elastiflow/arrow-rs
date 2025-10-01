@@ -1033,6 +1033,7 @@ impl ReaderBuilder {
                 .ok_or_else(|| {
                     ArrowError::ParseError("No Avro schema present in file header".into())
                 })?;
+            println!("\nCHECK SCHEMAS={:?}", writer_schema);
             let record_decoder =
                 self.make_record_decoder_from_schemas(&writer_schema, reader_schema)?;
             return Ok(self.make_decoder_with_parts(
@@ -3772,6 +3773,14 @@ mod test {
         {
             let (uf, mode) = get_union("union_prim");
             assert!(matches!(mode, UnionMode::Dense));
+            let generated_names: Vec<&str> = uf.iter().map(|(_, f)| f.name().as_str()).collect();
+            let expected_names = vec![
+                "boolean", "int", "long", "float", "double", "bytes", "string",
+            ];
+            assert_eq!(
+                generated_names, expected_names,
+                "Field names for union_prim are incorrect"
+            );
             let tids = vec![
                 tid_by_name(&uf, "long"),
                 tid_by_name(&uf, "int"),
@@ -3858,11 +3867,25 @@ mod test {
                 }
                 _ => None,
             });
+            let generated_names: Vec<&str> = uf.iter().map(|(_, f)| f.name().as_str()).collect();
+            let expected_names = vec!["Fx8", "Dur12", "DecFix16"];
+            assert_eq!(
+                generated_names, expected_names,
+                "Field names were not generated correctly for union_fixed_dur_decfix"
+            );
             expected_cols.push(arr);
         }
         // 6) union_enum_records_array_map: [enum ColorU, record RecA, record RecB, array<long>, map<string>]
         {
             let (uf, _) = get_union("union_enum_records_array_map");
+
+            let generated_names: Vec<&str> = uf.iter().map(|(_, f)| f.name().as_str()).collect();
+            let expected_names = vec!["ColorU", "RecA", "RecB", "array", "map"];
+            assert_eq!(
+                generated_names, expected_names,
+                "'record' field names were not generated as expected"
+            );
+
             let tid_enum = tid_by_dt(&uf, |dt| matches!(dt, DataType::Dictionary(_, _)));
             let tid_reca = tid_by_dt(&uf, |dt| {
                 if let DataType::Struct(fs) = dt {
@@ -4334,6 +4357,7 @@ mod test {
             expected_cols.push(arr);
         }
         let expected = RecordBatch::try_new(schema.clone(), expected_cols).unwrap();
+        println!("actual = {:?}", actual.column(5));
         assert_eq!(
             actual, expected,
             "full end-to-end equality for union_fields.avro"
